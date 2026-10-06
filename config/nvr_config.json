@@ -1,0 +1,23 @@
+{
+  "system": {
+    "device_name": "NVR_Main",
+    "log_level": "info",
+    "max_channels": 8
+  },
+  "storage": {
+    "recording_path": "/var/media/recordings",
+    "database_path": "/var/media/nvr_metadata.db",
+    "segment_duration_seconds": 60,
+    "min_free_space_mb": 2048
+  },
+  "live": {
+    "grid_layout": 4,
+    "max_queue_depth": 2,
+    "drop_stale_frames": true
+  },
+  "ai": {
+    "enabled": false,
+    "max_concurrent_models": 2,
+    "motion_threshold": 0.05
+  }
+}
