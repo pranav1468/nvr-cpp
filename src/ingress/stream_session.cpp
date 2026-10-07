@@ -36,6 +36,39 @@ std::string Base64Encode(const std::string& in) {
     return out;
 }
 
+std::vector<uint8_t> Base64Decode(const std::string& in) {
+    static const int8_t kLookup[256] = {
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+        52,53,54,55,56,57,58,59,60,61,-1,-1,-1, 0,-1,-1,
+        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+    };
+    std::vector<uint8_t> out;
+    int val = 0, valb = -8;
+    for (uint8_t c : in) {
+        if (kLookup[c] == -1) continue;
+        val = (val << 6) + kLookup[c];
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 StreamSession::StreamSession(int channel_id, StreamType stream_type, const std::string& rtsp_url)
@@ -305,6 +338,30 @@ void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control,
             }
             if (line.rfind("a=control:", 0) == 0) {
                 track_control = line.substr(10);
+            }
+            size_t sps_pos = line.find("sprop-parameter-sets=");
+            if (sps_pos != std::string::npos) {
+                std::string params = line.substr(sps_pos + 21);
+                size_t semi = params.find(';');
+                if (semi != std::string::npos) params = params.substr(0, semi);
+                std::stringstream ss(params);
+                std::string item;
+                while (std::getline(ss, item, ',')) {
+                    if (!item.empty()) {
+                        auto raw = Base64Decode(item);
+                        if (!raw.empty()) {
+                            auto pkt = std::make_shared<MediaPacket>();
+                            pkt->channel_id = channel_id_;
+                            pkt->stream_type = stream_type_;
+                            pkt->codec = CodecType::H264;
+                            pkt->is_keyframe = true;
+                            pkt->wall_time_ms = time_utils::WallTimeMs();
+                            pkt->data = {0x00, 0x00, 0x00, 0x01};
+                            pkt->data.insert(pkt->data.end(), raw.begin(), raw.end());
+                            StreamBroker::Instance().Publish(pkt);
+                        }
+                    }
+                }
             }
         }
     }
