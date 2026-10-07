@@ -50,6 +50,7 @@ private:
     void WriteMdat(const std::vector<uint8_t>& video_payload, const std::vector<uint8_t>& audio_payload);
 
     void ParseSps(const uint8_t* data, size_t size);
+    void ParseHevcSps(const uint8_t* data, size_t size);
 
     int channel_id_{0};
     std::string output_dir_;

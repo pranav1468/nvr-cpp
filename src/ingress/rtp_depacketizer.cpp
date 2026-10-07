@@ -13,6 +13,8 @@ void RtpDepacketizer::Reset() {
     fu_buffer_.clear();
     fu_in_progress_ = false;
     fu_is_keyframe_ = false;
+    fu_start_seq_ = 0;
+    fu_last_seq_ = 0;
     has_base_pts_ = false;
     unwrapped_rtp_timestamp_ = 0;
 }
@@ -105,7 +107,16 @@ void RtpDepacketizer::ProcessH264(const uint8_t* payload, size_t size, uint32_t 
             fu_is_keyframe_ = (original_nal_type == 5);
             fu_timestamp_ = rtp_timestamp;
             fu_start_seq_ = seq_num;
+            fu_last_seq_ = seq_num;
         } else if (fu_in_progress_) {
+            uint16_t expected_seq = static_cast<uint16_t>(fu_last_seq_ + 1);
+            if (seq_num != expected_seq) {
+                // Packet dropped; abort damaged FU sequence
+                fu_buffer_.clear();
+                fu_in_progress_ = false;
+                return;
+            }
+            fu_last_seq_ = seq_num;
             fu_buffer_.insert(fu_buffer_.end(), payload + 2, payload + size);
         }
 
@@ -163,7 +174,15 @@ void RtpDepacketizer::ProcessH265(const uint8_t* payload, size_t size, uint32_t 
             fu_is_keyframe_ = (original_nal_type >= 16 && original_nal_type <= 21);
             fu_timestamp_ = rtp_timestamp;
             fu_start_seq_ = seq_num;
+            fu_last_seq_ = seq_num;
         } else if (fu_in_progress_) {
+            uint16_t expected_seq = static_cast<uint16_t>(fu_last_seq_ + 1);
+            if (seq_num != expected_seq) {
+                fu_buffer_.clear();
+                fu_in_progress_ = false;
+                return;
+            }
+            fu_last_seq_ = seq_num;
             fu_buffer_.insert(fu_buffer_.end(), payload + 3, payload + size);
         }
 
@@ -228,9 +247,9 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
         has_base_pts_ = true;
         packet->pts_us = base_pts_us_;
     } else {
-        // Signed 32-bit difference handles wrap around from 0xFFFFFFFF -> 0 smoothly
+        uint32_t effective_rate = (clock_rate_ > 0) ? clock_rate_ : 90000;
         int32_t delta_ticks = static_cast<int32_t>(rtp_timestamp - last_rtp_timestamp_);
-        int64_t max_drift_ticks = static_cast<int64_t>(clock_rate_) * 10LL;
+        int64_t max_drift_ticks = static_cast<int64_t>(effective_rate) * 10LL;
         if (delta_ticks < -max_drift_ticks || delta_ticks > max_drift_ticks) {
             // Clock jump >10s detected; re-anchor to monotonic clock
             base_pts_us_ = time_utils::MonotonicUs();
@@ -240,7 +259,7 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
         }
         last_rtp_timestamp_ = rtp_timestamp;
 
-        int64_t delta_us = (unwrapped_rtp_timestamp_ * 1000000LL) / static_cast<int64_t>(clock_rate_);
+        int64_t delta_us = (unwrapped_rtp_timestamp_ * 1000000LL) / static_cast<int64_t>(effective_rate);
         packet->pts_us = base_pts_us_ + delta_us;
     }
     packet->dts_us = packet->pts_us;

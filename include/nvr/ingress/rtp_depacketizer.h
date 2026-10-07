@@ -38,6 +38,7 @@ private:
     bool fu_is_keyframe_{false};
     uint32_t fu_timestamp_{0};
     uint16_t fu_start_seq_{0};
+    uint16_t fu_last_seq_{0};
 
     uint32_t last_rtp_timestamp_{0};
     int64_t unwrapped_rtp_timestamp_{0};

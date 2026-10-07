@@ -29,20 +29,22 @@ bool RecordingScheduler::StartChannelRecording(int channel_id, RecordMode mode) 
         return true;
     }
 
-    auto segmenter = std::make_unique<Segmenter>(
+    auto segmenter = std::make_shared<Segmenter>(
         channel_id, 
         storage_config_.recording_path, 
         storage_config_.segment_duration_seconds
     );
 
-    Segmenter* seg_ptr = segmenter.get();
+    std::weak_ptr<Segmenter> weak_seg = segmenter;
 
     // Subscribe to compressed MAIN stream packets from the StreamBroker
     auto sub_id = StreamBroker::Instance().Subscribe(
         channel_id, 
         StreamType::MAIN,
-        [seg_ptr](const MediaPacketPtr& packet) {
-            seg_ptr->PushPacket(packet);
+        [weak_seg](const MediaPacketPtr& packet) {
+            if (auto seg = weak_seg.lock()) {
+                seg->PushPacket(packet);
+            }
         }
     );
 

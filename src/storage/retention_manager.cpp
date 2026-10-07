@@ -99,9 +99,12 @@ void RetentionManager::EnforceRetentionOnce() {
         }
 
         for (const auto& seg : segments) {
+            bool file_removed = false;
             try {
-                if (std::filesystem::exists(seg.file_path)) {
-                    std::filesystem::remove(seg.file_path);
+                if (!std::filesystem::exists(seg.file_path)) {
+                    file_removed = true;
+                } else if (std::filesystem::remove(seg.file_path)) {
+                    file_removed = true;
                     LOG_INFO << "Pruned old segment: " << seg.file_path << " (Freed "
                              << (seg.file_size_bytes / 1024) << " KB)";
                 }
@@ -109,7 +112,11 @@ void RetentionManager::EnforceRetentionOnce() {
                 LOG_ERROR << "Failed to delete file " << seg.file_path << ": " << e.what();
             }
 
-            SegmentIndex::Instance().DeleteSegmentRecord(seg.id);
+            if (file_removed) {
+                SegmentIndex::Instance().DeleteSegmentRecord(seg.id);
+            } else {
+                LOG_WARN << "RetentionManager: Retaining DB record for locked/unremoved file: " << seg.file_path;
+            }
         }
 
         free_bytes = GetFreeDiskSpaceBytes(check_path);
@@ -121,14 +128,20 @@ void RetentionManager::EnforceRetentionOnce() {
         auto old_segments = SegmentIndex::Instance().GetOldestUnlockedSegments(50);
         for (const auto& seg : old_segments) {
             if (seg.start_time_ms < cutoff_ms) {
+                bool file_removed = false;
                 try {
-                    if (std::filesystem::exists(seg.file_path)) {
-                        std::filesystem::remove(seg.file_path);
+                    if (!std::filesystem::exists(seg.file_path)) {
+                        file_removed = true;
+                    } else if (std::filesystem::remove(seg.file_path)) {
+                        file_removed = true;
                         LOG_INFO << "Pruned expired segment (age > " << cfg.max_retention_days 
                                  << " days): " << seg.file_path;
                     }
                 } catch (...) {}
-                SegmentIndex::Instance().DeleteSegmentRecord(seg.id);
+
+                if (file_removed) {
+                    SegmentIndex::Instance().DeleteSegmentRecord(seg.id);
+                }
             } else {
                 break; // Since results are sorted by start_time_ms ASC, remaining are newer
             }

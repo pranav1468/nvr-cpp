@@ -35,7 +35,7 @@ private:
     struct ChannelRecordState {
         int channel_id;
         RecordMode mode;
-        std::unique_ptr<Segmenter> segmenter;
+        std::shared_ptr<Segmenter> segmenter;
         StreamBroker::SubscriptionId subscription_id;
     };
 

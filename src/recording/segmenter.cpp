@@ -108,14 +108,17 @@ void Segmenter::ConfigureAudio(CodecType codec, uint32_t sample_rate, uint8_t ch
 }
 
 bool Segmenter::IsRecording() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return is_recording_;
 }
 
 uint32_t Segmenter::GetCurrentFrameCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return writer_.GetFrameCount();
 }
 
 uint64_t Segmenter::GetCurrentBytesWritten() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return writer_.GetCurrentBytesWritten();
 }
 

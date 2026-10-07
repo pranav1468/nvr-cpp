@@ -61,6 +61,21 @@ class BitReader {
 public:
     BitReader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
 
+    void SkipBits(size_t num_bits) {
+        for (size_t i = 0; i < num_bits; ++i) {
+            if (byte_offset_ >= size_) return;
+            bit_offset_++;
+            if (bit_offset_ == 8) {
+                bit_offset_ = 0;
+                byte_offset_++;
+                if (byte_offset_ >= 2 && byte_offset_ < size_ && data_[byte_offset_] == 0x03 &&
+                    data_[byte_offset_ - 1] == 0x00 && data_[byte_offset_ - 2] == 0x00) {
+                    byte_offset_++;
+                }
+            }
+        }
+    }
+
     uint32_t ReadBits(size_t num_bits) {
         uint32_t res = 0;
         for (size_t i = 0; i < num_bits; ++i) {
@@ -72,7 +87,7 @@ public:
                 bit_offset_ = 0;
                 byte_offset_++;
                 // Skip emulation prevention bytes 0x00 0x00 0x03
-                if (byte_offset_ + 2 < size_ && data_[byte_offset_] == 0x03 &&
+                if (byte_offset_ >= 2 && byte_offset_ < size_ && data_[byte_offset_] == 0x03 &&
                     data_[byte_offset_ - 1] == 0x00 && data_[byte_offset_ - 2] == 0x00) {
                     byte_offset_++;
                 }
@@ -83,10 +98,11 @@ public:
 
     uint32_t ReadExponentialGolomb() {
         size_t leading_zeros = 0;
-        while (ReadBits(1) == 0 && leading_zeros < 32) {
+        while (ReadBits(1) == 0 && leading_zeros < 31) {
             leading_zeros++;
         }
         if (leading_zeros == 0) return 0;
+        if (leading_zeros >= 31) return 0;
         uint32_t suffix = ReadBits(leading_zeros);
         return (1U << leading_zeros) - 1 + suffix;
     }
@@ -267,6 +283,71 @@ void AtomicWriter::ParseSps(const uint8_t* data, size_t size) {
 
     LOG_INFO << "[Channel " << channel_id_ << "] Parsed SPS video resolution: " 
              << width_ << "x" << height_;
+}
+
+void AtomicWriter::ParseHevcSps(const uint8_t* data, size_t size) {
+    if (size < 4) return;
+    BitReader reader(data + 2, size - 2);
+
+    reader.ReadBits(4); // sps_video_parameter_set_id
+    uint32_t max_sub_layers_minus1 = reader.ReadBits(3);
+    reader.ReadBits(1); // sps_temporal_id_nesting_flag
+
+    // profile_tier_level
+    reader.ReadBits(2);  // general_profile_space
+    reader.ReadBits(1);  // general_tier_flag
+    reader.ReadBits(5);  // general_profile_idc
+    reader.ReadBits(32); // general_profile_compatibility_flags
+    reader.SkipBits(48); // general_constraint_indicator_flags
+    reader.ReadBits(8);  // general_level_idc
+
+    std::vector<bool> sub_layer_profile_present(max_sub_layers_minus1);
+    std::vector<bool> sub_layer_level_present(max_sub_layers_minus1);
+    for (uint32_t i = 0; i < max_sub_layers_minus1; ++i) {
+        sub_layer_profile_present[i] = (reader.ReadBits(1) != 0);
+        sub_layer_level_present[i] = (reader.ReadBits(1) != 0);
+    }
+    if (max_sub_layers_minus1 > 0) {
+        for (uint32_t i = max_sub_layers_minus1; i < 8; ++i) {
+            reader.SkipBits(2);
+        }
+    }
+    for (uint32_t i = 0; i < max_sub_layers_minus1; ++i) {
+        if (sub_layer_profile_present[i]) {
+            reader.SkipBits(88);
+        }
+        if (sub_layer_level_present[i]) {
+            reader.SkipBits(8);
+        }
+    }
+
+    reader.ReadExponentialGolomb(); // sps_seq_parameter_set_id
+    uint32_t chroma_format_idc = reader.ReadExponentialGolomb();
+    if (chroma_format_idc == 3) {
+        reader.ReadBits(1); // separate_colour_plane_flag
+    }
+
+    uint32_t pic_width = reader.ReadExponentialGolomb();
+    uint32_t pic_height = reader.ReadExponentialGolomb();
+
+    uint32_t conformance_window_flag = reader.ReadBits(1);
+    uint32_t conf_left = 0, conf_right = 0, conf_top = 0, conf_bottom = 0;
+    if (conformance_window_flag) {
+        conf_left = reader.ReadExponentialGolomb();
+        conf_right = reader.ReadExponentialGolomb();
+        conf_top = reader.ReadExponentialGolomb();
+        conf_bottom = reader.ReadExponentialGolomb();
+    }
+
+    uint32_t sub_width_c = (chroma_format_idc == 1 || chroma_format_idc == 2) ? 2 : 1;
+    uint32_t sub_height_c = (chroma_format_idc == 1) ? 2 : 1;
+
+    if (pic_width > 0 && pic_height > 0) {
+        width_ = pic_width - (conf_left + conf_right) * sub_width_c;
+        height_ = pic_height - (conf_top + conf_bottom) * sub_height_c;
+        LOG_INFO << "[Channel " << channel_id_ << "] Parsed HEVC SPS video resolution: " 
+                 << width_ << "x" << height_;
+    }
 }
 
 void AtomicWriter::WriteFtyp() {
@@ -479,6 +560,18 @@ void AtomicWriter::WriteMoov() {
             buf.push_back(1); // numOfPictureParameterSets = 1
             PutU16(buf, static_cast<uint16_t>(pps_bytes_.size()));
             buf.insert(buf.end(), pps_bytes_.begin(), pps_bytes_.end());
+            UpdateBoxSize(buf, avcc_start);
+        } else {
+            size_t avcc_start = buf.size();
+            PutU32(buf, 0);
+            PutFourCC(buf, "avcC");
+            buf.push_back(1);    // configurationVersion
+            buf.push_back(0x64); // profile Main (100)
+            buf.push_back(0x00);
+            buf.push_back(0x28); // level 4.0
+            buf.push_back(0xFF); // 4-byte NAL length
+            buf.push_back(0xE0); // 0 SPS
+            buf.push_back(0x00); // 0 PPS
             UpdateBoxSize(buf, avcc_start);
         }
     }
@@ -936,12 +1029,15 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
             audio_channels_ = 1;
         }
 
-        uint32_t audio_sample_dur = (audio_codec_ == CodecType::AAC) ? 1024 : 160;
+        uint32_t nominal_dur = (audio_codec_ == CodecType::AAC) ? 1024 : 160;
+        uint32_t audio_sample_dur = nominal_dur;
         if (last_audio_pts_us_ > 0 && packet->pts_us > last_audio_pts_us_) {
             int64_t diff_us = packet->pts_us - last_audio_pts_us_;
             audio_sample_dur = static_cast<uint32_t>((diff_us * audio_sample_rate_) / 1000000LL);
-            if (audio_sample_dur == 0) {
-                audio_sample_dur = (audio_codec_ == CodecType::AAC) ? 1024 : 160;
+            uint32_t min_dur = nominal_dur / 2;
+            uint32_t max_dur = nominal_dur * 4;
+            if (audio_sample_dur < min_dur || audio_sample_dur > max_dur) {
+                audio_sample_dur = nominal_dur;
             }
         }
         last_audio_pts_us_ = packet->pts_us;
@@ -955,6 +1051,9 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
 
         pending_audio_samples_.push_back(audio_entry);
         pending_audio_mdat_bytes_.insert(pending_audio_mdat_bytes_.end(), packet->data.begin(), packet->data.end());
+        if (pending_audio_samples_.size() >= 50) {
+            FlushCurrentFragment();
+        }
         return true;
     }
 
@@ -1016,6 +1115,7 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
                 vps_bytes_.assign(nal_data, nal_data + nal_len);
             } else if (nal_type == 33) { // SPS
                 sps_bytes_.assign(nal_data, nal_data + nal_len);
+                ParseHevcSps(nal_data, nal_len);
             } else if (nal_type == 34) { // PPS
                 pps_bytes_.assign(nal_data, nal_data + nal_len);
             } else if (nal_type <= 31 || nal_type == 39 || nal_type == 40) { // VCL Slices or SEI
@@ -1062,7 +1162,9 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
     }
 
     // Emit fragment at GOP boundaries or every ~1 second (30 frames)
-    if ((packet->is_keyframe && pending_samples_.size() >= 25) || pending_samples_.size() >= 30) {
+    if ((packet->is_keyframe && pending_samples_.size() >= 25) || 
+        pending_samples_.size() >= 30 || 
+        pending_audio_samples_.size() >= 50) {
         FlushCurrentFragment();
     }
 

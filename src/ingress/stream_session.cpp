@@ -143,10 +143,14 @@ bool StreamSession::ParseRtspUrl(const std::string& url, std::string& host, int&
         path = "/";
     }
 
-    size_t colon_pos = host_port.find(':');
+    size_t colon_pos = host_port.rfind(':');
     if (colon_pos != std::string::npos) {
         host = host_port.substr(0, colon_pos);
-        port = std::stoi(host_port.substr(colon_pos + 1));
+        try {
+            port = std::stoi(host_port.substr(colon_pos + 1));
+        } catch (...) {
+            port = 554;
+        }
     } else {
         host = host_port;
         port = 554;
@@ -235,6 +239,9 @@ void StreamSession::DisconnectSocket() {
     if (depacketizer_) {
         depacketizer_->Reset();
     }
+    if (audio_depacketizer_) {
+        audio_depacketizer_->Reset();
+    }
 }
 
 bool StreamSession::ReadExact(uint8_t* buffer, size_t length, int timeout_ms) {
@@ -273,7 +280,14 @@ bool StreamSession::ReadRtspResponse(std::string& response, int timeout_ms) {
             if (cl_pos != std::string::npos) {
                 size_t val_start = cl_pos + 16;
                 size_t val_end = response.find("\r\n", val_start);
-                int content_len = std::stoi(response.substr(val_start, val_end - val_start));
+                int content_len = 0;
+                if (val_end != std::string::npos && val_end > val_start) {
+                    try {
+                        content_len = std::stoi(response.substr(val_start, val_end - val_start));
+                    } catch (...) {
+                        content_len = 0;
+                    }
+                }
                 if (content_len > 0) {
                     std::vector<uint8_t> body(content_len);
                     if (ReadExact(body.data(), content_len, timeout_ms)) {

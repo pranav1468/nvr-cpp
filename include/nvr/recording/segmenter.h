@@ -30,7 +30,7 @@ private:
     std::string output_dir_;
     int segment_duration_ms_{60000};
     AtomicWriter writer_;
-    std::mutex mutex_;
+    mutable std::mutex mutex_;
     bool is_recording_{false};
     bool waiting_for_first_keyframe_{true};
 };
