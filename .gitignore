@@ -1,0 +1,21 @@
+# Build artifacts
+build/
+bin/
+*.o
+*.a
+*.so
+
+# Runtime media and database files
+recordings/
+test_recordings/
+*.db
+*.db-wal
+*.db-shm
+*.tmp
+*.mp4
+
+# Editor and temporary files
+.vscode/
+.idea/
+*.swp
+*~

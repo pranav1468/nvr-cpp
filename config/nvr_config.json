@@ -5,10 +5,11 @@
     "max_channels": 8
   },
   "storage": {
-    "recording_path": "/var/media/recordings",
-    "database_path": "/var/media/nvr_metadata.db",
+    "recording_path": "./recordings",
+    "database_path": "./nvr_metadata.db",
     "segment_duration_seconds": 60,
-    "min_free_space_mb": 2048
+    "min_free_space_mb": 512,
+    "max_retention_days": 14
   },
   "live": {
     "grid_layout": 4,
@@ -19,5 +20,15 @@
     "enabled": false,
     "max_concurrent_models": 2,
     "motion_threshold": 0.05
-  }
+  },
+  "cameras": [
+    {
+      "id": 1,
+      "name": "Entrance_Cam1",
+      "rtsp_url": "rtsp://127.0.0.1:8554/live/cam1",
+      "sub_rtsp_url": "rtsp://127.0.0.1:8554/live/cam1_sub",
+      "enabled": false,
+      "record_mode": 1
+    }
+  ]
 }

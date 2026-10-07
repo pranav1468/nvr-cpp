@@ -5,24 +5,49 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Compiler warnings
-add_compile_options(-Wall -Wextra -Wpedantic -Wconversion -pthread)
+# Compiler options
+add_compile_options(-Wall -Wextra -Wpedantic -O2 -pthread)
 
 # Include directories
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/3rdparty
+)
+
+# Resolve SQLite3 library
+find_library(SQLITE3_LIB NAMES sqlite3 libsqlite3.so.0 libsqlite3.so
+    PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
 )
 
 # Core backend source files
-file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+set(CORE_SOURCES
+    src/common/logger.cpp
+    src/common/time_utils.cpp
+    src/common/thread_pool.cpp
+    src/storage/database_manager.cpp
+    src/storage/segment_index.cpp
+    src/storage/retention_manager.cpp
+    src/media/stream_broker.cpp
+    src/recording/atomic_writer.cpp
+    src/recording/segmenter.cpp
+    src/recording/recording_scheduler.cpp
+    src/ingress/rtp_depacketizer.cpp
+    src/ingress/stream_session.cpp
+    src/ingress/camera_manager.cpp
 )
-list(FILTER SOURCES EXCLUDE REGEX "src/main.cpp$")
 
 # Core static library
-add_library(nvr_core STATIC ${SOURCES})
-target_include_directories(nvr_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+add_library(nvr_core STATIC ${CORE_SOURCES})
+target_include_directories(nvr_core PUBLIC 
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include/3rdparty
+)
+target_link_libraries(nvr_core PUBLIC ${SQLITE3_LIB} pthread dl)
 
-# Executable target
+# Server executable target
 add_executable(nvr_server src/main.cpp)
-target_link_libraries(nvr_server PRIVATE nvr_core pthread)
+target_link_libraries(nvr_server PRIVATE nvr_core)
+
+# Automated test executable
+add_executable(test_recording_pipeline tests/test_recording_pipeline.cpp)
+target_link_libraries(test_recording_pipeline PRIVATE nvr_core)
