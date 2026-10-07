@@ -26,6 +26,9 @@ public:
     int64_t GetSegmentStartTimeMs() const;
     uint32_t GetFrameCount() const;
     uint64_t GetCurrentBytesWritten() const;
+    bool HasAudio() const { return has_audio_; }
+    CodecType GetAudioCodec() const { return audio_codec_; }
+    void ConfigureAudio(CodecType codec, uint32_t sample_rate = 8000, uint8_t channels = 1);
 
     static void CleanOrphanedTmpFiles(const std::string& directory);
 
@@ -42,8 +45,9 @@ private:
 
     void WriteFtyp();
     void WriteMoov();
-    void WriteMoof(const std::vector<SampleEntry>& samples, uint64_t base_decode_time, uint32_t mdat_size);
-    void WriteMdat(const std::vector<uint8_t>& raw_payload);
+    void WriteMoof(const std::vector<SampleEntry>& video_samples, uint64_t video_base_decode_time, uint32_t video_mdat_size,
+                   const std::vector<SampleEntry>& audio_samples, uint64_t audio_base_decode_time, uint32_t audio_mdat_size);
+    void WriteMdat(const std::vector<uint8_t>& video_payload, const std::vector<uint8_t>& audio_payload);
 
     void ParseSps(const uint8_t* data, size_t size);
 
@@ -74,6 +78,20 @@ private:
     uint32_t height_{1080};
     uint32_t timescale_{90000};
     CodecType codec_{CodecType::H264};
+
+    // Audio track support
+    bool has_audio_{false};
+    CodecType audio_codec_{CodecType::UNKNOWN};
+    uint32_t audio_sample_rate_{8000};
+    uint8_t audio_channels_{1};
+    bool audio_configured_{false};
+    CodecType configured_audio_codec_{CodecType::UNKNOWN};
+    uint32_t configured_audio_sample_rate_{8000};
+    uint8_t configured_audio_channels_{1};
+    uint64_t audio_base_decode_time_{0};
+    int64_t last_audio_pts_us_{0};
+    std::vector<SampleEntry> pending_audio_samples_;
+    std::vector<uint8_t> pending_audio_mdat_bytes_;
 };
 
 } // namespace nvr

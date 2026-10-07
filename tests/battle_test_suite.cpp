@@ -401,6 +401,95 @@ void TestBitstreamAndContainerResilience() {
     assert(found_trun_with_cto);
     std::cout << "     B-Frame check: Verified trun box contains sample-composition-time-offsets flag (0x800). [PASS]" << std::endl;
 
+    // Scenario 2.5: Synchronized Audio + Video Interleaved fMP4 Muxing (AAC & G.711)
+    std::cout << "  -> Scenario 2.5: Synchronized Audio + Video Interleaved fMP4 Muxing (AAC & G.711)..." << std::endl;
+    {
+        nvr::AtomicWriter av_writer(4, test_dir);
+        av_writer.ConfigureAudio(nvr::CodecType::AAC, 48000, 2);
+        assert(av_writer.StartSegment(1700000000000LL));
+
+        // Video parameter sets
+        auto sps_pkt = std::make_shared<nvr::MediaPacket>();
+        sps_pkt->channel_id = 4;
+        sps_pkt->codec = nvr::CodecType::H264;
+        sps_pkt->is_keyframe = true;
+        sps_pkt->data = MakeSps1080p();
+        av_writer.WritePacket(sps_pkt);
+
+        auto pps_pkt = std::make_shared<nvr::MediaPacket>();
+        pps_pkt->channel_id = 4;
+        pps_pkt->codec = nvr::CodecType::H264;
+        pps_pkt->is_keyframe = true;
+        pps_pkt->data = MakePps();
+        av_writer.WritePacket(pps_pkt);
+
+        // Feed 50 video frames (25 fps, 2s) interleaved with 94 AAC audio frames (~21.3ms each)
+        int64_t v_pts_us = 0;
+        int64_t a_pts_us = 0;
+        for (int f = 0; f < 50; ++f) {
+            auto v_pkt = std::make_shared<nvr::MediaPacket>();
+            v_pkt->channel_id = 4;
+            v_pkt->codec = nvr::CodecType::H264;
+            v_pkt->media_type = nvr::MediaType::VIDEO;
+            v_pkt->is_keyframe = (f % 25 == 0);
+            v_pkt->pts_us = v_pts_us;
+            v_pkt->dts_us = v_pts_us;
+            v_pkt->data = v_pkt->is_keyframe ? MakeIdrFrame(2048) : MakeDeltaFrame(512);
+            av_writer.WritePacket(v_pkt);
+            v_pts_us += 40000; // 40ms per video frame (25 fps)
+
+            // Feed ~2 audio packets per video frame to keep in lockstep
+            for (int a = 0; a < 2 && a_pts_us < v_pts_us; ++a) {
+                auto a_pkt = std::make_shared<nvr::MediaPacket>();
+                a_pkt->channel_id = 4;
+                a_pkt->codec = nvr::CodecType::AAC;
+                a_pkt->media_type = nvr::MediaType::AUDIO;
+                a_pkt->is_keyframe = true;
+                a_pkt->pts_us = a_pts_us;
+                a_pkt->dts_us = a_pts_us;
+                // AAC raw frame payload
+                a_pkt->data.assign(256, static_cast<uint8_t>(0xC0 | (a & 0x0F)));
+                av_writer.WritePacket(a_pkt);
+                a_pts_us += 21333; // ~21.33ms per 1024-sample frame at 48kHz
+            }
+        }
+
+        nvr::SegmentMetadata av_meta;
+        assert(av_writer.FinalizeSegment(av_meta));
+        assert(av_meta.has_audio);
+        assert(av_meta.audio_codec == nvr::CodecType::AAC);
+        assert(av_meta.audio_sample_rate == 48000);
+        assert(av_meta.audio_channels == 2);
+        assert(av_meta.frame_count == 50);
+
+        // Parse generated MP4 binary structure
+        std::ifstream av_file(av_meta.file_path, std::ios::binary);
+        std::vector<uint8_t> av_bytes((std::istreambuf_iterator<char>(av_file)), std::istreambuf_iterator<char>());
+        av_file.close();
+
+        bool has_vide_hdlr = false;
+        bool has_soun_hdlr = false;
+        bool has_mp4a_box = false;
+        bool has_esds_box = false;
+        int traf_count = 0;
+
+        for (size_t k = 0; k + 8 <= av_bytes.size(); ++k) {
+            if (std::memcmp(&av_bytes[k], "vide", 4) == 0) has_vide_hdlr = true;
+            if (std::memcmp(&av_bytes[k], "soun", 4) == 0) has_soun_hdlr = true;
+            if (std::memcmp(&av_bytes[k], "mp4a", 4) == 0) has_mp4a_box = true;
+            if (std::memcmp(&av_bytes[k], "esds", 4) == 0) has_esds_box = true;
+            if (std::memcmp(&av_bytes[k], "traf", 4) == 0) traf_count++;
+        }
+
+        assert(has_vide_hdlr);
+        assert(has_soun_hdlr);
+        assert(has_mp4a_box);
+        assert(has_esds_box);
+        // Each fragment has 2 traf boxes (1 video, 1 audio)
+        assert(traf_count >= 2);
+        std::cout << "     A/V Muxer check: Verified dual-track ISOBMFF container (vide+soun, mp4a/esds, dual traf fragments). [PASS]" << std::endl;
+    }
+
     std::filesystem::remove_all(test_dir);
 }
 

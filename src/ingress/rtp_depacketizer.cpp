@@ -4,8 +4,8 @@
 
 namespace nvr {
 
-RtpDepacketizer::RtpDepacketizer(int channel_id, StreamType stream_type, CodecType codec, DepacketizedCallback callback)
-    : channel_id_(channel_id), stream_type_(stream_type), codec_(codec), callback_(std::move(callback)) {
+RtpDepacketizer::RtpDepacketizer(int channel_id, StreamType stream_type, CodecType codec, DepacketizedCallback callback, uint32_t clock_rate)
+    : channel_id_(channel_id), stream_type_(stream_type), codec_(codec), callback_(std::move(callback)), clock_rate_(clock_rate) {
     fu_buffer_.reserve(256 * 1024);
 }
 
@@ -24,6 +24,10 @@ void RtpDepacketizer::ProcessRtpPacket(const uint8_t* payload, size_t size, uint
         ProcessH264(payload, size, rtp_timestamp, seq_num, marker_bit);
     } else if (codec_ == CodecType::H265) {
         ProcessH265(payload, size, rtp_timestamp, seq_num, marker_bit);
+    } else if (codec_ == CodecType::AAC) {
+        ProcessAac(payload, size, rtp_timestamp, seq_num);
+    } else if (codec_ == CodecType::PCMA || codec_ == CodecType::PCMU) {
+        ProcessG711(payload, size, rtp_timestamp, seq_num);
     }
 }
 
@@ -171,6 +175,37 @@ void RtpDepacketizer::ProcessH265(const uint8_t* payload, size_t size, uint32_t 
     }
 }
 
+void RtpDepacketizer::ProcessAac(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num) {
+    if (size < 4) return;
+
+    // RFC 3640 AU-header parsing
+    uint16_t au_headers_len_bits = (static_cast<uint16_t>(payload[0]) << 8) | payload[1];
+    size_t au_headers_len_bytes = (au_headers_len_bits + 7) / 8;
+    if (2 + au_headers_len_bytes > size) {
+        std::vector<uint8_t> frame(payload, payload + size);
+        EmitPacket(frame, true, rtp_timestamp, seq_num);
+        return;
+    }
+
+    uint16_t au_header = (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
+    size_t au_size = au_header >> 3;
+    size_t payload_offset = 2 + au_headers_len_bytes;
+
+    if (payload_offset + au_size <= size && au_size > 0) {
+        std::vector<uint8_t> frame(payload + payload_offset, payload + payload_offset + au_size);
+        EmitPacket(frame, true, rtp_timestamp, seq_num);
+    } else {
+        std::vector<uint8_t> frame(payload + payload_offset, payload + size);
+        EmitPacket(frame, true, rtp_timestamp, seq_num);
+    }
+}
+
+void RtpDepacketizer::ProcessG711(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num) {
+    if (size == 0) return;
+    std::vector<uint8_t> frame(payload, payload + size);
+    EmitPacket(frame, true, rtp_timestamp, seq_num);
+}
+
 void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyframe, uint32_t rtp_timestamp, uint16_t seq_num) {
     if (!callback_ || data.empty()) return;
 
@@ -178,12 +213,14 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
     packet->channel_id = channel_id_;
     packet->stream_type = stream_type_;
     packet->codec = codec_;
+    packet->media_type = (codec_ == CodecType::AAC || codec_ == CodecType::PCMA || codec_ == CodecType::PCMU) ?
+                         MediaType::AUDIO : MediaType::VIDEO;
     packet->is_keyframe = is_keyframe;
     packet->rtp_timestamp = rtp_timestamp;
     packet->sequence_number = seq_num;
     packet->wall_time_ms = time_utils::WallTimeMs();
 
-    // Convert RTP 90kHz timestamp to microseconds with seamless 32-bit wrap unrolling
+    // Convert RTP timestamp to microseconds with seamless 32-bit wrap unrolling
     if (!has_base_pts_) {
         base_pts_us_ = time_utils::MonotonicUs();
         last_rtp_timestamp_ = rtp_timestamp;
@@ -193,7 +230,8 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
     } else {
         // Signed 32-bit difference handles wrap around from 0xFFFFFFFF -> 0 smoothly
         int32_t delta_ticks = static_cast<int32_t>(rtp_timestamp - last_rtp_timestamp_);
-        if (delta_ticks < -900000 || delta_ticks > 900000) {
+        int64_t max_drift_ticks = static_cast<int64_t>(clock_rate_) * 10LL;
+        if (delta_ticks < -max_drift_ticks || delta_ticks > max_drift_ticks) {
             // Clock jump >10s detected; re-anchor to monotonic clock
             base_pts_us_ = time_utils::MonotonicUs();
             unwrapped_rtp_timestamp_ = 0;
@@ -202,7 +240,7 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
         }
         last_rtp_timestamp_ = rtp_timestamp;
 
-        int64_t delta_us = (unwrapped_rtp_timestamp_ * 1000000LL) / 90000LL;
+        int64_t delta_us = (unwrapped_rtp_timestamp_ * 1000000LL) / static_cast<int64_t>(clock_rate_);
         packet->pts_us = base_pts_us_ + delta_us;
     }
     packet->dts_us = packet->pts_us;

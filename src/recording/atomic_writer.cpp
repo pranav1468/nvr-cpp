@@ -161,8 +161,35 @@ bool AtomicWriter::StartSegment(int64_t start_wall_time_ms) {
     pending_samples_.clear();
     pending_mdat_bytes_.clear();
 
+    if (audio_configured_) {
+        has_audio_ = true;
+        audio_codec_ = configured_audio_codec_;
+        audio_sample_rate_ = configured_audio_sample_rate_;
+        audio_channels_ = configured_audio_channels_;
+    } else {
+        has_audio_ = false;
+        audio_codec_ = CodecType::UNKNOWN;
+        audio_sample_rate_ = 8000;
+        audio_channels_ = 1;
+    }
+    audio_base_decode_time_ = 0;
+    last_audio_pts_us_ = 0;
+    pending_audio_samples_.clear();
+    pending_audio_mdat_bytes_.clear();
+
     LOG_INFO << "[Channel " << channel_id_ << "] Started atomic segment: " << tmp_file_path_;
     return true;
+}
+
+void AtomicWriter::ConfigureAudio(CodecType codec, uint32_t sample_rate, uint8_t channels) {
+    audio_configured_ = true;
+    configured_audio_codec_ = codec;
+    configured_audio_sample_rate_ = sample_rate;
+    configured_audio_channels_ = channels;
+    has_audio_ = true;
+    audio_codec_ = codec;
+    audio_sample_rate_ = sample_rate;
+    audio_channels_ = channels;
 }
 
 void AtomicWriter::ParseSps(const uint8_t* data, size_t size) {
@@ -282,7 +309,7 @@ void AtomicWriter::WriteMoov() {
     PutU32(buf, 0); PutU32(buf, 0x00010000); PutU32(buf, 0);
     PutU32(buf, 0); PutU32(buf, 0); PutU32(buf, 0x40000000);
     for (int i = 0; i < 6; ++i) PutU32(buf, 0); // pre_defined[6]
-    PutU32(buf, 2); // next_track_ID
+    PutU32(buf, has_audio_ ? 3 : 2); // next_track_ID
     UpdateBoxSize(buf, mvhd_start);
 
     // trak
@@ -480,6 +507,207 @@ void AtomicWriter::WriteMoov() {
     UpdateBoxSize(buf, mdia_start);
     UpdateBoxSize(buf, trak_start);
 
+    // Track 2 (audio) trak
+    if (has_audio_) {
+        size_t audio_trak_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "trak");
+
+        // tkhd
+        size_t audio_tkhd_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "tkhd");
+        PutU32(buf, 0x00000003); // enabled | in_movie
+        PutU32(buf, 0); PutU32(buf, 0); // creation / mod
+        PutU32(buf, 2); // track_ID = 2
+        PutU32(buf, 0); // reserved
+        PutU32(buf, 0); // duration = 0
+        PutU32(buf, 0); PutU32(buf, 0); // reserved[2]
+        PutU16(buf, 0); // layer
+        PutU16(buf, 0); // alternate_group
+        PutU16(buf, 0x0100); // volume = 1.0 (audio)
+        PutU16(buf, 0); // reserved
+        // Unity matrix
+        PutU32(buf, 0x00010000); PutU32(buf, 0); PutU32(buf, 0);
+        PutU32(buf, 0); PutU32(buf, 0x00010000); PutU32(buf, 0);
+        PutU32(buf, 0); PutU32(buf, 0); PutU32(buf, 0x40000000);
+        PutU32(buf, 0); // width = 0
+        PutU32(buf, 0); // height = 0
+        UpdateBoxSize(buf, audio_tkhd_start);
+
+        // mdia
+        size_t audio_mdia_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "mdia");
+
+        // mdhd
+        size_t audio_mdhd_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "mdhd");
+        PutU32(buf, 0);
+        PutU32(buf, 0); PutU32(buf, 0);
+        PutU32(buf, audio_sample_rate_); // timescale
+        PutU32(buf, 0); // duration = 0
+        PutU16(buf, 0x55C4); // language 'und'
+        PutU16(buf, 0);
+        UpdateBoxSize(buf, audio_mdhd_start);
+
+        // hdlr
+        size_t audio_hdlr_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "hdlr");
+        PutU32(buf, 0);
+        PutU32(buf, 0);
+        PutFourCC(buf, "soun");
+        PutU32(buf, 0); PutU32(buf, 0); PutU32(buf, 0);
+        const char* audio_hdlr_name = "SoundHandler";
+        for (size_t i = 0; i <= strlen(audio_hdlr_name); ++i) buf.push_back(static_cast<uint8_t>(audio_hdlr_name[i]));
+        UpdateBoxSize(buf, audio_hdlr_start);
+
+        // minf
+        size_t audio_minf_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "minf");
+
+        // smhd
+        size_t smhd_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "smhd");
+        PutU32(buf, 0); // version 0, flags 0
+        PutU16(buf, 0); // balance = 0
+        PutU16(buf, 0); // reserved
+        UpdateBoxSize(buf, smhd_start);
+
+        // dinf & dref
+        size_t audio_dinf_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "dinf");
+        size_t audio_dref_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "dref");
+        PutU32(buf, 0);
+        PutU32(buf, 1);
+        PutU32(buf, 12);
+        PutFourCC(buf, "url ");
+        PutU32(buf, 0x00000001);
+        UpdateBoxSize(buf, audio_dref_start);
+        UpdateBoxSize(buf, audio_dinf_start);
+
+        // stbl
+        size_t audio_stbl_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "stbl");
+
+        // stsd
+        size_t audio_stsd_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "stsd");
+        PutU32(buf, 0);
+        PutU32(buf, 1); // entry_count = 1
+
+        size_t audio_entry_start = buf.size();
+        PutU32(buf, 0);
+        if (audio_codec_ == CodecType::PCMA) {
+            PutFourCC(buf, "alaw");
+        } else if (audio_codec_ == CodecType::PCMU) {
+            PutFourCC(buf, "ulaw");
+        } else {
+            PutFourCC(buf, "mp4a");
+        }
+        for (int i = 0; i < 6; ++i) buf.push_back(0); // reserved
+        PutU16(buf, 1); // data_reference_index = 1
+        PutU16(buf, 0); // sound_version = 0
+        PutU16(buf, 0); // reserved
+        PutU32(buf, 0); // reserved2
+        PutU16(buf, static_cast<uint16_t>(audio_channels_)); // channelcount
+        PutU16(buf, 16); // samplesize (16-bit)
+        PutU16(buf, 0); // pre_defined
+        PutU16(buf, 0); // reserved3
+        PutU32(buf, audio_sample_rate_ << 16); // 16.16 samplerate
+
+        if (audio_codec_ == CodecType::AAC) {
+            // Write esds box for AAC
+            size_t esds_start = buf.size();
+            PutU32(buf, 0);
+            PutFourCC(buf, "esds");
+            PutU32(buf, 0); // version 0, flags 0
+
+            // Sampling frequency index (ISO/IEC 14496-3)
+            uint8_t freq_idx = 4; // default 44100
+            switch (audio_sample_rate_) {
+                case 96000: freq_idx = 0; break;
+                case 88200: freq_idx = 1; break;
+                case 64000: freq_idx = 2; break;
+                case 48000: freq_idx = 3; break;
+                case 44100: freq_idx = 4; break;
+                case 32000: freq_idx = 5; break;
+                case 24000: freq_idx = 6; break;
+                case 22050: freq_idx = 7; break;
+                case 16000: freq_idx = 8; break;
+                case 12000: freq_idx = 9; break;
+                case 11025: freq_idx = 10; break;
+                case 8000:  freq_idx = 11; break;
+                default:    freq_idx = 3; break;
+            }
+            uint8_t asc[2];
+            asc[0] = static_cast<uint8_t>((2 << 3) | (freq_idx >> 1));
+            asc[1] = static_cast<uint8_t>(((freq_idx & 1) << 7) | (audio_channels_ << 3));
+
+            // ES_Descriptor tag 0x03
+            buf.push_back(0x03);
+            buf.push_back(25); // tag length
+            PutU16(buf, 2); // ES_ID = 2
+            buf.push_back(0); // priority = 0
+
+            // DecoderConfigDescriptor tag 0x04
+            buf.push_back(0x04);
+            buf.push_back(17); // tag length
+            buf.push_back(0x40); // objectTypeIndication = Audio ISO/IEC 14496-3 AAC
+            buf.push_back(0x15); // streamType = Audio (5<<2 | 1)
+            buf.push_back(0x00); buf.push_back(0x00); buf.push_back(0x00); // bufferSizeDB = 0
+            PutU32(buf, 128000); // maxBitrate
+            PutU32(buf, 128000); // avgBitrate
+
+            // DecoderSpecificInfo tag 0x05
+            buf.push_back(0x05);
+            buf.push_back(2); // length = 2 bytes
+            buf.push_back(asc[0]);
+            buf.push_back(asc[1]);
+
+            // SLConfigDescriptor tag 0x06
+            buf.push_back(0x06);
+            buf.push_back(1); // length = 1
+            buf.push_back(0x02); // predefined = 2
+
+            UpdateBoxSize(buf, esds_start);
+        }
+
+        UpdateBoxSize(buf, audio_entry_start);
+        UpdateBoxSize(buf, audio_stsd_start);
+
+        // Dummy empty stts, stsc, stsz, stco for audio
+        size_t audio_empty_stts = buf.size();
+        PutU32(buf, 0); PutFourCC(buf, "stts"); PutU32(buf, 0); PutU32(buf, 0);
+        UpdateBoxSize(buf, audio_empty_stts);
+
+        size_t audio_empty_stsc = buf.size();
+        PutU32(buf, 0); PutFourCC(buf, "stsc"); PutU32(buf, 0); PutU32(buf, 0);
+        UpdateBoxSize(buf, audio_empty_stsc);
+
+        size_t audio_empty_stsz = buf.size();
+        PutU32(buf, 0); PutFourCC(buf, "stsz"); PutU32(buf, 0); PutU32(buf, 0); PutU32(buf, 0);
+        UpdateBoxSize(buf, audio_empty_stsz);
+
+        size_t audio_empty_stco = buf.size();
+        PutU32(buf, 0); PutFourCC(buf, "stco"); PutU32(buf, 0); PutU32(buf, 0);
+        UpdateBoxSize(buf, audio_empty_stco);
+
+        UpdateBoxSize(buf, audio_stbl_start);
+        UpdateBoxSize(buf, audio_minf_start);
+        UpdateBoxSize(buf, audio_mdia_start);
+        UpdateBoxSize(buf, audio_trak_start);
+    }
+
     // mvex box
     size_t mvex_start = buf.size();
     PutU32(buf, 0);
@@ -495,6 +723,20 @@ void AtomicWriter::WriteMoov() {
     PutU32(buf, 0); // default_sample_size
     PutU32(buf, 0x00010000); // default_sample_flags
     UpdateBoxSize(buf, trex_start);
+
+    if (has_audio_) {
+        size_t audio_trex_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "trex");
+        PutU32(buf, 0);
+        PutU32(buf, 2); // track_ID = 2
+        PutU32(buf, 1); // default_sample_description_index = 1
+        PutU32(buf, (audio_codec_ == CodecType::AAC) ? 1024 : 160);
+        PutU32(buf, 0);
+        PutU32(buf, 0x02000000); // sync sample flags
+        UpdateBoxSize(buf, audio_trex_start);
+    }
+
     UpdateBoxSize(buf, mvex_start);
 
     UpdateBoxSize(buf, moov_start);
@@ -504,7 +746,9 @@ void AtomicWriter::WriteMoov() {
     has_header_written_ = true;
 }
 
-void AtomicWriter::WriteMoof(const std::vector<SampleEntry>& samples, uint64_t base_decode_time, uint32_t mdat_size) {
+void AtomicWriter::WriteMoof(const std::vector<SampleEntry>& video_samples, uint64_t video_base_decode_time, uint32_t video_mdat_size,
+                             const std::vector<SampleEntry>& audio_samples, uint64_t audio_base_decode_time, uint32_t audio_mdat_size) {
+    (void)audio_mdat_size;
     std::vector<uint8_t> buf;
     size_t moof_start = buf.size();
     PutU32(buf, 0);
@@ -518,48 +762,47 @@ void AtomicWriter::WriteMoof(const std::vector<SampleEntry>& samples, uint64_t b
     PutU32(buf, fragment_sequence_++);
     UpdateBoxSize(buf, mfhd_start);
 
-    // traf
-    size_t traf_start = buf.size();
+    // Track 1 (video) traf
+    size_t video_traf_start = buf.size();
     PutU32(buf, 0);
     PutFourCC(buf, "traf");
 
     // tfhd
-    size_t tfhd_start = buf.size();
+    size_t video_tfhd_start = buf.size();
     PutU32(buf, 0);
     PutFourCC(buf, "tfhd");
     PutU32(buf, 0x020000); // default-base-is-moof
-    PutU32(buf, 1); // track_ID
-    UpdateBoxSize(buf, tfhd_start);
+    PutU32(buf, 1); // track_ID = 1
+    UpdateBoxSize(buf, video_tfhd_start);
 
     // tfdt
-    size_t tfdt_start = buf.size();
+    size_t video_tfdt_start = buf.size();
     PutU32(buf, 0);
     PutFourCC(buf, "tfdt");
     PutU32(buf, 0x01000000); // version 1
-    PutU64(buf, base_decode_time);
-    UpdateBoxSize(buf, tfdt_start);
+    PutU64(buf, video_base_decode_time);
+    UpdateBoxSize(buf, video_tfdt_start);
 
     // trun
-    size_t trun_start = buf.size();
+    size_t video_trun_start = buf.size();
     PutU32(buf, 0);
     PutFourCC(buf, "trun");
 
     bool has_cto = false;
-    for (const auto& s : samples) {
+    for (const auto& s : video_samples) {
         if (s.composition_time_offset != 0) {
             has_cto = true;
             break;
         }
     }
 
-    // flags: data-offset (0x01) | duration (0x100) | size (0x200) | flags (0x400) | optional cto (0x800)
     uint32_t trun_flags = has_cto ? 0x000F01 : 0x000701;
     PutU32(buf, trun_flags);
-    PutU32(buf, static_cast<uint32_t>(samples.size()));
-    size_t data_offset_pos = buf.size();
+    PutU32(buf, static_cast<uint32_t>(video_samples.size()));
+    size_t video_data_offset_pos = buf.size();
     PutU32(buf, 0); // placeholder data_offset
 
-    for (const auto& s : samples) {
+    for (const auto& s : video_samples) {
         PutU32(buf, s.duration);
         PutU32(buf, s.size);
         uint32_t sample_flags = s.is_keyframe ? 0x02000000 : 0x01010000;
@@ -568,31 +811,92 @@ void AtomicWriter::WriteMoof(const std::vector<SampleEntry>& samples, uint64_t b
             PutU32(buf, static_cast<uint32_t>(s.composition_time_offset));
         }
     }
-    UpdateBoxSize(buf, trun_start);
-    UpdateBoxSize(buf, traf_start);
+    UpdateBoxSize(buf, video_trun_start);
+    UpdateBoxSize(buf, video_traf_start);
+
+    // Track 2 (audio) traf
+    size_t audio_data_offset_pos = 0;
+    bool write_audio_traf = has_audio_ && !audio_samples.empty();
+    if (write_audio_traf) {
+        size_t audio_traf_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "traf");
+
+        // tfhd
+        size_t audio_tfhd_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "tfhd");
+        PutU32(buf, 0x020000); // default-base-is-moof
+        PutU32(buf, 2); // track_ID = 2
+        UpdateBoxSize(buf, audio_tfhd_start);
+
+        // tfdt
+        size_t audio_tfdt_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "tfdt");
+        PutU32(buf, 0x01000000); // version 1
+        PutU64(buf, audio_base_decode_time);
+        UpdateBoxSize(buf, audio_tfdt_start);
+
+        // trun
+        size_t audio_trun_start = buf.size();
+        PutU32(buf, 0);
+        PutFourCC(buf, "trun");
+        PutU32(buf, 0x000701); // data-offset | duration | size | flags
+        PutU32(buf, static_cast<uint32_t>(audio_samples.size()));
+        audio_data_offset_pos = buf.size();
+        PutU32(buf, 0); // placeholder audio data_offset
+
+        for (const auto& s : audio_samples) {
+            PutU32(buf, s.duration);
+            PutU32(buf, s.size);
+            PutU32(buf, 0x02000000); // sync sample flags
+        }
+        UpdateBoxSize(buf, audio_trun_start);
+        UpdateBoxSize(buf, audio_traf_start);
+    }
+
     UpdateBoxSize(buf, moof_start);
 
-    // Patch data_offset = total moof size + 8 (mdat header size)
     uint32_t moof_size = static_cast<uint32_t>(buf.size() - moof_start);
-    uint32_t data_offset = moof_size + 8;
-    buf[data_offset_pos]     = static_cast<uint8_t>((data_offset >> 24) & 0xFF);
-    buf[data_offset_pos + 1] = static_cast<uint8_t>((data_offset >> 16) & 0xFF);
-    buf[data_offset_pos + 2] = static_cast<uint8_t>((data_offset >> 8) & 0xFF);
-    buf[data_offset_pos + 3] = static_cast<uint8_t>(data_offset & 0xFF);
+    uint32_t video_data_offset = moof_size + 8; // mdat header is 8 bytes
+    buf[video_data_offset_pos]     = static_cast<uint8_t>((video_data_offset >> 24) & 0xFF);
+    buf[video_data_offset_pos + 1] = static_cast<uint8_t>((video_data_offset >> 16) & 0xFF);
+    buf[video_data_offset_pos + 2] = static_cast<uint8_t>((video_data_offset >> 8) & 0xFF);
+    buf[video_data_offset_pos + 3] = static_cast<uint8_t>(video_data_offset & 0xFF);
+
+    if (write_audio_traf) {
+        uint32_t audio_data_offset = moof_size + 8 + video_mdat_size;
+        buf[audio_data_offset_pos]     = static_cast<uint8_t>((audio_data_offset >> 24) & 0xFF);
+        buf[audio_data_offset_pos + 1] = static_cast<uint8_t>((audio_data_offset >> 16) & 0xFF);
+        buf[audio_data_offset_pos + 2] = static_cast<uint8_t>((audio_data_offset >> 8) & 0xFF);
+        buf[audio_data_offset_pos + 3] = static_cast<uint8_t>(audio_data_offset & 0xFF);
+    }
 
     WriteAll(fd_, buf.data(), buf.size());
     total_bytes_written_ += buf.size();
+}
 
-    // Write mdat box header
+void AtomicWriter::WriteMdat(const std::vector<uint8_t>& video_payload, const std::vector<uint8_t>& audio_payload) {
+    uint32_t total_payload = static_cast<uint32_t>(video_payload.size() + (has_audio_ ? audio_payload.size() : 0));
     std::vector<uint8_t> mdat_hdr;
-    PutU32(mdat_hdr, mdat_size + 8);
+    PutU32(mdat_hdr, total_payload + 8);
     PutFourCC(mdat_hdr, "mdat");
     WriteAll(fd_, mdat_hdr.data(), mdat_hdr.size());
     total_bytes_written_ += mdat_hdr.size();
+
+    if (!video_payload.empty()) {
+        WriteAll(fd_, video_payload.data(), video_payload.size());
+        total_bytes_written_ += video_payload.size();
+    }
+    if (has_audio_ && !audio_payload.empty()) {
+        WriteAll(fd_, audio_payload.data(), audio_payload.size());
+        total_bytes_written_ += audio_payload.size();
+    }
 }
 
 void AtomicWriter::FlushCurrentFragment() {
-    if (pending_samples_.empty() || pending_mdat_bytes_.empty()) {
+    if (pending_samples_.empty() && pending_audio_samples_.empty()) {
         return;
     }
 
@@ -601,22 +905,57 @@ void AtomicWriter::FlushCurrentFragment() {
         WriteMoov();
     }
 
-    WriteMoof(pending_samples_, base_decode_time_, static_cast<uint32_t>(pending_mdat_bytes_.size()));
-    WriteAll(fd_, pending_mdat_bytes_.data(), pending_mdat_bytes_.size());
-    total_bytes_written_ += pending_mdat_bytes_.size();
+    WriteMoof(pending_samples_, base_decode_time_, static_cast<uint32_t>(pending_mdat_bytes_.size()),
+              pending_audio_samples_, audio_base_decode_time_, static_cast<uint32_t>(pending_audio_mdat_bytes_.size()));
 
-    // Advance base decode time by total sample duration in fragment
+    WriteMdat(pending_mdat_bytes_, pending_audio_mdat_bytes_);
+
     for (const auto& s : pending_samples_) {
         base_decode_time_ += s.duration;
+    }
+    for (const auto& s : pending_audio_samples_) {
+        audio_base_decode_time_ += s.duration;
     }
 
     pending_samples_.clear();
     pending_mdat_bytes_.clear();
+    pending_audio_samples_.clear();
+    pending_audio_mdat_bytes_.clear();
 }
 
 bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
     if (!is_active_ || !packet || packet->data.empty()) {
         return false;
+    }
+
+    if (packet->IsAudio()) {
+        if (!has_audio_) {
+            has_audio_ = true;
+            audio_codec_ = packet->codec;
+            audio_sample_rate_ = (packet->codec == CodecType::AAC) ? 48000 : 8000;
+            audio_channels_ = 1;
+        }
+
+        uint32_t audio_sample_dur = (audio_codec_ == CodecType::AAC) ? 1024 : 160;
+        if (last_audio_pts_us_ > 0 && packet->pts_us > last_audio_pts_us_) {
+            int64_t diff_us = packet->pts_us - last_audio_pts_us_;
+            audio_sample_dur = static_cast<uint32_t>((diff_us * audio_sample_rate_) / 1000000LL);
+            if (audio_sample_dur == 0) {
+                audio_sample_dur = (audio_codec_ == CodecType::AAC) ? 1024 : 160;
+            }
+        }
+        last_audio_pts_us_ = packet->pts_us;
+
+        SampleEntry audio_entry;
+        audio_entry.size = static_cast<uint32_t>(packet->data.size());
+        audio_entry.duration = audio_sample_dur;
+        audio_entry.is_keyframe = true;
+        audio_entry.pts = static_cast<uint64_t>(packet->pts_us);
+        audio_entry.composition_time_offset = 0;
+
+        pending_audio_samples_.push_back(audio_entry);
+        pending_audio_mdat_bytes_.insert(pending_audio_mdat_bytes_.end(), packet->data.begin(), packet->data.end());
+        return true;
     }
 
     codec_ = packet->codec;
@@ -769,10 +1108,15 @@ bool AtomicWriter::FinalizeSegment(SegmentMetadata& out_meta) {
     out_meta.width = width_;
     out_meta.height = height_;
     out_meta.fps = (duration_ms > 0) ? static_cast<uint32_t>((frame_count_ * 1000) / duration_ms) : 25;
+    out_meta.has_audio = has_audio_;
+    out_meta.audio_codec = audio_codec_;
+    out_meta.audio_sample_rate = audio_sample_rate_;
+    out_meta.audio_channels = audio_channels_;
 
     LOG_INFO << "[Channel " << channel_id_ << "] Successfully finalized atomic segment: "
              << final_file_path_ << " (" << (total_bytes_written_ / 1024) << " KB, "
-             << frame_count_ << " frames, " << duration_ms << " ms)";
+             << frame_count_ << " frames, " << duration_ms << " ms"
+             << (has_audio_ ? ", with audio" : ", video only") << ")";
 
     is_active_ = false;
     return true;

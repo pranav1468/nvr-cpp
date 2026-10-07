@@ -21,6 +21,15 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
 
     std::lock_guard<std::mutex> lock(mutex_);
 
+    // Audio stream packets are routed directly to the writer when active.
+    // Audio never dictates segment rotation and is dropped if waiting for first keyframe.
+    if (packet->IsAudio()) {
+        if (is_recording_) {
+            writer_.WritePacket(packet);
+        }
+        return;
+    }
+
     // Segments must always begin on an IDR keyframe
     if (waiting_for_first_keyframe_) {
         if (!packet->is_keyframe) {
@@ -91,6 +100,11 @@ void Segmenter::FlushAndStop() {
         waiting_for_first_keyframe_ = true;
         LOG_INFO << "[Channel " << channel_id_ << "] Flushed and stopped segmenter";
     }
+}
+
+void Segmenter::ConfigureAudio(CodecType codec, uint32_t sample_rate, uint8_t channels) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    writer_.ConfigureAudio(codec, sample_rate, channels);
 }
 
 bool Segmenter::IsRecording() const {

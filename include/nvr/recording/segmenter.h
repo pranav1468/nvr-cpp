@@ -17,6 +17,8 @@ public:
 
     void FlushAndStop();
 
+    void ConfigureAudio(CodecType codec, uint32_t sample_rate = 8000, uint8_t channels = 1);
+
     bool IsRecording() const;
     uint32_t GetCurrentFrameCount() const;
     uint64_t GetCurrentBytesWritten() const;

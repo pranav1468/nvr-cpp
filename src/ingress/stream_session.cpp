@@ -311,24 +311,51 @@ void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control,
     track_control.clear();
     codec = CodecType::H264;
     payload_type = 96;
+    has_audio_track_ = false;
+    audio_track_control_.clear();
+    audio_codec_ = CodecType::UNKNOWN;
+    audio_clock_rate_ = 8000;
+    audio_channels_ = 1;
 
     std::istringstream stream(sdp);
     std::string line;
     bool in_video = false;
+    bool in_audio = false;
 
     while (std::getline(stream, line)) {
         if (!line.empty() && line.back() == '\r') line.pop_back();
 
         if (line.rfind("m=video", 0) == 0) {
             in_video = true;
+            in_audio = false;
             std::istringstream iss(line);
             std::string m, port, proto, pt;
             iss >> m >> port >> proto >> pt;
             if (!pt.empty()) {
                 try { payload_type = std::stoi(pt); } catch (...) {}
             }
-        } else if (line.rfind("m=", 0) == 0 && in_video) {
+        } else if (line.rfind("m=audio", 0) == 0) {
+            in_audio = true;
             in_video = false;
+            has_audio_track_ = true;
+            std::istringstream iss(line);
+            std::string m, port, proto, pt;
+            iss >> m >> port >> proto >> pt;
+            if (!pt.empty()) {
+                try {
+                    audio_payload_type_ = std::stoi(pt);
+                    if (audio_payload_type_ == 0) {
+                        audio_codec_ = CodecType::PCMU;
+                        audio_clock_rate_ = 8000;
+                    } else if (audio_payload_type_ == 8) {
+                        audio_codec_ = CodecType::PCMA;
+                        audio_clock_rate_ = 8000;
+                    }
+                } catch (...) {}
+            }
+        } else if (line.rfind("m=", 0) == 0) {
+            in_video = false;
+            in_audio = false;
         }
 
         if (in_video) {
@@ -363,11 +390,38 @@ void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control,
                     }
                 }
             }
+        } else if (in_audio) {
+            if (line.rfind("a=control:", 0) == 0) {
+                audio_track_control_ = line.substr(10);
+            }
+            if (line.find("PCMU") != std::string::npos || line.find("pcmu") != std::string::npos) {
+                audio_codec_ = CodecType::PCMU;
+                audio_clock_rate_ = 8000;
+            } else if (line.find("PCMA") != std::string::npos || line.find("pcma") != std::string::npos) {
+                audio_codec_ = CodecType::PCMA;
+                audio_clock_rate_ = 8000;
+            } else if (line.find("MPEG4-GENERIC") != std::string::npos || line.find("mpeg4-generic") != std::string::npos ||
+                       line.find("MP4A-LATM") != std::string::npos || line.find("mp4a-latm") != std::string::npos) {
+                audio_codec_ = CodecType::AAC;
+                size_t slash1 = line.find('/');
+                if (slash1 != std::string::npos) {
+                    size_t slash2 = line.find('/', slash1 + 1);
+                    std::string rate_str = (slash2 != std::string::npos) ?
+                        line.substr(slash1 + 1, slash2 - slash1 - 1) : line.substr(slash1 + 1);
+                    try { audio_clock_rate_ = std::stoi(rate_str); } catch (...) {}
+                    if (slash2 != std::string::npos) {
+                        try { audio_channels_ = static_cast<uint8_t>(std::stoi(line.substr(slash2 + 1))); } catch (...) {}
+                    }
+                }
+            }
         }
     }
 
     if (track_control.empty()) {
         track_control = "trackID=1";
+    }
+    if (has_audio_track_ && audio_track_control_.empty()) {
+        audio_track_control_ = "trackID=2";
     }
 }
 
@@ -401,11 +455,34 @@ bool StreamSession::SendRtspDescribe() {
         }
     );
 
+    if (has_audio_track_ && audio_codec_ != CodecType::UNKNOWN) {
+        audio_depacketizer_ = std::make_unique<RtpDepacketizer>(
+            channel_id_, stream_type_, audio_codec_,
+            [](const MediaPacketPtr& pkt) {
+                StreamBroker::Instance().Publish(pkt);
+            },
+            audio_clock_rate_
+        );
+        LOG_INFO << "[Channel " << channel_id_ << "] Detected audio track: codec=" 
+                 << CodecToString(audio_codec_) << " (" << audio_clock_rate_ << " Hz, "
+                 << static_cast<int>(audio_channels_) << " ch)";
+    }
+
     state_ = SessionState::DESCRIBE_SENT;
-    return SendRtspSetup(track_control);
+    if (!SendRtspSetup(track_control, 0, 1)) {
+        return false;
+    }
+
+    if (has_audio_track_ && !audio_track_control_.empty() && audio_codec_ != CodecType::UNKNOWN) {
+        if (!SendRtspSetup(audio_track_control_, 2, 3)) {
+            LOG_WARN << "[Channel " << channel_id_ << "] Audio track SETUP failed, continuing video-only";
+        }
+    }
+
+    return SendRtspPlay();
 }
 
-bool StreamSession::SendRtspSetup(const std::string& track_control) {
+bool StreamSession::SendRtspSetup(const std::string& track_control, int rtp_channel, int rtcp_channel) {
     std::string setup_url = rtsp_url_;
     if (track_control.rfind("rtsp://", 0) == 0) {
         setup_url = track_control;
@@ -419,8 +496,11 @@ bool StreamSession::SendRtspSetup(const std::string& track_control) {
     std::ostringstream oss;
     oss << "SETUP " << setup_url << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
-        << "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
-        << "User-Agent: NVR_Core/1.0\r\n"
+        << "Transport: RTP/AVP/TCP;unicast;interleaved=" << rtp_channel << "-" << rtcp_channel << "\r\n";
+    if (!session_id_.empty()) {
+        oss << "Session: " << session_id_ << "\r\n";
+    }
+    oss << "User-Agent: NVR_Core/1.0\r\n"
         << auth_header_
         << "\r\n";
 
@@ -433,16 +513,18 @@ bool StreamSession::SendRtspSetup(const std::string& track_control) {
         return false;
     }
 
-    size_t sess_pos = resp.find("Session: ");
-    if (sess_pos == std::string::npos) sess_pos = resp.find("session: ");
-    if (sess_pos != std::string::npos) {
-        size_t val_start = sess_pos + 9;
-        size_t val_end = resp.find_first_of(";\r\n", val_start);
-        session_id_ = resp.substr(val_start, val_end - val_start);
+    if (session_id_.empty()) {
+        size_t sess_pos = resp.find("Session: ");
+        if (sess_pos == std::string::npos) sess_pos = resp.find("session: ");
+        if (sess_pos != std::string::npos) {
+            size_t val_start = sess_pos + 9;
+            size_t val_end = resp.find_first_of(";\r\n", val_start);
+            session_id_ = resp.substr(val_start, val_end - val_start);
+        }
     }
 
     state_ = SessionState::SETUP_SENT;
-    return SendRtspPlay();
+    return true;
 }
 
 bool StreamSession::SendRtspPlay() {
@@ -532,7 +614,7 @@ void StreamSession::WorkerLoop() {
 
             if (!ReadExact(rtp_buf.data(), length, 2000)) break;
 
-            if (channel == 0 && length >= 12) { // RTP Channel
+            if ((channel == 0 || channel == 2) && length >= 12) { // Video (ch 0) or Audio (ch 2) RTP
                 // Parse RTP header
                 uint8_t b0 = rtp_buf[0];
                 uint8_t b1 = rtp_buf[1];
@@ -554,13 +636,23 @@ void StreamSession::WorkerLoop() {
                 }
 
                 if (payload_offset < length) {
-                    depacketizer_->ProcessRtpPacket(
-                        rtp_buf.data() + payload_offset,
-                        length - payload_offset,
-                        rtp_timestamp,
-                        seq_num,
-                        marker_bit
-                    );
+                    if (channel == 0 && depacketizer_) {
+                        depacketizer_->ProcessRtpPacket(
+                            rtp_buf.data() + payload_offset,
+                            length - payload_offset,
+                            rtp_timestamp,
+                            seq_num,
+                            marker_bit
+                        );
+                    } else if (channel == 2 && audio_depacketizer_) {
+                        audio_depacketizer_->ProcessRtpPacket(
+                            rtp_buf.data() + payload_offset,
+                            length - payload_offset,
+                            rtp_timestamp,
+                            seq_num,
+                            marker_bit
+                        );
+                    }
                 }
             }
 

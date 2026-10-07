@@ -27,6 +27,15 @@ inline const char* CodecToString(CodecType codec) {
     }
 }
 
+inline CodecType StringToCodec(const std::string& str) {
+    if (str == "H264") return CodecType::H264;
+    if (str == "H265" || str == "HEVC") return CodecType::H265;
+    if (str == "AAC") return CodecType::AAC;
+    if (str == "PCMU") return CodecType::PCMU;
+    if (str == "PCMA") return CodecType::PCMA;
+    return CodecType::UNKNOWN;
+}
+
 enum class StreamType {
     MAIN = 0,
     SUB = 1
@@ -60,9 +69,15 @@ enum class SessionState {
     ERROR_BACKOFF
 };
 
+enum class MediaType {
+    VIDEO = 0,
+    AUDIO = 1
+};
+
 struct MediaPacket {
     int channel_id{0};
     StreamType stream_type{StreamType::MAIN};
+    MediaType media_type{MediaType::VIDEO};
     CodecType codec{CodecType::H264};
     bool is_keyframe{false};
     uint32_t rtp_timestamp{0};
@@ -71,6 +86,16 @@ struct MediaPacket {
     int64_t wall_time_ms{0};
     uint16_t sequence_number{0};
     std::vector<uint8_t> data;
+
+    bool IsAudio() const {
+        return media_type == MediaType::AUDIO ||
+               codec == CodecType::AAC ||
+               codec == CodecType::PCMU ||
+               codec == CodecType::PCMA;
+    }
+    bool IsVideo() const {
+        return !IsAudio();
+    }
 };
 
 using MediaPacketPtr = std::shared_ptr<MediaPacket>;
@@ -100,6 +125,10 @@ struct SegmentMetadata {
     uint32_t width{1920};
     uint32_t height{1080};
     uint32_t fps{25};
+    bool has_audio{false};
+    CodecType audio_codec{CodecType::UNKNOWN};
+    uint32_t audio_sample_rate{8000};
+    uint8_t audio_channels{1};
 };
 
 struct StorageConfig {

@@ -11,7 +11,7 @@ using DepacketizedCallback = std::function<void(const MediaPacketPtr&)>;
 
 class RtpDepacketizer {
 public:
-    RtpDepacketizer(int channel_id, StreamType stream_type, CodecType codec, DepacketizedCallback callback);
+    RtpDepacketizer(int channel_id, StreamType stream_type, CodecType codec, DepacketizedCallback callback, uint32_t clock_rate = 90000);
     ~RtpDepacketizer() = default;
 
     void ProcessRtpPacket(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit);
@@ -21,6 +21,8 @@ public:
 private:
     void ProcessH264(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit);
     void ProcessH265(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit);
+    void ProcessAac(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num);
+    void ProcessG711(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num);
 
     void EmitPacket(const std::vector<uint8_t>& data, bool is_keyframe, uint32_t rtp_timestamp, uint16_t seq_num);
 
@@ -28,6 +30,7 @@ private:
     StreamType stream_type_{StreamType::MAIN};
     CodecType codec_{CodecType::H264};
     DepacketizedCallback callback_;
+    uint32_t clock_rate_{90000};
 
     // Fragmentation reassembly buffer
     std::vector<uint8_t> fu_buffer_;

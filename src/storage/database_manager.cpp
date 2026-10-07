@@ -94,6 +94,8 @@ bool DatabaseManager::CreateTables() {
         "  width INTEGER DEFAULT 1920,"
         "  height INTEGER DEFAULT 1080,"
         "  fps INTEGER DEFAULT 25,"
+        "  has_audio INTEGER DEFAULT 0,"
+        "  audio_codec TEXT DEFAULT '',"
         "  created_at INTEGER NOT NULL"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_recordings_channel_time ON recordings (channel_id, start_time_ms, end_time_ms);"
@@ -117,6 +119,10 @@ bool DatabaseManager::CreateTables() {
         sqlite3_free(err_msg);
         return false;
     }
+
+    // Upgrade table if already created without audio columns
+    sqlite3_exec(db_, "ALTER TABLE recordings ADD COLUMN has_audio INTEGER DEFAULT 0;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE recordings ADD COLUMN audio_codec TEXT DEFAULT '';", nullptr, nullptr, nullptr);
 
     return true;
 }

@@ -21,8 +21,9 @@ bool SegmentIndex::InsertSegment(const SegmentMetadata& meta) {
     const char* sql = 
         "INSERT INTO recordings ("
         "  channel_id, file_path, start_time_ms, end_time_ms, duration_ms, "
-        "  file_size, frame_count, keyframe_count, is_locked, codec, width, height, fps, created_at"
-        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        "  file_size, frame_count, keyframe_count, is_locked, codec, width, height, fps, "
+        "  has_audio, audio_codec, created_at"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt* stmt = nullptr;
     std::lock_guard<std::mutex> lock(DatabaseManager::Instance().GetMutex());
@@ -45,7 +46,9 @@ bool SegmentIndex::InsertSegment(const SegmentMetadata& meta) {
     sqlite3_bind_int(stmt, 11, static_cast<int>(meta.width));
     sqlite3_bind_int(stmt, 12, static_cast<int>(meta.height));
     sqlite3_bind_int(stmt, 13, static_cast<int>(meta.fps));
-    sqlite3_bind_int64(stmt, 14, time_utils::WallTimeMs());
+    sqlite3_bind_int(stmt, 14, meta.has_audio ? 1 : 0);
+    sqlite3_bind_text(stmt, 15, CodecToString(meta.audio_codec), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 16, time_utils::WallTimeMs());
 
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
@@ -69,7 +72,8 @@ std::vector<SegmentMetadata> SegmentIndex::QuerySegments(int channel_id, int64_t
 
     const char* sql = 
         "SELECT id, channel_id, file_path, start_time_ms, end_time_ms, duration_ms, "
-        "       file_size, frame_count, keyframe_count, is_locked, codec, width, height, fps "
+        "       file_size, frame_count, keyframe_count, is_locked, codec, width, height, fps, "
+        "       has_audio, audio_codec "
         "FROM recordings "
         "WHERE channel_id = ? AND end_time_ms >= ? AND start_time_ms <= ? "
         "ORDER BY start_time_ms ASC;";
@@ -101,6 +105,9 @@ std::vector<SegmentMetadata> SegmentIndex::QuerySegments(int channel_id, int64_t
         m.width = static_cast<uint32_t>(sqlite3_column_int(stmt, 11));
         m.height = static_cast<uint32_t>(sqlite3_column_int(stmt, 12));
         m.fps = static_cast<uint32_t>(sqlite3_column_int(stmt, 13));
+        m.has_audio = (sqlite3_column_int(stmt, 14) != 0);
+        const char* a_codec_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 15));
+        m.audio_codec = a_codec_str ? StringToCodec(a_codec_str) : CodecType::UNKNOWN;
         results.push_back(m);
     }
 
@@ -117,7 +124,8 @@ std::vector<SegmentMetadata> SegmentIndex::GetOldestUnlockedSegments(int limit) 
 
     const char* sql = 
         "SELECT id, channel_id, file_path, start_time_ms, end_time_ms, duration_ms, "
-        "       file_size, frame_count, keyframe_count, is_locked, codec, width, height, fps "
+        "       file_size, frame_count, keyframe_count, is_locked, codec, width, height, fps, "
+        "       has_audio, audio_codec "
         "FROM recordings "
         "WHERE is_locked = 0 "
         "ORDER BY start_time_ms ASC "
@@ -148,6 +156,9 @@ std::vector<SegmentMetadata> SegmentIndex::GetOldestUnlockedSegments(int limit) 
         m.width = static_cast<uint32_t>(sqlite3_column_int(stmt, 11));
         m.height = static_cast<uint32_t>(sqlite3_column_int(stmt, 12));
         m.fps = static_cast<uint32_t>(sqlite3_column_int(stmt, 13));
+        m.has_audio = (sqlite3_column_int(stmt, 14) != 0);
+        const char* a_codec_str = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 15));
+        m.audio_codec = a_codec_str ? StringToCodec(a_codec_str) : CodecType::UNKNOWN;
         results.push_back(m);
     }
 

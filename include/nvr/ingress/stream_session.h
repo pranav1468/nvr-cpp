@@ -29,7 +29,7 @@ private:
 
     bool SendRtspOptions();
     bool SendRtspDescribe();
-    bool SendRtspSetup(const std::string& track_control);
+    bool SendRtspSetup(const std::string& track_control, int rtp_channel = 0, int rtcp_channel = 1);
     bool SendRtspPlay();
     bool SendRtspKeepAlive();
 
@@ -52,6 +52,14 @@ private:
     std::string session_id_;
     std::string auth_header_;
     std::unique_ptr<RtpDepacketizer> depacketizer_;
+    std::unique_ptr<RtpDepacketizer> audio_depacketizer_;
+
+    bool has_audio_track_{false};
+    std::string audio_track_control_;
+    CodecType audio_codec_{CodecType::UNKNOWN};
+    int audio_payload_type_{-1};
+    uint32_t audio_clock_rate_{8000};
+    uint8_t audio_channels_{1};
 };
 
 } // namespace nvr
