@@ -35,6 +35,7 @@ private:
         uint32_t duration{0};
         bool is_keyframe{false};
         uint64_t pts{0};
+        int32_t composition_time_offset{0};
     };
 
     void FlushCurrentFragment();

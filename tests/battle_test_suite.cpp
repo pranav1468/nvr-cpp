@@ -357,6 +357,50 @@ void TestBitstreamAndContainerResilience() {
     assert(found_hvcc);
     std::cout << "     H.265 Muxer check: Verified valid hvc1 sample description and hvcC parameter box. [PASS]" << std::endl;
 
+    // Scenario 2.4: B-Frame Composition Time Offset (CTO) verification
+    std::cout << "  -> Scenario 2.4: B-Frame composition time offset (CTO) in trun box..." << std::endl;
+    nvr::AtomicWriter bframe_writer(1, test_dir);
+    assert(bframe_writer.StartSegment(t0));
+    auto bsps = std::make_shared<nvr::MediaPacket>();
+    bsps->channel_id = 1; bsps->codec = nvr::CodecType::H264; bsps->is_keyframe = true; bsps->data = MakeSps1080p();
+    bframe_writer.WritePacket(bsps);
+    auto bpps = std::make_shared<nvr::MediaPacket>();
+    bpps->channel_id = 1; bpps->codec = nvr::CodecType::H264; bpps->is_keyframe = true; bpps->data = MakePps();
+    bframe_writer.WritePacket(bpps);
+
+    // Write 30 frames with B-frames (where PTS != DTS)
+    for (size_t f = 0; f < 30; ++f) {
+        auto pkt = std::make_shared<nvr::MediaPacket>();
+        pkt->channel_id = 1;
+        pkt->codec = nvr::CodecType::H264;
+        pkt->is_keyframe = (f == 0);
+        pkt->dts_us = f * 40000;
+        pkt->pts_us = pkt->dts_us + ((f % 2 == 1) ? 80000 : 0); // B-frame offset of 80ms
+        pkt->data = pkt->is_keyframe ? MakeIdrFrame(2048) : MakeDeltaFrame(512);
+        bframe_writer.WritePacket(pkt);
+    }
+    nvr::SegmentMetadata bmeta;
+    assert(bframe_writer.FinalizeSegment(bmeta));
+
+    std::ifstream bfile(bmeta.file_path, std::ios::binary);
+    std::vector<uint8_t> bbytes((std::istreambuf_iterator<char>(bfile)), std::istreambuf_iterator<char>());
+    bfile.close();
+
+    bool found_trun_with_cto = false;
+    for (size_t k = 0; k + 8 <= bbytes.size(); ++k) {
+        if (std::memcmp(&bbytes[k], "trun", 4) == 0) {
+            // FullBox: 1 byte version at k+4, 3 bytes flags at k+5, k+6, k+7
+            uint32_t flags = (static_cast<uint32_t>(bbytes[k+5]) << 16) |
+                             (static_cast<uint32_t>(bbytes[k+6]) << 8) |
+                             static_cast<uint32_t>(bbytes[k+7]);
+            if ((flags & 0x000800) != 0) {
+                found_trun_with_cto = true;
+            }
+        }
+    }
+    assert(found_trun_with_cto);
+    std::cout << "     B-Frame check: Verified trun box contains sample-composition-time-offsets flag (0x800). [PASS]" << std::endl;
+
     std::filesystem::remove_all(test_dir);
 }
 
@@ -392,9 +436,9 @@ void TestStorageFailureAndCrashRecovery() {
     // Verify RAII cleaned up in-flight .tmp and NO partial .mp4 exists
     bool has_tmp = false;
     bool has_mp4 = false;
-    for (const auto& entry : std::filesystem::directory_iterator(test_dir)) {
-        if (entry.path().extension() == ".tmp") has_tmp = true;
-        if (entry.path().extension() == ".mp4") has_mp4 = true;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(test_dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".tmp") has_tmp = true;
+        if (entry.is_regular_file() && entry.path().extension() == ".mp4") has_mp4 = true;
     }
     assert(has_tmp == false);
     assert(has_mp4 == false);
@@ -484,6 +528,32 @@ void TestStorageFailureAndCrashRecovery() {
     assert(queried.size() == kInsertsPerThread);
     std::cout << "     Concurrency check: " << (kThreadCount * kInsertsPerThread) 
               << " concurrent segment records committed to SQLite WAL without single lock collision. [PASS]" << std::endl;
+
+    // Scenario 3.5: Hard segment duration ceiling (missing keyframe timeout)
+    std::cout << "  -> Scenario 3.5: Missing keyframe timeout enforcement (hard segment ceiling)..." << std::endl;
+    std::string ceiling_dir = "./test_ceiling_dir";
+    std::filesystem::remove_all(ceiling_dir);
+    std::filesystem::create_directories(ceiling_dir);
+    {
+        nvr::Segmenter ceiling_segmenter(9, ceiling_dir, 1); // 1s segment duration -> 2s ceiling
+        // Push initial IDR at t = 1000ms
+        auto idr = std::make_shared<nvr::MediaPacket>();
+        idr->channel_id = 9; idr->codec = nvr::CodecType::H264; idr->is_keyframe = true;
+        idr->wall_time_ms = 1000; idr->data = MakeIdrFrame(1024);
+        ceiling_segmenter.PushPacket(idr);
+        assert(ceiling_segmenter.IsRecording());
+
+        // Push delta frames past the 2000ms threshold without any keyframes (t = 3500ms > 1000 + 2000)
+        auto delta = std::make_shared<nvr::MediaPacket>();
+        delta->channel_id = 9; delta->codec = nvr::CodecType::H264; delta->is_keyframe = false;
+        delta->wall_time_ms = 3500; delta->data = MakeDeltaFrame(512);
+        ceiling_segmenter.PushPacket(delta);
+
+        // Ceiling should have triggered: segment finalized safely, now waiting for next keyframe!
+        assert(!ceiling_segmenter.IsRecording());
+    }
+    std::cout << "     Segment ceiling check: Exceeded 2x duration ceiling force-finalized segment safely. [PASS]" << std::endl;
+    std::filesystem::remove_all(ceiling_dir);
 
     std::filesystem::remove_all(test_dir);
 }

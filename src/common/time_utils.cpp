@@ -33,5 +33,15 @@ std::string FormatTimestampCompact(int64_t epoch_ms) {
     return oss.str();
 }
 
+std::string FormatDateOnly(int64_t epoch_ms) {
+    std::time_t sec = static_cast<std::time_t>(epoch_ms / 1000);
+    std::tm tm_buf{};
+    localtime_r(&sec, &tm_buf);
+
+    std::ostringstream oss;
+    oss << std::put_time(&tm_buf, "%Y-%m-%d");
+    return oss.str();
+}
+
 } // namespace time_utils
 } // namespace nvr

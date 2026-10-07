@@ -44,6 +44,21 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
         return;
     }
 
+    // Hard segment ceiling guardrail: if camera fails to send keyframe for 2x target duration,
+    // force-finalize current segment to avoid runaway uncommitted file sizes.
+    if (elapsed_ms >= (2 * segment_duration_ms_)) {
+        LOG_WARN << "[Channel " << channel_id_
+                 << "] Missing keyframe timeout (" << elapsed_ms << " ms > "
+                 << (2 * segment_duration_ms_) << " ms ceiling). Force-finalizing segment.";
+        SegmentMetadata meta;
+        if (writer_.FinalizeSegment(meta)) {
+            SegmentIndex::Instance().InsertSegment(meta);
+        }
+        waiting_for_first_keyframe_ = true;
+        is_recording_ = false;
+        return;
+    }
+
     writer_.WritePacket(packet);
 }
 

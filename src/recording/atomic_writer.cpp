@@ -116,7 +116,7 @@ AtomicWriter::~AtomicWriter() {
 void AtomicWriter::CleanOrphanedTmpFiles(const std::string& directory) {
     try {
         if (!std::filesystem::exists(directory)) return;
-        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(directory)) {
             if (entry.is_regular_file() && entry.path().extension() == ".tmp") {
                 LOG_WARN << "Startup cleanup: Removing orphaned temporary segment: " << entry.path();
                 std::filesystem::remove(entry.path());
@@ -133,11 +133,16 @@ bool AtomicWriter::StartSegment(int64_t start_wall_time_ms) {
     }
 
     start_time_ms_ = start_wall_time_ms;
+    std::string date_str = time_utils::FormatDateOnly(start_wall_time_ms);
+    std::filesystem::path target_dir = std::filesystem::path(output_dir_) / date_str;
+    std::error_code ec;
+    std::filesystem::create_directories(target_dir, ec);
+
     std::string timestamp_str = time_utils::FormatTimestampCompact(start_wall_time_ms);
     std::string base_name = "cam" + std::to_string(channel_id_) + "_" + timestamp_str;
 
-    tmp_file_path_ = (std::filesystem::path(output_dir_) / (base_name + ".tmp")).string();
-    final_file_path_ = (std::filesystem::path(output_dir_) / (base_name + ".mp4")).string();
+    tmp_file_path_ = (target_dir / (base_name + ".tmp")).string();
+    final_file_path_ = (target_dir / (base_name + ".mp4")).string();
 
     fd_ = open(tmp_file_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd_ < 0) {
@@ -538,8 +543,18 @@ void AtomicWriter::WriteMoof(const std::vector<SampleEntry>& samples, uint64_t b
     size_t trun_start = buf.size();
     PutU32(buf, 0);
     PutFourCC(buf, "trun");
-    // flags: data-offset-present (0x01) | sample-duration-present (0x100) | sample-size-present (0x200) | sample-flags-present (0x400)
-    PutU32(buf, 0x000701);
+
+    bool has_cto = false;
+    for (const auto& s : samples) {
+        if (s.composition_time_offset != 0) {
+            has_cto = true;
+            break;
+        }
+    }
+
+    // flags: data-offset (0x01) | duration (0x100) | size (0x200) | flags (0x400) | optional cto (0x800)
+    uint32_t trun_flags = has_cto ? 0x000F01 : 0x000701;
+    PutU32(buf, trun_flags);
     PutU32(buf, static_cast<uint32_t>(samples.size()));
     size_t data_offset_pos = buf.size();
     PutU32(buf, 0); // placeholder data_offset
@@ -549,6 +564,9 @@ void AtomicWriter::WriteMoof(const std::vector<SampleEntry>& samples, uint64_t b
         PutU32(buf, s.size);
         uint32_t sample_flags = s.is_keyframe ? 0x02000000 : 0x01010000;
         PutU32(buf, sample_flags);
+        if (has_cto) {
+            PutU32(buf, static_cast<uint32_t>(s.composition_time_offset));
+        }
     }
     UpdateBoxSize(buf, trun_start);
     UpdateBoxSize(buf, traf_start);
@@ -689,6 +707,12 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
     sample.duration = sample_dur;
     sample.is_keyframe = packet->is_keyframe;
     sample.pts = static_cast<uint64_t>(packet->pts_us);
+    if (packet->dts_us > 0 && packet->pts_us != packet->dts_us) {
+        int64_t cto_us = packet->pts_us - packet->dts_us;
+        sample.composition_time_offset = static_cast<int32_t>((cto_us * 90) / 1000);
+    } else {
+        sample.composition_time_offset = 0;
+    }
 
     pending_samples_.push_back(sample);
     pending_mdat_bytes_.insert(pending_mdat_bytes_.end(), frame_bytes.begin(), frame_bytes.end());

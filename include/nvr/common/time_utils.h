@@ -36,5 +36,7 @@ std::string FormatIso8601(int64_t epoch_ms);
 
 std::string FormatTimestampCompact(int64_t epoch_ms);
 
+std::string FormatDateOnly(int64_t epoch_ms);
+
 } // namespace time_utils
 } // namespace nvr
