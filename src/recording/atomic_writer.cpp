@@ -394,23 +394,61 @@ void AtomicWriter::WriteMoov() {
     PutU16(buf, 0x0018); // depth 24
     PutU16(buf, 0xFFFF); // pre_defined -1
 
-    // avcC box
-    if (!sps_bytes_.empty() && !pps_bytes_.empty()) {
-        size_t avcc_start = buf.size();
+    // avcC or hvcC box
+    if (codec_ == CodecType::H265) {
+        size_t hvcc_start = buf.size();
         PutU32(buf, 0);
-        PutFourCC(buf, "avcC");
+        PutFourCC(buf, "hvcC");
         buf.push_back(1); // configurationVersion
-        buf.push_back(sps_bytes_[1]); // AVCProfileIndication
-        buf.push_back(sps_bytes_[2]); // profile_compatibility
-        buf.push_back(sps_bytes_[3]); // AVCLevelIndication
-        buf.push_back(0xFF); // lengthSizeMinusOne = 3 (4 bytes)
-        buf.push_back(0xE1); // numOfSequenceParameterSets = 1
-        PutU16(buf, static_cast<uint16_t>(sps_bytes_.size()));
-        buf.insert(buf.end(), sps_bytes_.begin(), sps_bytes_.end());
-        buf.push_back(1); // numOfPictureParameterSets = 1
-        PutU16(buf, static_cast<uint16_t>(pps_bytes_.size()));
-        buf.insert(buf.end(), pps_bytes_.begin(), pps_bytes_.end());
-        UpdateBoxSize(buf, avcc_start);
+        buf.push_back(0x01); // general_profile_space=0, tier_flag=0, profile_idc=1
+        PutU32(buf, 0x60000000); // compatibility flags
+        for (int k = 0; k < 6; ++k) buf.push_back(0); // constraint flags
+        buf.push_back(93); // level_idc 3.1
+        PutU16(buf, 0xF000); // min_spatial_segmentation_idc
+        buf.push_back(0xFC); // parallelismType = 0
+        buf.push_back(0xFD); // chromaFormat = 1 (4:2:0)
+        buf.push_back(0xF8); // bitDepthLumaMinus8 = 0 (8-bit)
+        buf.push_back(0xF8); // bitDepthChromaMinus8 = 0 (8-bit)
+        PutU16(buf, 0); // avgFrameRate
+        buf.push_back(0x0F); // constantFrameRate=0, lengthSizeMinusOne=3 (4 bytes)
+
+        uint8_t num_arrays = 0;
+        if (!vps_bytes_.empty()) num_arrays++;
+        if (!sps_bytes_.empty()) num_arrays++;
+        if (!pps_bytes_.empty()) num_arrays++;
+        buf.push_back(num_arrays);
+
+        auto write_nal_array = [&](uint8_t nal_type, const std::vector<uint8_t>& data) {
+            if (data.empty()) return;
+            buf.push_back(0x80 | (nal_type & 0x3F));
+            PutU16(buf, 1);
+            PutU16(buf, static_cast<uint16_t>(data.size()));
+            buf.insert(buf.end(), data.begin(), data.end());
+        };
+
+        write_nal_array(32, vps_bytes_);
+        write_nal_array(33, sps_bytes_);
+        write_nal_array(34, pps_bytes_);
+
+        UpdateBoxSize(buf, hvcc_start);
+    } else {
+        if (!sps_bytes_.empty() && !pps_bytes_.empty()) {
+            size_t avcc_start = buf.size();
+            PutU32(buf, 0);
+            PutFourCC(buf, "avcC");
+            buf.push_back(1); // configurationVersion
+            buf.push_back(sps_bytes_[1]); // AVCProfileIndication
+            buf.push_back(sps_bytes_[2]); // profile_compatibility
+            buf.push_back(sps_bytes_[3]); // AVCLevelIndication
+            buf.push_back(0xFF); // lengthSizeMinusOne = 3 (4 bytes)
+            buf.push_back(0xE1); // numOfSequenceParameterSets = 1
+            PutU16(buf, static_cast<uint16_t>(sps_bytes_.size()));
+            buf.insert(buf.end(), sps_bytes_.begin(), sps_bytes_.end());
+            buf.push_back(1); // numOfPictureParameterSets = 1
+            PutU16(buf, static_cast<uint16_t>(pps_bytes_.size()));
+            buf.insert(buf.end(), pps_bytes_.begin(), pps_bytes_.end());
+            UpdateBoxSize(buf, avcc_start);
+        }
     }
     UpdateBoxSize(buf, avc1_start);
     UpdateBoxSize(buf, stsd_start);
@@ -603,17 +641,31 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
 
     for (const auto& [nal_data, nal_len] : nals) {
         if (nal_len == 0) continue;
-        uint8_t nal_type = nal_data[0] & 0x1F;
-
-        if (nal_type == 7) { // SPS
-            sps_bytes_.assign(nal_data, nal_data + nal_len);
-            ParseSps(nal_data, nal_len);
-        } else if (nal_type == 8) { // PPS
-            pps_bytes_.assign(nal_data, nal_data + nal_len);
-        } else if (nal_type == 1 || nal_type == 5) { // Video Slice
-            PutU32(frame_bytes, static_cast<uint32_t>(nal_len));
-            frame_bytes.insert(frame_bytes.end(), nal_data, nal_data + nal_len);
-            frame_sample_size += static_cast<uint32_t>(4 + nal_len);
+        if (codec_ == CodecType::H264) {
+            uint8_t nal_type = nal_data[0] & 0x1F;
+            if (nal_type == 7) { // SPS
+                sps_bytes_.assign(nal_data, nal_data + nal_len);
+                ParseSps(nal_data, nal_len);
+            } else if (nal_type == 8) { // PPS
+                pps_bytes_.assign(nal_data, nal_data + nal_len);
+            } else if (nal_type == 1 || nal_type == 5 || nal_type == 6) { // Slice or SEI
+                PutU32(frame_bytes, static_cast<uint32_t>(nal_len));
+                frame_bytes.insert(frame_bytes.end(), nal_data, nal_data + nal_len);
+                frame_sample_size += static_cast<uint32_t>(4 + nal_len);
+            }
+        } else if (codec_ == CodecType::H265) {
+            uint8_t nal_type = (nal_data[0] >> 1) & 0x3F;
+            if (nal_type == 32) { // VPS
+                vps_bytes_.assign(nal_data, nal_data + nal_len);
+            } else if (nal_type == 33) { // SPS
+                sps_bytes_.assign(nal_data, nal_data + nal_len);
+            } else if (nal_type == 34) { // PPS
+                pps_bytes_.assign(nal_data, nal_data + nal_len);
+            } else if (nal_type <= 31 || nal_type == 39 || nal_type == 40) { // VCL Slices or SEI
+                PutU32(frame_bytes, static_cast<uint32_t>(nal_len));
+                frame_bytes.insert(frame_bytes.end(), nal_data, nal_data + nal_len);
+                frame_sample_size += static_cast<uint32_t>(4 + nal_len);
+            }
         }
     }
 

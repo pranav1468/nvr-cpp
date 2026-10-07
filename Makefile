@@ -22,13 +22,17 @@ OBJS = $(patsubst src/%.cpp, build/obj/%.o, $(SRCS))
 
 TARGET = bin/nvr_server
 TEST_TARGET = bin/test_recording_pipeline
+BATTLE_TARGET = bin/battle_test_suite
 
-all: $(TARGET) $(TEST_TARGET)
+all: $(TARGET) $(TEST_TARGET) $(BATTLE_TARGET)
 
 $(TARGET): $(OBJS) build/obj/main.o | bin
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(SQLITE_LIB) $(LDFLAGS)
 
 $(TEST_TARGET): $(OBJS) build/obj/tests/test_recording_pipeline.o | bin
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(SQLITE_LIB) $(LDFLAGS)
+
+$(BATTLE_TARGET): $(OBJS) build/obj/tests/battle_test_suite.o | bin
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(SQLITE_LIB) $(LDFLAGS)
 
 build/obj/%.o: src/%.cpp | build/obj

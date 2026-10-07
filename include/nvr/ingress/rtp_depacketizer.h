@@ -37,6 +37,7 @@ private:
     uint16_t fu_start_seq_{0};
 
     uint32_t last_rtp_timestamp_{0};
+    int64_t unwrapped_rtp_timestamp_{0};
     int64_t base_pts_us_{0};
     bool has_base_pts_{false};
 };

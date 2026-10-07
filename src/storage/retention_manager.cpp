@@ -88,7 +88,10 @@ void RetentionManager::EnforceRetentionOnce() {
     }
 
     // Retrieve batches of oldest unlocked segments
-    while (low_space && running_) {
+    while (low_space) {
+        if (worker_thread_.joinable() && !running_) {
+            break;
+        }
         auto segments = SegmentIndex::Instance().GetOldestUnlockedSegments(10);
         if (segments.empty()) {
             LOG_WARN << "RetentionManager: No unlocked segments available to prune!";

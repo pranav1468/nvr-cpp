@@ -14,6 +14,7 @@ void RtpDepacketizer::Reset() {
     fu_in_progress_ = false;
     fu_is_keyframe_ = false;
     has_base_pts_ = false;
+    unwrapped_rtp_timestamp_ = 0;
 }
 
 void RtpDepacketizer::ProcessRtpPacket(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit) {
@@ -182,15 +183,26 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
     packet->sequence_number = seq_num;
     packet->wall_time_ms = time_utils::WallTimeMs();
 
-    // Convert RTP 90kHz timestamp to microseconds
+    // Convert RTP 90kHz timestamp to microseconds with seamless 32-bit wrap unrolling
     if (!has_base_pts_) {
         base_pts_us_ = time_utils::MonotonicUs();
         last_rtp_timestamp_ = rtp_timestamp;
+        unwrapped_rtp_timestamp_ = 0;
         has_base_pts_ = true;
         packet->pts_us = base_pts_us_;
     } else {
-        uint32_t delta_ts = rtp_timestamp - last_rtp_timestamp_;
-        int64_t delta_us = (static_cast<int64_t>(delta_ts) * 1000000LL) / 90000LL;
+        // Signed 32-bit difference handles wrap around from 0xFFFFFFFF -> 0 smoothly
+        int32_t delta_ticks = static_cast<int32_t>(rtp_timestamp - last_rtp_timestamp_);
+        if (delta_ticks < -900000 || delta_ticks > 900000) {
+            // Clock jump >10s detected; re-anchor to monotonic clock
+            base_pts_us_ = time_utils::MonotonicUs();
+            unwrapped_rtp_timestamp_ = 0;
+        } else {
+            unwrapped_rtp_timestamp_ += delta_ticks;
+        }
+        last_rtp_timestamp_ = rtp_timestamp;
+
+        int64_t delta_us = (unwrapped_rtp_timestamp_ * 1000000LL) / 90000LL;
         packet->pts_us = base_pts_us_ + delta_us;
     }
     packet->dts_us = packet->pts_us;
