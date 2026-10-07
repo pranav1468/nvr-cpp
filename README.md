@@ -1,6 +1,6 @@
 # NVR Core Backend Engine (C++)
 
-Welcome to the backend engine for the Network Video Recorder (NVR). This C++ service runs 24/7 in the background on the device..
+Welcome to the backend engine for the Network Video Recorder (NVR). This C++ service runs 24/7 in the background on the device.
 
 ---
 
