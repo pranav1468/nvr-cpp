@@ -60,6 +60,7 @@ private:
     bool is_active_{false};
 
     int64_t start_time_ms_{0};
+    int64_t segment_start_pts_us_{-1};
     int64_t last_pts_us_{0};
     uint64_t base_decode_time_{0};
     uint32_t frame_count_{0};

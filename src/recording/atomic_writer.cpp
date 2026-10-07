@@ -171,6 +171,7 @@ bool AtomicWriter::StartSegment(int64_t start_wall_time_ms) {
     keyframe_count_ = 0;
     total_bytes_written_ = 0;
     fragment_sequence_ = 1;
+    segment_start_pts_us_ = -1;
     base_decode_time_ = 0;
     last_pts_us_ = 0;
     has_header_written_ = false;
@@ -1029,22 +1030,40 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
             audio_channels_ = 1;
         }
 
-        uint32_t nominal_dur = (audio_codec_ == CodecType::AAC) ? 1024 : 160;
-        uint32_t audio_sample_dur = nominal_dur;
-        if (last_audio_pts_us_ > 0 && packet->pts_us > last_audio_pts_us_) {
-            int64_t diff_us = packet->pts_us - last_audio_pts_us_;
-            audio_sample_dur = static_cast<uint32_t>((diff_us * audio_sample_rate_) / 1000000LL);
-            uint32_t min_dur = nominal_dur / 2;
-            uint32_t max_dur = nominal_dur * 4;
-            if (audio_sample_dur < min_dur || audio_sample_dur > max_dur) {
-                audio_sample_dur = nominal_dur;
+        if (segment_start_pts_us_ < 0) {
+            segment_start_pts_us_ = packet->pts_us;
+        }
+
+        // Intrinsic nominal sample duration for this audio format:
+        // AAC-LC access units are fixed at 1024 PCM samples; G.711 is 1 byte per sample (8kHz).
+        uint32_t nominal_dur = (audio_codec_ == CodecType::AAC) ? 1024 : 
+            (packet->data.empty() ? 160 : static_cast<uint32_t>(packet->data.size()));
+        int64_t nominal_dur_us = (static_cast<int64_t>(nominal_dur) * 1000000LL) / audio_sample_rate_;
+        if (nominal_dur_us <= 0) nominal_dur_us = 20000;
+
+        // Gap detection: If a gap > 3x nominal duration occurs (network stall, packet drop, silence suppression),
+        // flush any pending fragment first so the gap is placed between fragments on the container timeline.
+        bool is_gap = (last_audio_pts_us_ > 0) && ((packet->pts_us - last_audio_pts_us_) > (3 * nominal_dur_us));
+        if (is_gap) {
+            if (!pending_audio_samples_.empty() || !pending_samples_.empty()) {
+                FlushCurrentFragment();
             }
         }
-        last_audio_pts_us_ = packet->pts_us;
+
+        // Re-anchor audio_base_decode_time_ on the first sample of a segment or across gaps
+        if (last_audio_pts_us_ == 0 || is_gap) {
+            int64_t offset_us = packet->pts_us - segment_start_pts_us_;
+            if (offset_us < 0) offset_us = 0;
+            audio_base_decode_time_ = static_cast<uint64_t>((offset_us * static_cast<int64_t>(audio_sample_rate_)) / 1000000LL);
+        }
+
+        if (last_audio_pts_us_ == 0 || packet->pts_us > last_audio_pts_us_) {
+            last_audio_pts_us_ = packet->pts_us;
+        }
 
         SampleEntry audio_entry;
         audio_entry.size = static_cast<uint32_t>(packet->data.size());
-        audio_entry.duration = audio_sample_dur;
+        audio_entry.duration = nominal_dur;
         audio_entry.is_keyframe = true;
         audio_entry.pts = static_cast<uint64_t>(packet->pts_us);
         audio_entry.composition_time_offset = 0;
@@ -1128,6 +1147,10 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
 
     if (frame_sample_size == 0) {
         return true; // Parameter-set only packet consumed
+    }
+
+    if (segment_start_pts_us_ < 0) {
+        segment_start_pts_us_ = packet->pts_us;
     }
 
     // Calculate duration in 90000Hz units

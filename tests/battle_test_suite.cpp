@@ -538,7 +538,35 @@ void TestBitstreamAndContainerResilience() {
 
         nvr::SegmentMetadata meta;
         assert(jitter_writer.FinalizeSegment(meta));
-        std::cout << "     Audio clamp check: Writer finalized segment safely with bounded audio samples. [PASS]" << std::endl;
+
+        // Verify container preserves A/V timing across network stall
+        std::ifstream j_file(meta.file_path, std::ios::binary);
+        std::vector<uint8_t> j_bytes((std::istreambuf_iterator<char>(j_file)), std::istreambuf_iterator<char>());
+        j_file.close();
+
+        int moof_count = 0;
+        uint64_t max_tfdt = 0;
+        for (size_t k = 0; k + 16 <= j_bytes.size(); ++k) {
+            if (std::memcmp(&j_bytes[k], "moof", 4) == 0) {
+                moof_count++;
+            }
+            if (std::memcmp(&j_bytes[k], "tfdt", 4) == 0) {
+                uint64_t bmdt = (static_cast<uint64_t>(j_bytes[k + 8]) << 56) |
+                                (static_cast<uint64_t>(j_bytes[k + 9]) << 48) |
+                                (static_cast<uint64_t>(j_bytes[k + 10]) << 40) |
+                                (static_cast<uint64_t>(j_bytes[k + 11]) << 32) |
+                                (static_cast<uint64_t>(j_bytes[k + 12]) << 24) |
+                                (static_cast<uint64_t>(j_bytes[k + 13]) << 16) |
+                                (static_cast<uint64_t>(j_bytes[k + 14]) << 8) |
+                                (static_cast<uint64_t>(j_bytes[k + 15]));
+                if (bmdt > max_tfdt) {
+                    max_tfdt = bmdt;
+                }
+            }
+        }
+        assert(moof_count >= 2);
+        assert(max_tfdt == 288000); // Exactly 6.0s at 48kHz audio timescale
+        std::cout << "     Audio timing check: Container preserved 6.0s timeline gap via tfdt (288,000 ticks, 0 desync). [PASS]" << std::endl;
     }
 
     // Scenario 2.7: HEVC SPS resolution parsing & BitReader safety
