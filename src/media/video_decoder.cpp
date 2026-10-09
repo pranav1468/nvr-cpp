@@ -391,7 +391,7 @@ public:
 
         if (is_hardware_) {
             LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming active at " << v4l2_device_path_;
-        } else {
+        } else if (codec_ != CodecType::UNKNOWN) {
             sw_decoder_.Initialize(codec_);
             LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 device not present, active engine: "
                      << (sw_decoder_.IsAvailable() ? "Software-FFmpeg" : "Aligned-Surface")
@@ -405,6 +405,17 @@ public:
     bool Decode(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) override {
         if (!packet || packet->data.size() < 4 || packet->IsAudio()) {
             return false;
+        }
+
+        // Dynamically adopt packet's codec if unconfigured or changed
+        if (packet->codec != CodecType::UNKNOWN && packet->codec != codec_) {
+            codec_ = packet->codec;
+            if (is_hardware_) {
+                SetupV4l2Queues();
+            } else {
+                sw_decoder_.Close();
+                sw_decoder_.Initialize(codec_);
+            }
         }
 
         // Validate Annex-B start code

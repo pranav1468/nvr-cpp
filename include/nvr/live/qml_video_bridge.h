@@ -20,6 +20,8 @@ public:
     void ClearTile(int tile_index) override;
     void Shutdown() override;
     const char* GetBackendName() const override;
+    int GetWidth() const override { return width_; }
+    int GetHeight() const override { return height_; }
 
     // Frame retrieval for QML VideoTile rendering
     DecodedFramePtr GetTileFrame(int tile_index) const;

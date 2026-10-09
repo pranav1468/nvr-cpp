@@ -145,13 +145,18 @@ bool LiveController::SetFullscreen(int channel_id) {
         pipe->paused = true;
     }
 
-    // Set up single-camera fullscreen pipeline (MAIN stream at 1080p)
+    int disp_w = display_backend_ ? display_backend_->GetWidth() : 1920;
+    int disp_h = display_backend_ ? display_backend_->GetHeight() : 1080;
+    if (disp_w <= 0) disp_w = 1920;
+    if (disp_h <= 0) disp_h = 1080;
+
+    // Set up single-camera fullscreen pipeline (dynamic display dimensions)
     fullscreen_pipeline_ = std::make_unique<ChannelPipeline>();
     fullscreen_pipeline_->channel_id = channel_id;
     fullscreen_pipeline_->tile_index = 0;
     fullscreen_pipeline_->stream_type = StreamType::MAIN;
-    fullscreen_pipeline_->decoder = VideoDecoderFactory::Create(CodecType::H264, 1920, 1080, true);
-    fullscreen_pipeline_->scaler = VideoScalerFactory::Create(1920, 1080, PixelFormat::NV12, 1920, 1080, PixelFormat::RGBA32);
+    fullscreen_pipeline_->decoder = VideoDecoderFactory::Create(CodecType::UNKNOWN, 0, 0, true);
+    fullscreen_pipeline_->scaler = VideoScalerFactory::Create(0, 0, PixelFormat::NV12, disp_w, disp_h, PixelFormat::RGBA32);
     fullscreen_pipeline_->queue = std::make_unique<LiveQueue>(config_.max_queue_depth);
     fullscreen_pipeline_->active = true;
     fullscreen_pipeline_->paused = false;
@@ -170,7 +175,7 @@ bool LiveController::SetFullscreen(int channel_id) {
         }
     );
 
-    fullscreen_pipeline_->worker_thread = std::thread(&LiveController::ChannelWorkerLoop, this, raw_pipe, 1920, 1080);
+    fullscreen_pipeline_->worker_thread = std::thread(&LiveController::ChannelWorkerLoop, this, raw_pipe, disp_w, disp_h);
     LOG_INFO << "[LiveController] Successfully switched to single-camera fullscreen (Channel " << channel_id << ")";
     return true;
 }
@@ -289,21 +294,23 @@ void LiveController::SetupGridPipelines() {
         }
     }
 
-    uint32_t tile_w = 640;
-    uint32_t tile_h = 360;
-    if (current_layout_ == LiveGridLayout::SINGLE) {
-        tile_w = 1920;
-        tile_h = 1080;
-    } else if (current_layout_ == LiveGridLayout::GRID_4) {
-        tile_w = 960;
-        tile_h = 540;
-    } else if (current_layout_ == LiveGridLayout::GRID_6) {
-        tile_w = 640;
-        tile_h = 540;
-    } else if (current_layout_ == LiveGridLayout::GRID_8) {
-        tile_w = 480;
-        tile_h = 540;
+    int disp_w = display_backend_ ? display_backend_->GetWidth() : 1920;
+    int disp_h = display_backend_ ? display_backend_->GetHeight() : 1080;
+    if (disp_w <= 0) disp_w = 1920;
+    if (disp_h <= 0) disp_h = 1080;
+
+    int cols = 1, rows = 1;
+    switch (current_layout_) {
+        case LiveGridLayout::SINGLE:     cols = 1; rows = 1; break;
+        case LiveGridLayout::GRID_4:     cols = 2; rows = 2; break;
+        case LiveGridLayout::GRID_6:     cols = 3; rows = 2; break;
+        case LiveGridLayout::GRID_8:     cols = 4; rows = 2; break;
+        case LiveGridLayout::FULLSCREEN: cols = 1; rows = 1; break;
+        default:                         cols = 2; rows = 2; break;
     }
+
+    uint32_t tile_w = static_cast<uint32_t>(disp_w / cols);
+    uint32_t tile_h = static_cast<uint32_t>(disp_h / rows);
 
     int tile_idx = 0;
     for (int ch : channels_to_use) {
@@ -337,8 +344,8 @@ void LiveController::StartChannelPipeline(int channel_id, int tile_index, Stream
     pipe->channel_id = channel_id;
     pipe->tile_index = tile_index;
     pipe->stream_type = stream_type;
-    pipe->decoder = VideoDecoderFactory::Create(CodecType::H264, 640, 360, true);
-    pipe->scaler = VideoScalerFactory::Create(640, 360, PixelFormat::NV12, target_w, target_h, PixelFormat::RGBA32);
+    pipe->decoder = VideoDecoderFactory::Create(CodecType::UNKNOWN, 0, 0, true);
+    pipe->scaler = VideoScalerFactory::Create(0, 0, PixelFormat::NV12, target_w, target_h, PixelFormat::RGBA32);
     pipe->queue = std::make_unique<LiveQueue>(config_.max_queue_depth);
     pipe->active = true;
     pipe->paused = false;
@@ -434,8 +441,8 @@ std::vector<LiveTileMetrics> LiveController::GetTileMetrics() const {
         m.channel_id = fullscreen_pipeline_->channel_id;
         m.tile_index = 0;
         m.stream_type = StreamType::MAIN;
-        m.width = 1920;
-        m.height = 1080;
+        m.width = fullscreen_pipeline_->scaler ? fullscreen_pipeline_->scaler->GetDstWidth() : (display_backend_ ? display_backend_->GetWidth() : 1920);
+        m.height = fullscreen_pipeline_->scaler ? fullscreen_pipeline_->scaler->GetDstHeight() : (display_backend_ ? display_backend_->GetHeight() : 1080);
         m.enqueued_frames = fullscreen_pipeline_->queue ? fullscreen_pipeline_->queue->GetTotalEnqueued() : 0;
         m.dropped_frames = fullscreen_pipeline_->queue ? fullscreen_pipeline_->queue->GetTotalDropped() : 0;
         m.rendered_frames = fullscreen_pipeline_->rendered_count.load();
@@ -470,8 +477,8 @@ LiveTileMetrics LiveController::GetChannelMetrics(int channel_id) const {
     if (fullscreen_channel_id_ == channel_id && fullscreen_pipeline_) {
         m.tile_index = 0;
         m.stream_type = StreamType::MAIN;
-        m.width = 1920;
-        m.height = 1080;
+        m.width = fullscreen_pipeline_->scaler ? fullscreen_pipeline_->scaler->GetDstWidth() : (display_backend_ ? display_backend_->GetWidth() : 1920);
+        m.height = fullscreen_pipeline_->scaler ? fullscreen_pipeline_->scaler->GetDstHeight() : (display_backend_ ? display_backend_->GetHeight() : 1080);
         m.enqueued_frames = fullscreen_pipeline_->queue ? fullscreen_pipeline_->queue->GetTotalEnqueued() : 0;
         m.dropped_frames = fullscreen_pipeline_->queue ? fullscreen_pipeline_->queue->GetTotalDropped() : 0;
         m.rendered_frames = fullscreen_pipeline_->rendered_count.load();

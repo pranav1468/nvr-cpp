@@ -18,6 +18,8 @@ public:
     virtual void ClearTile(int tile_index) = 0;
     virtual void Shutdown() = 0;
     virtual const char* GetBackendName() const = 0;
+    virtual int GetWidth() const { return 1920; }
+    virtual int GetHeight() const { return 1080; }
 };
 
 using DisplayBackendPtr = std::shared_ptr<IDisplayBackend>;
@@ -34,6 +36,9 @@ public:
         initialized_ = true;
         return true;
     }
+
+    int GetWidth() const override { return width_; }
+    int GetHeight() const override { return height_; }
 
     void RenderTile(int tile_index, int channel_id, const DecodedFramePtr& frame) override {
         std::lock_guard<std::mutex> lock(mutex_);
