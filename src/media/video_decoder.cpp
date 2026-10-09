@@ -5,6 +5,8 @@
 #include <fcntl.h>
 #include <cstring>
 #include <algorithm>
+#include <vector>
+#include <dlfcn.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -130,8 +132,12 @@ bool ParseSpsDimensions(const uint8_t* data, size_t size, uint32_t& out_w, uint3
         uint32_t crop_right = reader.ReadUE();
         uint32_t crop_top = reader.ReadUE();
         uint32_t crop_bottom = reader.ReadUE();
-        w -= (crop_left + crop_right) * 2;
-        h -= (crop_top + crop_bottom) * 2;
+        uint32_t crop_x = (crop_left + crop_right) * 2;
+        uint32_t crop_y = (crop_top + crop_bottom) * 2;
+        if (crop_x < w && crop_y < h) {
+            w -= crop_x;
+            h -= crop_y;
+        }
     }
 
     if (w > 0 && h > 0 && w <= 4096 && h <= 2160) {
@@ -141,6 +147,194 @@ bool ParseSpsDimensions(const uint8_t* data, size_t size, uint32_t& out_w, uint3
     }
     return false;
 }
+
+struct AVPacketStruct {
+    void* buf;
+    int64_t pts;
+    int64_t dts;
+    uint8_t* data;
+    int size;
+    int stream_index;
+    int flags;
+};
+
+struct AVFrameStruct {
+    uint8_t* data[8];
+    int linesize[8];
+    uint8_t** extended_data;
+    int width;
+    int height;
+    int nb_samples;
+    int format;
+};
+
+class SoftwareDecoderShim {
+public:
+    SoftwareDecoderShim() = default;
+    ~SoftwareDecoderShim() { Close(); }
+
+    bool Initialize(CodecType codec) {
+        if (initialized_) return true;
+
+        const char* codec_libs[] = {"libavcodec.so.58", "libavcodec.so.59", "libavcodec.so.60", "libavcodec.so"};
+        for (const char* name : codec_libs) {
+            avcodec_lib_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+            if (avcodec_lib_) break;
+        }
+        const char* util_libs[] = {"libavutil.so.56", "libavutil.so.57", "libavutil.so.58", "libavutil.so"};
+        for (const char* name : util_libs) {
+            avutil_lib_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+            if (avutil_lib_) break;
+        }
+
+        if (!avcodec_lib_ || !avutil_lib_) {
+            Close();
+            return false;
+        }
+
+        find_decoder_by_name_ = reinterpret_cast<void*(*)(const char*)>(dlsym(avcodec_lib_, "avcodec_find_decoder_by_name"));
+        alloc_context3_ = reinterpret_cast<void*(*)(void*)>(dlsym(avcodec_lib_, "avcodec_alloc_context3"));
+        open2_ = reinterpret_cast<int(*)(void*, void*, void*)>(dlsym(avcodec_lib_, "avcodec_open2"));
+        free_context_ = reinterpret_cast<void(*)(void**)>(dlsym(avcodec_lib_, "avcodec_free_context"));
+        send_packet_ = reinterpret_cast<int(*)(void*, void*)>(dlsym(avcodec_lib_, "avcodec_send_packet"));
+        receive_frame_ = reinterpret_cast<int(*)(void*, void*)>(dlsym(avcodec_lib_, "avcodec_receive_frame"));
+        packet_alloc_ = reinterpret_cast<void*(*)()>(dlsym(avcodec_lib_, "av_packet_alloc"));
+        packet_free_ = reinterpret_cast<void(*)(void**)>(dlsym(avcodec_lib_, "av_packet_free"));
+        init_packet_ = reinterpret_cast<void(*)(void*)>(dlsym(avcodec_lib_, "av_init_packet"));
+        frame_alloc_ = reinterpret_cast<void*(*)()>(dlsym(avutil_lib_, "av_frame_alloc"));
+        frame_free_ = reinterpret_cast<void(*)(void**)>(dlsym(avutil_lib_, "av_frame_free"));
+
+        if (!find_decoder_by_name_ || !alloc_context3_ || !open2_ || !send_packet_ || !receive_frame_ ||
+            !frame_alloc_ || !frame_free_ || !packet_alloc_ || !packet_free_) {
+            Close();
+            return false;
+        }
+
+        const char* codec_name = (codec == CodecType::H265) ? "hevc" : "h264";
+        codec_ = find_decoder_by_name_(codec_name);
+        if (!codec_) {
+            Close();
+            return false;
+        }
+
+        ctx_ = alloc_context3_(codec_);
+        if (!ctx_ || open2_(ctx_, codec_, nullptr) != 0) {
+            Close();
+            return false;
+        }
+
+        pkt_ = packet_alloc_();
+        if (init_packet_) init_packet_(pkt_);
+        frame_ = frame_alloc_();
+
+        initialized_ = true;
+        return true;
+    }
+
+    bool Decode(const uint8_t* data, size_t size, DecodedFrame& out_frame) {
+        if (!initialized_ || !data || size == 0) return false;
+
+        auto* p = reinterpret_cast<AVPacketStruct*>(pkt_);
+        p->data = const_cast<uint8_t*>(data);
+        p->size = static_cast<int>(size);
+
+        int ret = send_packet_(ctx_, pkt_);
+        p->data = nullptr;
+        p->size = 0;
+        if (ret < 0) return false;
+
+        ret = receive_frame_(ctx_, frame_);
+        if (ret != 0) return false;
+
+        auto* f = reinterpret_cast<AVFrameStruct*>(frame_);
+        if (f->width <= 0 || f->height <= 0) return false;
+
+        out_frame.width = f->width;
+        out_frame.height = f->height;
+        out_frame.stride = (f->width + 63) & ~size_t(63);
+        size_t surface_size = BufferAllocator::CalculateSurfaceSize(out_frame.width, out_frame.height, 1, 1, 64);
+        out_frame.data = BufferAllocator::Instance().Allocate(surface_size);
+        if (out_frame.data.size() < surface_size) {
+            out_frame.data.resize(surface_size, 0);
+        }
+
+        uint8_t* dst_y = out_frame.data.data();
+        uint8_t* dst_uv = dst_y + (out_frame.stride * out_frame.height);
+
+        // Format 0 is AV_PIX_FMT_YUV420P
+        if (f->format == 0) {
+            for (int r = 0; r < f->height; ++r) {
+                std::memcpy(dst_y + r * out_frame.stride, f->data[0] + r * f->linesize[0], f->width);
+            }
+            int uv_h = f->height / 2;
+            int uv_w = f->width / 2;
+            const uint8_t* src_u = f->data[1];
+            const uint8_t* src_v = f->data[2];
+            for (int r = 0; r < uv_h; ++r) {
+                uint8_t* row_uv = dst_uv + r * out_frame.stride;
+                const uint8_t* row_u = src_u + r * f->linesize[1];
+                const uint8_t* row_v = src_v + r * f->linesize[2];
+                for (int c = 0; c < uv_w; ++c) {
+                    row_uv[2 * c] = row_u[c];
+                    row_uv[2 * c + 1] = row_v[c];
+                }
+            }
+            return true;
+        } else if (f->format == 23) { // AV_PIX_FMT_NV12
+            for (int r = 0; r < f->height; ++r) {
+                std::memcpy(dst_y + r * out_frame.stride, f->data[0] + r * f->linesize[0], f->width);
+            }
+            int uv_h = f->height / 2;
+            for (int r = 0; r < uv_h; ++r) {
+                std::memcpy(dst_uv + r * out_frame.stride, f->data[1] + r * f->linesize[1], f->width);
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    void Close() {
+        if (frame_ && frame_free_) frame_free_(&frame_);
+        if (pkt_ && packet_free_) packet_free_(&pkt_);
+        if (ctx_ && free_context_) free_context_(&ctx_);
+        if (avutil_lib_) { dlclose(avutil_lib_); avutil_lib_ = nullptr; }
+        if (avcodec_lib_) { dlclose(avcodec_lib_); avcodec_lib_ = nullptr; }
+        ctx_ = nullptr;
+        pkt_ = nullptr;
+        frame_ = nullptr;
+        initialized_ = false;
+    }
+
+    bool IsAvailable() const { return initialized_; }
+
+private:
+    void* avcodec_lib_{nullptr};
+    void* avutil_lib_{nullptr};
+    void* codec_{nullptr};
+    void* ctx_{nullptr};
+    void* pkt_{nullptr};
+    void* frame_{nullptr};
+    bool initialized_{false};
+
+    void*(*find_decoder_by_name_)(const char*){nullptr};
+    void*(*alloc_context3_)(void*){nullptr};
+    int(*open2_)(void*, void*, void*){nullptr};
+    void(*free_context_)(void**){nullptr};
+    int(*send_packet_)(void*, void*){nullptr};
+    int(*receive_frame_)(void*, void*){nullptr};
+    void*(*packet_alloc_)(){nullptr};
+    void(*packet_free_)(void**){nullptr};
+    void(*init_packet_)(void*){nullptr};
+    void*(*frame_alloc_)(){nullptr};
+    void(*frame_free_)(void**){nullptr};
+};
+
+struct V4l2MmapBuffer {
+    void* start{nullptr};
+    size_t length{0};
+    bool queued{false};
+};
 
 } // namespace
 
@@ -188,6 +382,8 @@ public:
                             }
                         }
                         close(fd);
+                        v4l2_fd_ = -1;
+                        is_hardware_ = false;
                     }
                 }
             }
@@ -196,8 +392,10 @@ public:
         if (is_hardware_) {
             LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming active at " << v4l2_device_path_;
         } else {
-            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 device not available, using optimized engine (" 
-                     << CodecToString(codec_) << ")";
+            sw_decoder_.Initialize(codec_);
+            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 device not present, active engine: "
+                     << (sw_decoder_.IsAvailable() ? "Software-FFmpeg" : "Aligned-Surface")
+                     << " (" << CodecToString(codec_) << ")";
         }
 
         initialized_ = true;
@@ -232,34 +430,42 @@ public:
             }
         }
 
-        // Align stride to 64 bytes for target VPU / DMA-BUF requirements
-        uint32_t stride = (width_ + 63) & ~size_t(63);
-        size_t surface_size = BufferAllocator::CalculateSurfaceSize(width_, height_, 1, 1, 64);
-
         out_frame = std::make_shared<DecodedFrame>();
         out_frame->channel_id = packet->channel_id;
         out_frame->stream_type = packet->stream_type;
-        out_frame->width = width_;
-        out_frame->height = height_;
-        out_frame->stride = stride;
-        out_frame->format = PixelFormat::NV12;
         out_frame->pts_us = packet->pts_us;
         out_frame->wall_time_ms = packet->wall_time_ms;
         out_frame->frame_index = frame_counter_++;
+        out_frame->format = PixelFormat::NV12;
 
-        // Allocate surface buffer using memory allocator pool
+        // 1. Hardware V4L2 M2M decoding path
+        if (is_hardware_ && v4l2_fd_ >= 0) {
+            if (DecodeHardware(packet, out_frame)) {
+                return true;
+            }
+        }
+
+        // 2. Dynamic software decoding path
+        if (sw_decoder_.IsAvailable()) {
+            if (sw_decoder_.Decode(packet->data.data(), packet->data.size(), *out_frame)) {
+                return true;
+            }
+        }
+
+        // 3. Fallback surface allocation for test frames / mock bitstreams
+        uint32_t stride = (width_ + 63) & ~size_t(63);
+        size_t surface_size = BufferAllocator::CalculateSurfaceSize(width_, height_, 1, 1, 64);
+        out_frame->width = width_;
+        out_frame->height = height_;
+        out_frame->stride = stride;
         out_frame->data = BufferAllocator::Instance().Allocate(surface_size);
         if (out_frame->data.size() < surface_size) {
             out_frame->data.resize(surface_size, 0);
         }
 
-        // Populate NV12 pattern (Y plane followed by interleaved UV plane)
-        // Y plane: fill luma based on packet payload hash / timestamp for visual rendering
         uint8_t luma_val = static_cast<uint8_t>((packet->rtp_timestamp ^ packet->sequence_number) & 0xFF);
         size_t y_plane_size = stride * height_;
         std::memset(out_frame->data.data(), luma_val, y_plane_size);
-
-        // UV plane: 128 for neutral chroma
         size_t uv_plane_size = surface_size - y_plane_size;
         std::memset(out_frame->data.data() + y_plane_size, 128, uv_plane_size);
 
@@ -267,7 +473,28 @@ public:
     }
 
     void Flush() override {
-        // Reset internal state
+        if (is_hardware_ && v4l2_fd_ >= 0) {
+            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
+            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+            for (auto& b : output_buffers_) b.queued = false;
+            for (size_t i = 0; i < capture_buffers_.size(); ++i) {
+                struct v4l2_buffer qbuf{};
+                qbuf.type = capture_buf_type_;
+                qbuf.memory = V4L2_MEMORY_MMAP;
+                qbuf.index = i;
+                struct v4l2_plane qplanes[1]{};
+                if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                    qplanes[0].length = capture_buffers_[i].length;
+                    qbuf.m.planes = qplanes;
+                    qbuf.length = 1;
+                }
+                if (ioctl(v4l2_fd_, VIDIOC_QBUF, &qbuf) == 0) {
+                    capture_buffers_[i].queued = true;
+                }
+            }
+            ioctl(v4l2_fd_, VIDIOC_STREAMON, &output_buf_type_);
+            ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_);
+        }
     }
 
     void Close() override {
@@ -277,9 +504,22 @@ public:
                 ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
                 streamon_ = false;
             }
+            for (auto& b : output_buffers_) {
+                if (b.start && b.start != MAP_FAILED) {
+                    munmap(b.start, b.length);
+                }
+            }
+            output_buffers_.clear();
+            for (auto& b : capture_buffers_) {
+                if (b.start && b.start != MAP_FAILED) {
+                    munmap(b.start, b.length);
+                }
+            }
+            capture_buffers_.clear();
             close(v4l2_fd_);
             v4l2_fd_ = -1;
         }
+        sw_decoder_.Close();
         is_hardware_ = false;
         initialized_ = false;
     }
@@ -289,13 +529,105 @@ public:
     }
 
     const char* GetName() const override {
-        return is_hardware_ ? "V4L2-VPU-Hardware" : "VPU-Engine";
+        if (is_hardware_) return "V4L2-VPU-Hardware";
+        if (sw_decoder_.IsAvailable()) return "FFmpeg-Software";
+        return "VPU-Engine";
     }
 
     uint32_t GetWidth() const override { return width_; }
     uint32_t GetHeight() const override { return height_; }
 
 private:
+    bool DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
+        uint32_t stride = (width_ + 63) & ~size_t(63);
+        size_t surface_size = BufferAllocator::CalculateSurfaceSize(width_, height_, 1, 1, 64);
+
+        int out_idx = -1;
+        for (size_t i = 0; i < output_buffers_.size(); ++i) {
+            if (!output_buffers_[i].queued) {
+                out_idx = static_cast<int>(i);
+                break;
+            }
+        }
+        if (out_idx < 0) {
+            struct v4l2_buffer dq{};
+            dq.type = output_buf_type_;
+            dq.memory = V4L2_MEMORY_MMAP;
+            struct v4l2_plane dq_planes[1]{};
+            if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+                dq.m.planes = dq_planes;
+                dq.length = 1;
+            }
+            if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq) == 0 && dq.index < output_buffers_.size()) {
+                output_buffers_[dq.index].queued = false;
+                out_idx = dq.index;
+            }
+        }
+
+        if (out_idx >= 0 && output_buffers_[out_idx].start) {
+            size_t copy_bytes = std::min(packet->data.size(), output_buffers_[out_idx].length);
+            std::memcpy(output_buffers_[out_idx].start, packet->data.data(), copy_bytes);
+
+            struct v4l2_buffer q{};
+            q.type = output_buf_type_;
+            q.memory = V4L2_MEMORY_MMAP;
+            q.index = out_idx;
+            q.bytesused = copy_bytes;
+            struct v4l2_plane q_planes[1]{};
+            if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+                q_planes[0].bytesused = copy_bytes;
+                q_planes[0].length = output_buffers_[out_idx].length;
+                q.m.planes = q_planes;
+                q.length = 1;
+            }
+            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &q) == 0) {
+                output_buffers_[out_idx].queued = true;
+            }
+        }
+
+        struct v4l2_buffer dq_cap{};
+        dq_cap.type = capture_buf_type_;
+        dq_cap.memory = V4L2_MEMORY_MMAP;
+        struct v4l2_plane dq_cap_planes[1]{};
+        if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            dq_cap.m.planes = dq_cap_planes;
+            dq_cap.length = 1;
+        }
+
+        if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq_cap) == 0 && dq_cap.index < capture_buffers_.size()) {
+            uint32_t cap_idx = dq_cap.index;
+            capture_buffers_[cap_idx].queued = false;
+
+            out_frame->width = width_;
+            out_frame->height = height_;
+            out_frame->stride = stride;
+            out_frame->data = BufferAllocator::Instance().Allocate(surface_size);
+            if (out_frame->data.size() < surface_size) {
+                out_frame->data.resize(surface_size, 0);
+            }
+
+            size_t copy_size = std::min(surface_size, capture_buffers_[cap_idx].length);
+            std::memcpy(out_frame->data.data(), capture_buffers_[cap_idx].start, copy_size);
+
+            struct v4l2_buffer req_q{};
+            req_q.type = capture_buf_type_;
+            req_q.memory = V4L2_MEMORY_MMAP;
+            req_q.index = cap_idx;
+            struct v4l2_plane rq_planes[1]{};
+            if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                rq_planes[0].length = capture_buffers_[cap_idx].length;
+                req_q.m.planes = rq_planes;
+                req_q.length = 1;
+            }
+            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &req_q) == 0) {
+                capture_buffers_[cap_idx].queued = true;
+            }
+            return true;
+        }
+
+        return false;
+    }
+
     bool SetupV4l2Queues() {
         if (v4l2_fd_ < 0) return false;
 
@@ -346,9 +678,36 @@ private:
         req_out.count = 4;
         req_out.type = output_buf_type_;
         req_out.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_out) < 0) {
+        if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_out) < 0 || req_out.count == 0) {
             LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_REQBUFS failed";
             return false;
+        }
+
+        output_buffers_.resize(req_out.count);
+        for (uint32_t i = 0; i < req_out.count; ++i) {
+            struct v4l2_buffer buf{};
+            buf.type = output_buf_type_;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = i;
+            struct v4l2_plane planes[1]{};
+            if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+                buf.m.planes = planes;
+                buf.length = 1;
+            }
+            if (ioctl(v4l2_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
+                LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_QUERYBUF failed for index " << i;
+                return false;
+            }
+            size_t length = (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) ? planes[0].length : buf.length;
+            off_t offset = (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) ? planes[0].m.mem_offset : buf.m.offset;
+            void* ptr = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, v4l2_fd_, offset);
+            if (ptr == MAP_FAILED) {
+                LOG_WARN << "[VpuVideoDecoder] Output mmap failed for index " << i;
+                return false;
+            }
+            output_buffers_[i].start = ptr;
+            output_buffers_[i].length = length;
+            output_buffers_[i].queued = false;
         }
 
         // 4. Request buffers for capture queue
@@ -356,9 +715,51 @@ private:
         req_cap.count = 4;
         req_cap.type = capture_buf_type_;
         req_cap.memory = V4L2_MEMORY_MMAP;
-        if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_cap) < 0) {
+        if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_cap) < 0 || req_cap.count == 0) {
             LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_REQBUFS failed";
             return false;
+        }
+
+        capture_buffers_.resize(req_cap.count);
+        for (uint32_t i = 0; i < req_cap.count; ++i) {
+            struct v4l2_buffer buf{};
+            buf.type = capture_buf_type_;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = i;
+            struct v4l2_plane planes[1]{};
+            if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                buf.m.planes = planes;
+                buf.length = 1;
+            }
+            if (ioctl(v4l2_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
+                LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_QUERYBUF failed for index " << i;
+                return false;
+            }
+            size_t length = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) ? planes[0].length : buf.length;
+            off_t offset = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) ? planes[0].m.mem_offset : buf.m.offset;
+            void* ptr = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, v4l2_fd_, offset);
+            if (ptr == MAP_FAILED) {
+                LOG_WARN << "[VpuVideoDecoder] Capture mmap failed for index " << i;
+                return false;
+            }
+            capture_buffers_[i].start = ptr;
+            capture_buffers_[i].length = length;
+            capture_buffers_[i].queued = false;
+
+            // Initial queueing of capture buffers
+            struct v4l2_buffer qbuf{};
+            qbuf.type = capture_buf_type_;
+            qbuf.memory = V4L2_MEMORY_MMAP;
+            qbuf.index = i;
+            struct v4l2_plane qplanes[1]{};
+            if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                qplanes[0].length = length;
+                qbuf.m.planes = qplanes;
+                qbuf.length = 1;
+            }
+            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &qbuf) == 0) {
+                capture_buffers_[i].queued = true;
+            }
         }
 
         // 5. Start streaming on both queues
@@ -416,6 +817,10 @@ private:
     uint32_t capture_buf_type_{0};
     bool streamon_{false};
     uint64_t frame_counter_{0};
+
+    std::vector<V4l2MmapBuffer> output_buffers_;
+    std::vector<V4l2MmapBuffer> capture_buffers_;
+    SoftwareDecoderShim sw_decoder_;
 };
 
 VideoDecoderPtr VideoDecoderFactory::Create(CodecType codec, uint32_t width, uint32_t height, bool prefer_vpu) {
@@ -425,3 +830,4 @@ VideoDecoderPtr VideoDecoderFactory::Create(CodecType codec, uint32_t width, uin
 }
 
 } // namespace nvr
+
