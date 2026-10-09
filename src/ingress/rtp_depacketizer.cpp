@@ -24,7 +24,68 @@ void RtpDepacketizer::Reset() {
 }
 
 void RtpDepacketizer::Flush() {
+    while (!reorder_buffer_.empty()) {
+        auto lowest_it = reorder_buffer_.begin();
+        if (expected_seq_ != lowest_it->first) {
+            fu_buffer_.clear();
+            fu_in_progress_ = false;
+            fu_is_keyframe_ = false;
+            expected_seq_ = lowest_it->first;
+        }
+        DrainReorderBuffer();
+    }
     FlushAu();
+}
+
+void RtpDepacketizer::DrainReorderBuffer() {
+    // 1. Drain contiguous in-order packets
+    while (!reorder_buffer_.empty()) {
+        auto it = reorder_buffer_.find(expected_seq_);
+        if (it != reorder_buffer_.end()) {
+            QueuedRtpPacket qp = std::move(it->second);
+            reorder_buffer_.erase(it);
+            ProcessVideoPacketInternal(qp.payload.data(), qp.payload.size(), qp.timestamp, qp.seq_num, qp.marker);
+            expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+        } else {
+            break;
+        }
+    }
+
+    // 2. Check loss recovery conditions (timeout > 50ms, capacity >= 16, or gap > 8)
+    while (!reorder_buffer_.empty()) {
+        auto now = std::chrono::steady_clock::now();
+        bool timeout = false;
+        for (const auto& kv : reorder_buffer_) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - kv.second.arrival_time).count() > 50) {
+                timeout = true;
+                break;
+            }
+        }
+
+        int16_t gap = static_cast<int16_t>(reorder_buffer_.rbegin()->first - expected_seq_);
+        if (timeout || reorder_buffer_.size() >= 16 || gap > 8) {
+            // Sequence continuity broken: reset in-progress fragmentation unit
+            fu_buffer_.clear();
+            fu_in_progress_ = false;
+            fu_is_keyframe_ = false;
+
+            // Advance expected_seq_ to lowest available packet in reorder buffer
+            expected_seq_ = reorder_buffer_.begin()->first;
+            while (!reorder_buffer_.empty()) {
+                auto it = reorder_buffer_.find(expected_seq_);
+                if (it != reorder_buffer_.end()) {
+                    QueuedRtpPacket qp_low = std::move(it->second);
+                    reorder_buffer_.erase(it);
+                    ProcessVideoPacketInternal(qp_low.payload.data(), qp_low.payload.size(), qp_low.timestamp, qp_low.seq_num, qp_low.marker);
+                    expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+                } else {
+                    break;
+                }
+            }
+        } else {
+            break;
+        }
+    }
 }
 
 void RtpDepacketizer::ProcessRtpPacket(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit) {
@@ -47,18 +108,7 @@ void RtpDepacketizer::ProcessRtpPacket(const uint8_t* payload, size_t size, uint
     if (seq_num == expected_seq_) {
         ProcessVideoPacketInternal(payload, size, rtp_timestamp, seq_num, marker_bit);
         expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
-
-        while (!reorder_buffer_.empty()) {
-            auto it = reorder_buffer_.find(expected_seq_);
-            if (it != reorder_buffer_.end()) {
-                QueuedRtpPacket qp = std::move(it->second);
-                reorder_buffer_.erase(it);
-                ProcessVideoPacketInternal(qp.payload.data(), qp.payload.size(), qp.timestamp, qp.seq_num, qp.marker);
-                expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
-            } else {
-                break;
-            }
-        }
+        DrainReorderBuffer();
     } else {
         int16_t diff = static_cast<int16_t>(seq_num - expected_seq_);
         if (diff > 0) {
@@ -66,17 +116,10 @@ void RtpDepacketizer::ProcessRtpPacket(const uint8_t* payload, size_t size, uint
             qp.seq_num = seq_num;
             qp.timestamp = rtp_timestamp;
             qp.marker = marker_bit;
+            qp.arrival_time = std::chrono::steady_clock::now();
             qp.payload.assign(payload, payload + size);
             reorder_buffer_[seq_num] = std::move(qp);
-
-            if (reorder_buffer_.size() >= 16) {
-                auto lowest_it = reorder_buffer_.begin();
-                expected_seq_ = lowest_it->first;
-                QueuedRtpPacket qp_low = std::move(lowest_it->second);
-                reorder_buffer_.erase(lowest_it);
-                ProcessVideoPacketInternal(qp_low.payload.data(), qp_low.payload.size(), qp_low.timestamp, qp_low.seq_num, qp_low.marker);
-                expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
-            }
+            DrainReorderBuffer();
         }
     }
 }

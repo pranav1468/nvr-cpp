@@ -18,6 +18,8 @@
 #include <fstream>
 #include <vector>
 #include <cstring>
+#include <thread>
+#include <chrono>
 
 namespace {
 
@@ -361,7 +363,67 @@ void RunRtpDepacketizerTest() {
     assert(received_seqs[1] == 11);
     assert(received_seqs[2] == 12);
 
-    std::cout << "  -> PASSED: RFC 6184 AU reassembly, STAP-A aggregation & jitter reordering verified." << std::endl;
+    // Test 5: Time-based packet loss recovery (>50ms wait drops missing packet)
+    received_seqs.clear();
+    nvr::RtpDepacketizer depack_loss(
+        1, nvr::StreamType::MAIN, nvr::CodecType::H264,
+        [&](const nvr::MediaPacketPtr& pkt) {
+            received_seqs.push_back(pkt->sequence_number);
+        }
+    );
+    uint8_t p_seq20[] = { 0x65, 0x20, 0x01 };
+    uint8_t p_seq22[] = { 0x65, 0x22, 0x02 }; // seq 21 missing!
+    uint8_t p_seq23[] = { 0x65, 0x23, 0x03 };
+
+    depack_loss.ProcessRtpPacket(p_seq20, sizeof(p_seq20), 400000, 20, true);
+    assert(received_seqs.size() == 1 && received_seqs.back() == 20);
+
+    depack_loss.ProcessRtpPacket(p_seq22, sizeof(p_seq22), 460000, 22, true);
+    assert(received_seqs.size() == 1); // 22 held in buffer waiting for missing 21
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(60)); // Wait > 50ms timeout
+
+    depack_loss.ProcessRtpPacket(p_seq23, sizeof(p_seq23), 490000, 23, true);
+    // Timeout expired for seq 22: missing seq 21 skipped, seq 22 and seq 23 processed!
+    assert(received_seqs.size() == 3);
+    assert(received_seqs[0] == 20);
+    assert(received_seqs[1] == 22);
+    assert(received_seqs[2] == 23);
+
+    // Test 6: Sequence gap recovery (>8 packets dropped)
+    received_seqs.clear();
+    nvr::RtpDepacketizer depack_gap(
+        1, nvr::StreamType::MAIN, nvr::CodecType::H264,
+        [&](const nvr::MediaPacketPtr& pkt) {
+            received_seqs.push_back(pkt->sequence_number);
+        }
+    );
+    uint8_t p_seq30[] = { 0x65, 0x30, 0x01 };
+    uint8_t p_seq40[] = { 0x65, 0x40, 0x02 }; // gap = 10 > 8
+    depack_gap.ProcessRtpPacket(p_seq30, sizeof(p_seq30), 500000, 30, true);
+    depack_gap.ProcessRtpPacket(p_seq40, sizeof(p_seq40), 600000, 40, true);
+    assert(received_seqs.size() == 2);
+    assert(received_seqs[0] == 30);
+    assert(received_seqs[1] == 40);
+
+    // Test 7: Flush drains stranded packets
+    received_seqs.clear();
+    nvr::RtpDepacketizer depack_flush(
+        1, nvr::StreamType::MAIN, nvr::CodecType::H264,
+        [&](const nvr::MediaPacketPtr& pkt) {
+            received_seqs.push_back(pkt->sequence_number);
+        }
+    );
+    uint8_t p_seq50[] = { 0x65, 0x50, 0x01 };
+    uint8_t p_seq52[] = { 0x65, 0x52, 0x02 }; // seq 51 missing
+    depack_flush.ProcessRtpPacket(p_seq50, sizeof(p_seq50), 700000, 50, true);
+    depack_flush.ProcessRtpPacket(p_seq52, sizeof(p_seq52), 760000, 52, true);
+    assert(received_seqs.size() == 1); // 52 still waiting
+    depack_flush.Flush();
+    assert(received_seqs.size() == 2);
+    assert(received_seqs[1] == 52);
+
+    std::cout << "  -> PASSED: RFC 6184 AU reassembly, STAP-A aggregation, jitter reordering & timeout loss recovery verified." << std::endl;
 }
 
 void RunDigestAuthAndIPv6Test() {

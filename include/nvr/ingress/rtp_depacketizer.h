@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <functional>
 
+#include <chrono>
+
 namespace nvr {
 
 using DepacketizedCallback = std::function<void(const MediaPacketPtr&)>;
@@ -25,6 +27,7 @@ private:
         uint16_t seq_num{0};
         uint32_t timestamp{0};
         bool marker{false};
+        std::chrono::steady_clock::time_point arrival_time{};
         std::vector<uint8_t> payload;
     };
 
@@ -34,6 +37,7 @@ private:
         }
     };
 
+    void DrainReorderBuffer();
     void ProcessVideoPacketInternal(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit);
     void ProcessH264(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit);
     void ProcessH265(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit);
