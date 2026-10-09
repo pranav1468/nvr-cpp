@@ -11,6 +11,12 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
+}
+
 #ifndef V4L2_PIX_FMT_HEVC
 #define V4L2_PIX_FMT_HEVC v4l2_fourcc('H', 'E', 'V', 'C')
 #endif
@@ -148,27 +154,6 @@ bool ParseSpsDimensions(const uint8_t* data, size_t size, uint32_t& out_w, uint3
     return false;
 }
 
-// Canonical 64-bit Linux FFmpeg ABI layouts for dynamic binding
-struct AVPacketShim64 {
-    void* buf{nullptr};
-    int64_t pts{0};
-    int64_t dts{0};
-    uint8_t* data{nullptr};
-    int size{0};
-    int stream_index{0};
-    int flags{0};
-};
-
-struct AVFrameShim64 {
-    uint8_t* data[8]{nullptr};
-    int linesize[8]{0};
-    uint8_t** extended_data{nullptr};
-    int width{0};
-    int height{0};
-    int nb_samples{0};
-    int format{0};
-};
-
 class SoftwareDecoderShim {
 public:
     SoftwareDecoderShim() = default;
@@ -176,11 +161,6 @@ public:
 
     bool Initialize(CodecType codec) {
         if (initialized_) return true;
-
-        if (sizeof(void*) != 8) {
-            LOG_WARN << "[SoftwareDecoder] 64-bit architecture required for dynamic ABI shim";
-            return false;
-        }
 
         const char* codec_libs[] = {"libavcodec.so.58", "libavcodec.so.59", "libavcodec.so.60", "libavcodec.so.61", "libavcodec.so"};
         for (const char* name : codec_libs) {
@@ -209,18 +189,18 @@ public:
             }
         }
 
-        find_decoder_by_name_ = reinterpret_cast<void*(*)(const char*)>(dlsym(avcodec_lib_, "avcodec_find_decoder_by_name"));
-        alloc_context3_ = reinterpret_cast<void*(*)(void*)>(dlsym(avcodec_lib_, "avcodec_alloc_context3"));
-        open2_ = reinterpret_cast<int(*)(void*, void*, void*)>(dlsym(avcodec_lib_, "avcodec_open2"));
-        free_context_ = reinterpret_cast<void(*)(void**)>(dlsym(avcodec_lib_, "avcodec_free_context"));
-        send_packet_ = reinterpret_cast<int(*)(void*, void*)>(dlsym(avcodec_lib_, "avcodec_send_packet"));
-        receive_frame_ = reinterpret_cast<int(*)(void*, void*)>(dlsym(avcodec_lib_, "avcodec_receive_frame"));
-        packet_alloc_ = reinterpret_cast<void*(*)()>(dlsym(avcodec_lib_, "av_packet_alloc"));
-        packet_free_ = reinterpret_cast<void(*)(void**)>(dlsym(avcodec_lib_, "av_packet_free"));
-        packet_unref_ = reinterpret_cast<void(*)(void*)>(dlsym(avcodec_lib_, "av_packet_unref"));
-        frame_alloc_ = reinterpret_cast<void*(*)()>(dlsym(avutil_lib_, "av_frame_alloc"));
-        frame_free_ = reinterpret_cast<void(*)(void**)>(dlsym(avutil_lib_, "av_frame_free"));
-        frame_unref_ = reinterpret_cast<void(*)(void*)>(dlsym(avutil_lib_, "av_frame_unref"));
+        find_decoder_by_name_ = reinterpret_cast<const AVCodec*(*)(const char*)>(dlsym(avcodec_lib_, "avcodec_find_decoder_by_name"));
+        alloc_context3_ = reinterpret_cast<AVCodecContext*(*)(const AVCodec*)>(dlsym(avcodec_lib_, "avcodec_alloc_context3"));
+        open2_ = reinterpret_cast<int(*)(AVCodecContext*, const AVCodec*, void**)>(dlsym(avcodec_lib_, "avcodec_open2"));
+        free_context_ = reinterpret_cast<void(*)(AVCodecContext**)>(dlsym(avcodec_lib_, "avcodec_free_context"));
+        send_packet_ = reinterpret_cast<int(*)(AVCodecContext*, const AVPacket*)>(dlsym(avcodec_lib_, "avcodec_send_packet"));
+        receive_frame_ = reinterpret_cast<int(*)(AVCodecContext*, AVFrame*)>(dlsym(avcodec_lib_, "avcodec_receive_frame"));
+        packet_alloc_ = reinterpret_cast<AVPacket*(*)()>(dlsym(avcodec_lib_, "av_packet_alloc"));
+        packet_free_ = reinterpret_cast<void(*)(AVPacket**)>(dlsym(avcodec_lib_, "av_packet_free"));
+        packet_unref_ = reinterpret_cast<void(*)(AVPacket*)>(dlsym(avcodec_lib_, "av_packet_unref"));
+        frame_alloc_ = reinterpret_cast<AVFrame*(*)()>(dlsym(avutil_lib_, "av_frame_alloc"));
+        frame_free_ = reinterpret_cast<void(*)(AVFrame**)>(dlsym(avutil_lib_, "av_frame_free"));
+        frame_unref_ = reinterpret_cast<void(*)(AVFrame*)>(dlsym(avutil_lib_, "av_frame_unref"));
 
         if (!find_decoder_by_name_ || !alloc_context3_ || !open2_ || !send_packet_ || !receive_frame_ ||
             !frame_alloc_ || !frame_free_ || !packet_alloc_ || !packet_free_) {
@@ -251,13 +231,12 @@ public:
     bool Decode(const uint8_t* data, size_t size, DecodedFrame& out_frame) {
         if (!initialized_ || !data || size == 0) return false;
 
-        auto* p = reinterpret_cast<AVPacketShim64*>(pkt_);
-        p->data = const_cast<uint8_t*>(data);
-        p->size = static_cast<int>(size);
+        pkt_->data = const_cast<uint8_t*>(data);
+        pkt_->size = static_cast<int>(size);
 
         int ret = send_packet_(ctx_, pkt_);
-        p->data = nullptr;
-        p->size = 0;
+        pkt_->data = nullptr;
+        pkt_->size = 0;
         if (packet_unref_) packet_unref_(pkt_);
         if (ret < 0) return false;
 
@@ -267,15 +246,14 @@ public:
             return false;
         }
 
-        auto* f = reinterpret_cast<AVFrameShim64*>(frame_);
-        if (f->width <= 0 || f->height <= 0 || f->width > 4096 || f->height > 2160 || !f->data[0]) {
+        if (frame_->width <= 0 || frame_->height <= 0 || frame_->width > 4096 || frame_->height > 2160 || !frame_->data[0]) {
             if (frame_unref_) frame_unref_(frame_);
             return false;
         }
 
-        out_frame.width = f->width;
-        out_frame.height = f->height;
-        out_frame.stride = (f->width + 63) & ~size_t(63);
+        out_frame.width = frame_->width;
+        out_frame.height = frame_->height;
+        out_frame.stride = (frame_->width + 63) & ~size_t(63);
         size_t surface_size = BufferAllocator::CalculateSurfaceSize(out_frame.width, out_frame.height, 1, 1, 64);
         out_frame.data = BufferAllocator::Instance().Allocate(surface_size);
         if (out_frame.data.size() < surface_size) {
@@ -286,32 +264,31 @@ public:
         uint8_t* dst_uv = dst_y + (out_frame.stride * out_frame.height);
 
         bool copy_ok = false;
-        // Format 0 is AV_PIX_FMT_YUV420P
-        if (f->format == 0 && f->data[1] && f->data[2]) {
-            for (int r = 0; r < f->height; ++r) {
-                std::memcpy(dst_y + r * out_frame.stride, f->data[0] + r * f->linesize[0], f->width);
+        if (frame_->format == AV_PIX_FMT_YUV420P && frame_->data[1] && frame_->data[2]) {
+            for (int r = 0; r < frame_->height; ++r) {
+                std::memcpy(dst_y + r * out_frame.stride, frame_->data[0] + r * frame_->linesize[0], frame_->width);
             }
-            int uv_h = f->height / 2;
-            int uv_w = f->width / 2;
-            const uint8_t* src_u = f->data[1];
-            const uint8_t* src_v = f->data[2];
+            int uv_h = frame_->height / 2;
+            int uv_w = frame_->width / 2;
+            const uint8_t* src_u = frame_->data[1];
+            const uint8_t* src_v = frame_->data[2];
             for (int r = 0; r < uv_h; ++r) {
                 uint8_t* row_uv = dst_uv + r * out_frame.stride;
-                const uint8_t* row_u = src_u + r * f->linesize[1];
-                const uint8_t* row_v = src_v + r * f->linesize[2];
+                const uint8_t* row_u = src_u + r * frame_->linesize[1];
+                const uint8_t* row_v = src_v + r * frame_->linesize[2];
                 for (int c = 0; c < uv_w; ++c) {
                     row_uv[2 * c] = row_u[c];
                     row_uv[2 * c + 1] = row_v[c];
                 }
             }
             copy_ok = true;
-        } else if (f->format == 23 && f->data[1]) { // AV_PIX_FMT_NV12
-            for (int r = 0; r < f->height; ++r) {
-                std::memcpy(dst_y + r * out_frame.stride, f->data[0] + r * f->linesize[0], f->width);
+        } else if (frame_->format == AV_PIX_FMT_NV12 && frame_->data[1]) {
+            for (int r = 0; r < frame_->height; ++r) {
+                std::memcpy(dst_y + r * out_frame.stride, frame_->data[0] + r * frame_->linesize[0], frame_->width);
             }
-            int uv_h = f->height / 2;
+            int uv_h = frame_->height / 2;
             for (int r = 0; r < uv_h; ++r) {
-                std::memcpy(dst_uv + r * out_frame.stride, f->data[1] + r * f->linesize[1], f->width);
+                std::memcpy(dst_uv + r * out_frame.stride, frame_->data[1] + r * frame_->linesize[1], frame_->width);
             }
             copy_ok = true;
         }
@@ -338,25 +315,25 @@ public:
 private:
     void* avcodec_lib_{nullptr};
     void* avutil_lib_{nullptr};
-    void* codec_{nullptr};
-    void* ctx_{nullptr};
-    void* pkt_{nullptr};
-    void* frame_{nullptr};
+    const AVCodec* codec_{nullptr};
+    AVCodecContext* ctx_{nullptr};
+    AVPacket* pkt_{nullptr};
+    AVFrame* frame_{nullptr};
     bool initialized_{false};
 
     unsigned int(*avcodec_version_)(){nullptr};
-    void*(*find_decoder_by_name_)(const char*){nullptr};
-    void*(*alloc_context3_)(void*){nullptr};
-    int(*open2_)(void*, void*, void*){nullptr};
-    void(*free_context_)(void**){nullptr};
-    int(*send_packet_)(void*, void*){nullptr};
-    int(*receive_frame_)(void*, void*){nullptr};
-    void*(*packet_alloc_)(){nullptr};
-    void(*packet_free_)(void**){nullptr};
-    void(*packet_unref_)(void*){nullptr};
-    void*(*frame_alloc_)(){nullptr};
-    void(*frame_free_)(void**){nullptr};
-    void(*frame_unref_)(void*){nullptr};
+    const AVCodec*(*find_decoder_by_name_)(const char*){nullptr};
+    AVCodecContext*(*alloc_context3_)(const AVCodec*){nullptr};
+    int(*open2_)(AVCodecContext*, const AVCodec*, void**){nullptr};
+    void(*free_context_)(AVCodecContext**){nullptr};
+    int(*send_packet_)(AVCodecContext*, const AVPacket*){nullptr};
+    int(*receive_frame_)(AVCodecContext*, AVFrame*){nullptr};
+    AVPacket*(*packet_alloc_)(){nullptr};
+    void(*packet_free_)(AVPacket**){nullptr};
+    void(*packet_unref_)(AVPacket*){nullptr};
+    AVFrame*(*frame_alloc_)(){nullptr};
+    void(*frame_free_)(AVFrame**){nullptr};
+    void(*frame_unref_)(AVFrame*){nullptr};
 };
 
 struct V4l2MmapBuffer {
