@@ -58,6 +58,7 @@ void BufferAllocator::Release(AlignedByteBuffer&& buffer) {
         if (total_allocated_bytes_ >= aligned_size) {
             total_allocated_bytes_ -= aligned_size;
         }
+        buffer.reset();
     }
 }
 

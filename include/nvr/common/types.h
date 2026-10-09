@@ -4,6 +4,9 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <cstring>
+#include <cstdlib>
+#include <new>
 
 namespace nvr {
 
@@ -129,44 +132,131 @@ enum class LiveGridLayout {
     FULLSCREEN = 100
 };
 
-template <typename T, size_t Alignment = 64>
-class AlignedAllocator {
+class AlignedByteBuffer {
 public:
-    using value_type = T;
-    using size_type = std::size_t;
-    using difference_type = std::ptrdiff_t;
+    static constexpr size_t kAlignment = 64;
 
-    AlignedAllocator() noexcept = default;
+    AlignedByteBuffer() noexcept = default;
 
-    template <typename U>
-    AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
+    explicit AlignedByteBuffer(size_t size, uint8_t init_val = 0) {
+        resize(size, init_val);
+    }
 
-    T* allocate(size_t n) {
-        if (n == 0) return nullptr;
-        static_assert((Alignment & (Alignment - 1)) == 0, "Alignment must be a power of 2");
-        static_assert(Alignment >= sizeof(void*), "Alignment must be at least sizeof(void*)");
+    ~AlignedByteBuffer() {
+        reset();
+    }
+
+    AlignedByteBuffer(const AlignedByteBuffer& other) {
+        if (other.size_ > 0) {
+            allocate(other.size_);
+            std::memcpy(data_, other.data_, other.size_);
+            size_ = other.size_;
+        }
+    }
+
+    AlignedByteBuffer& operator=(const AlignedByteBuffer& other) {
+        if (this != &other) {
+            if (other.size_ == 0) {
+                size_ = 0;
+            } else {
+                if (capacity_ < other.size_) {
+                    reset();
+                    allocate(other.size_);
+                }
+                std::memcpy(data_, other.data_, other.size_);
+                size_ = other.size_;
+            }
+        }
+        return *this;
+    }
+
+    AlignedByteBuffer(AlignedByteBuffer&& other) noexcept
+        : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+        other.data_ = nullptr;
+        other.size_ = 0;
+        other.capacity_ = 0;
+    }
+
+    AlignedByteBuffer& operator=(AlignedByteBuffer&& other) noexcept {
+        if (this != &other) {
+            reset();
+            data_ = other.data_;
+            size_ = other.size_;
+            capacity_ = other.capacity_;
+            other.data_ = nullptr;
+            other.size_ = 0;
+            other.capacity_ = 0;
+        }
+        return *this;
+    }
+
+    uint8_t* data() noexcept { return data_; }
+    const uint8_t* data() const noexcept { return data_; }
+
+    size_t size() const noexcept { return size_; }
+    size_t capacity() const noexcept { return capacity_; }
+    bool empty() const noexcept { return size_ == 0; }
+
+    uint8_t& operator[](size_t idx) noexcept { return data_[idx]; }
+    const uint8_t& operator[](size_t idx) const noexcept { return data_[idx]; }
+
+    uint8_t* begin() noexcept { return data_; }
+    const uint8_t* begin() const noexcept { return data_; }
+    uint8_t* end() noexcept { return data_ ? (data_ + size_) : nullptr; }
+    const uint8_t* end() const noexcept { return data_ ? (data_ + size_) : nullptr; }
+
+    void clear() noexcept { size_ = 0; }
+
+    void reserve(size_t new_cap) {
+        if (new_cap <= capacity_) return;
+        size_t aligned_cap = (new_cap + (kAlignment - 1)) & ~(kAlignment - 1);
         void* ptr = nullptr;
-        size_t bytes = n * sizeof(T);
-        if (posix_memalign(&ptr, Alignment, bytes) != 0) {
+        if (posix_memalign(&ptr, kAlignment, aligned_cap) != 0) {
             throw std::bad_alloc();
         }
-        return static_cast<T*>(ptr);
+        uint8_t* new_data = static_cast<uint8_t*>(ptr);
+        if (data_ && size_ > 0) {
+            std::memcpy(new_data, data_, size_);
+        }
+        free(data_);
+        data_ = new_data;
+        capacity_ = aligned_cap;
     }
 
-    void deallocate(T* p, size_t) noexcept {
-        free(p);
+    void resize(size_t new_size, uint8_t val = 0) {
+        if (new_size > capacity_) {
+            reserve(new_size);
+        }
+        if (new_size > size_ && data_) {
+            std::memset(data_ + size_, val, new_size - size_);
+        }
+        size_ = new_size;
     }
 
-    template <typename U>
-    struct rebind {
-        using other = AlignedAllocator<U, Alignment>;
-    };
+    void reset() noexcept {
+        if (data_) {
+            free(data_);
+            data_ = nullptr;
+        }
+        size_ = 0;
+        capacity_ = 0;
+    }
 
-    bool operator==(const AlignedAllocator&) const noexcept { return true; }
-    bool operator!=(const AlignedAllocator&) const noexcept { return false; }
+private:
+    void allocate(size_t size) {
+        size_t aligned_cap = (size + (kAlignment - 1)) & ~(kAlignment - 1);
+        void* ptr = nullptr;
+        if (posix_memalign(&ptr, kAlignment, aligned_cap) != 0) {
+            throw std::bad_alloc();
+        }
+        data_ = static_cast<uint8_t*>(ptr);
+        capacity_ = aligned_cap;
+    }
+
+    uint8_t* data_{nullptr};
+    size_t size_{0};
+    size_t capacity_{0};
 };
-
-using AlignedByteBuffer = std::vector<uint8_t, AlignedAllocator<uint8_t, 64>>;
 
 struct DecodedFrame {
     int channel_id{0};

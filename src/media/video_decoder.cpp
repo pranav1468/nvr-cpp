@@ -15,8 +15,6 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
-#include <libavcodec/version.h>
-#include <libavutil/version.h>
 }
 
 #ifndef V4L2_PIX_FMT_HEVC
@@ -190,11 +188,9 @@ public:
 
         const unsigned int codec_major = avcodec_version_() >> 16;
         const unsigned int util_major = avutil_version_() >> 16;
-        if (codec_major != LIBAVCODEC_VERSION_MAJOR ||
-            util_major != LIBAVUTIL_VERSION_MAJOR) {
-            LOG_WARN << "[SoftwareDecoder] FFmpeg ABI mismatch: headers expect libavcodec "
-                     << LIBAVCODEC_VERSION_MAJOR << " / libavutil " << LIBAVUTIL_VERSION_MAJOR
-                     << ", runtime provides " << codec_major << " / " << util_major;
+        if (codec_major < 58 || codec_major > 61 || util_major != (codec_major - 2)) {
+            LOG_WARN << "[SoftwareDecoder] Incompatible FFmpeg ABI: libavcodec major "
+                     << codec_major << ", libavutil major " << util_major;
             Close();
             return false;
         }
@@ -211,6 +207,7 @@ public:
         frame_alloc_ = reinterpret_cast<AVFrame*(*)()>(dlsym(avutil_lib_, "av_frame_alloc"));
         frame_free_ = reinterpret_cast<void(*)(AVFrame**)>(dlsym(avutil_lib_, "av_frame_free"));
         frame_unref_ = reinterpret_cast<void(*)(AVFrame*)>(dlsym(avutil_lib_, "av_frame_unref"));
+        flush_buffers_ = reinterpret_cast<void(*)(AVCodecContext*)>(dlsym(avcodec_lib_, "avcodec_flush_buffers"));
 
         if (!find_decoder_by_name_ || !alloc_context3_ || !open2_ || !free_context_ ||
             !send_packet_ || !receive_frame_ || !frame_alloc_ || !frame_free_ ||
@@ -325,6 +322,12 @@ public:
         initialized_ = false;
     }
 
+    void Flush() {
+        if (initialized_ && ctx_ && flush_buffers_) {
+            flush_buffers_(ctx_);
+        }
+    }
+
     bool IsAvailable() const { return initialized_; }
 
 private:
@@ -344,6 +347,7 @@ private:
     void(*free_context_)(AVCodecContext**){nullptr};
     int(*send_packet_)(AVCodecContext*, const AVPacket*){nullptr};
     int(*receive_frame_)(AVCodecContext*, AVFrame*){nullptr};
+    void(*flush_buffers_)(AVCodecContext*){nullptr};
     AVPacket*(*packet_alloc_)(){nullptr};
     void(*packet_free_)(AVPacket**){nullptr};
     void(*packet_unref_)(AVPacket*){nullptr};
@@ -513,6 +517,7 @@ public:
             ioctl(v4l2_fd_, VIDIOC_STREAMON, &output_buf_type_);
             ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_);
         }
+        sw_decoder_.Flush();
     }
 
     void Close() override {

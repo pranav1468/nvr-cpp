@@ -37,6 +37,7 @@ int avcodec_open2(AVCodecContext *avctx, const AVCodec *codec, void **options);
 void avcodec_free_context(AVCodecContext **avctx);
 int avcodec_send_packet(AVCodecContext *avctx, const AVPacket *avpkt);
 int avcodec_receive_frame(AVCodecContext *avctx, AVFrame *frame);
+void avcodec_flush_buffers(AVCodecContext *avctx);
 
 AVPacket *av_packet_alloc(void);
 void av_packet_free(AVPacket **pkt);
