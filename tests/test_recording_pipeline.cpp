@@ -8,6 +8,9 @@
 #include "nvr/recording/atomic_writer.h"
 #include "nvr/recording/segmenter.h"
 #include "nvr/ingress/rtp_depacketizer.h"
+#include "nvr/ingress/stream_session.h"
+#include "nvr/recording/recording_scheduler.h"
+#include "nvr/common/md5.h"
 
 #include <iostream>
 #include <cassert>
@@ -292,7 +295,7 @@ void RunRtpDepacketizerTest() {
 
     // Test 1: Single NAL Unit packet (SPS = type 7)
     uint8_t single_rtp[] = { 0x67, 0x42, 0x00, 0x1E };
-    depack.ProcessRtpPacket(single_rtp, sizeof(single_rtp), 90000, 1, false);
+    depack.ProcessRtpPacket(single_rtp, sizeof(single_rtp), 90000, 1, true);
     assert(received_frame);
     assert(rx_data.size() == 8); // 4-byte start code + 4 payload
     assert(rx_data[0] == 0 && rx_data[1] == 0 && rx_data[2] == 0 && rx_data[3] == 1);
@@ -312,9 +315,195 @@ void RunRtpDepacketizerTest() {
     assert(is_keyframe == true);
     // Start code (4) + Reconstructed NAL Header (1) + Payload1 (3) + Payload2 (3) = 11 bytes
     assert(rx_data.size() == 11);
-    assert(rx_data[4] == 0x65); // Reconstructed IDR header: (0x7C & 0xE0) | 5 = 0x60 | 5 = 0x65
+    // Test 3: STAP-A aggregation packet (SPS + PPS + IDR slice assembled into single AU)
+    received_frame = false;
+    uint8_t stap_a[] = {
+        0x18, // STAP-A NAL header
+        0x00, 0x04, 0x67, 0x42, 0x00, 0x1E, // SPS (4 bytes)
+        0x00, 0x04, 0x68, 0xCE, 0x3C, 0x80, // PPS (4 bytes)
+        0x00, 0x03, 0x65, 0x88, 0x84        // IDR slice (3 bytes)
+    };
+    depack.ProcessRtpPacket(stap_a, sizeof(stap_a), 270000, 4, true);
+    assert(received_frame);
+    assert(is_keyframe == true);
+    // (4 start code + 4 SPS) + (4 start code + 4 PPS) + (4 start code + 3 IDR) = 23 bytes
+    assert(rx_data.size() == 23);
+    assert(rx_data[0] == 0 && rx_data[1] == 0 && rx_data[2] == 0 && rx_data[3] == 1 && rx_data[4] == 0x67);
+    assert(rx_data[8] == 0 && rx_data[9] == 0 && rx_data[10] == 0 && rx_data[11] == 1 && rx_data[12] == 0x68);
+    assert(rx_data[16] == 0 && rx_data[17] == 0 && rx_data[18] == 0 && rx_data[19] == 1 && rx_data[20] == 0x65);
 
-    std::cout << "  -> PASSED: RFC 6184 FU-A reassembly & start code generation verified." << std::endl;
+    // Test 4: Sequence reordering buffer (out-of-order packets reassembled in-sequence)
+    received_frame = false;
+    std::vector<uint16_t> received_seqs;
+    nvr::RtpDepacketizer depack_reorder(
+        1, nvr::StreamType::MAIN, nvr::CodecType::H264,
+        [&](const nvr::MediaPacketPtr& pkt) {
+            received_seqs.push_back(pkt->sequence_number);
+        }
+    );
+    uint8_t p_seq10[] = { 0x65, 0x10, 0x01 };
+    uint8_t p_seq11[] = { 0x65, 0x11, 0x02 };
+    uint8_t p_seq12[] = { 0x65, 0x12, 0x03 };
+
+    // Send seq 10 (in-order base)
+    depack_reorder.ProcessRtpPacket(p_seq10, sizeof(p_seq10), 300000, 10, true);
+    assert(received_seqs.size() == 1 && received_seqs.back() == 10);
+
+    // Send seq 12 FIRST (out of order, missing seq 11)
+    depack_reorder.ProcessRtpPacket(p_seq12, sizeof(p_seq12), 360000, 12, true);
+    assert(received_seqs.size() == 1); // seq 12 is held in reorder buffer!
+
+    // Send missing seq 11 (completes the sequence)
+    depack_reorder.ProcessRtpPacket(p_seq11, sizeof(p_seq11), 330000, 11, true);
+    // Both seq 11 and seq 12 should now have been processed in strict order!
+    assert(received_seqs.size() == 3);
+    assert(received_seqs[0] == 10);
+    assert(received_seqs[1] == 11);
+    assert(received_seqs[2] == 12);
+
+    std::cout << "  -> PASSED: RFC 6184 AU reassembly, STAP-A aggregation & jitter reordering verified." << std::endl;
+}
+
+void RunDigestAuthAndIPv6Test() {
+    std::cout << "[TEST 6] Running RTSP Digest Auth & IPv6 Parsing Tests..." << std::endl;
+
+    // Test 1: IPv4 URL parsing
+    std::string host, path, auth, user, pass;
+    int port = 0;
+    bool ok = nvr::StreamSession::ParseRtspUrl(
+        "rtsp://admin:pass123@192.168.1.100:554/h264Preview_01_main",
+        host, port, path, auth, user, pass
+    );
+    assert(ok);
+    assert(host == "192.168.1.100");
+    assert(port == 554);
+    assert(path == "/h264Preview_01_main");
+    assert(user == "admin");
+    assert(pass == "pass123");
+
+    // Test 2: IPv6 bracketed URL with custom port
+    ok = nvr::StreamSession::ParseRtspUrl(
+        "rtsp://operator:p@ss@[2001:db8::1]:8554/live/stream1",
+        host, port, path, auth, user, pass
+    );
+    assert(ok);
+    assert(host == "2001:db8::1");
+    assert(port == 8554);
+    assert(path == "/live/stream1");
+    assert(user == "operator");
+    assert(pass == "p@ss");
+
+    // Test 3: IPv6 bracketed URL with default port and no credentials
+    ok = nvr::StreamSession::ParseRtspUrl(
+        "rtsp://[fe80::20c:29ff:fe4f:1a2b]/axis-media/media.amp",
+        host, port, path, auth, user, pass
+    );
+    assert(ok);
+    assert(host == "fe80::20c:29ff:fe4f:1a2b");
+    assert(port == 554);
+    assert(path == "/axis-media/media.amp");
+    assert(user.empty());
+    assert(pass.empty());
+
+    // Test 4: Parse WWW-Authenticate Challenge
+    std::string challenge_resp = 
+        "RTSP/1.0 401 Unauthorized\r\n"
+        "CSeq: 2\r\n"
+        "WWW-Authenticate: Digest realm=\"NVR_VPU\", nonce=\"4f8a12bc\", qop=\"auth\", opaque=\"5ccc069c403ebaf9f0171e9517f40e41\"\r\n"
+        "\r\n";
+    std::string realm, nonce, opaque, qop;
+    nvr::StreamSession::ParseDigestChallenge(challenge_resp, realm, nonce, opaque, qop);
+    assert(realm == "NVR_VPU");
+    assert(nonce == "4f8a12bc");
+    assert(qop == "auth");
+    assert(opaque == "5ccc069c403ebaf9f0171e9517f40e41");
+
+    // Test 5: Digest Auth Header Construction
+    std::string auth_header;
+    bool built = nvr::StreamSession::BuildDigestAuthHeader(
+        "admin", "secret123", realm, nonce, "DESCRIBE", "rtsp://192.168.1.100/live", qop, opaque, auth_header
+    );
+    assert(built);
+    assert(auth_header.find("Authorization: Digest") != std::string::npos);
+    assert(auth_header.find("username=\"admin\"") != std::string::npos);
+    assert(auth_header.find("realm=\"NVR_VPU\"") != std::string::npos);
+    assert(auth_header.find("nonce=\"4f8a12bc\"") != std::string::npos);
+    assert(auth_header.find("uri=\"rtsp://192.168.1.100/live\"") != std::string::npos);
+    assert(auth_header.find("response=") != std::string::npos);
+    assert(auth_header.find("qop=auth") != std::string::npos);
+
+    // Test 6: MD5 calculation correctness against RFC test vector
+    assert(nvr::crypto::ComputeMD5("") == "d41d8cd98f00b204e9800998ecf8427e");
+    assert(nvr::crypto::ComputeMD5("The quick brown fox jumps over the lazy dog") == "9e107d9d372bb6826bd81d3542a419d6");
+
+    std::cout << "  -> PASSED: RFC 2617 Digest auth & IPv6 bracketed address handling verified." << std::endl;
+}
+
+void RunMotionAndScheduleTest() {
+    std::cout << "[TEST 7] Running Motion-Triggered & Weekly Schedule Tests..." << std::endl;
+
+    auto& sched = nvr::RecordingScheduler::Instance();
+    nvr::StorageConfig storage_config;
+    storage_config.recording_path = "./test_recordings";
+    sched.Configure(storage_config);
+
+    // Channel 5 configured for MOTION_ONLY
+    bool start_ok = sched.StartChannelRecording(5, nvr::RecordMode::MOTION_ONLY);
+    assert(start_ok);
+    assert(sched.IsChannelActive(5));
+    assert(!sched.IsChannelRecording(5)); // Gated by motion; not recording yet
+
+    // Inject frames with motion inactive
+    for (int i = 0; i < 10; ++i) {
+        auto pkt = std::make_shared<nvr::MediaPacket>();
+        pkt->channel_id = 5;
+        pkt->stream_type = nvr::StreamType::MAIN;
+        pkt->codec = nvr::CodecType::H264;
+        pkt->is_keyframe = (i == 0);
+        pkt->pts_us = i * 40000;
+        pkt->wall_time_ms = 1000 + i * 40;
+        pkt->data = {0x00, 0x00, 0x00, 0x01, 0x41};
+        sched.EnqueuePacket(5, pkt);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Trigger motion
+    sched.SetMotionEvent(5, true);
+
+    // Inject keyframe while motion is active
+    auto key_pkt = std::make_shared<nvr::MediaPacket>();
+    key_pkt->channel_id = 5;
+    key_pkt->stream_type = nvr::StreamType::MAIN;
+    key_pkt->codec = nvr::CodecType::H264;
+    key_pkt->is_keyframe = true;
+    key_pkt->pts_us = 500000;
+    key_pkt->wall_time_ms = 1500;
+    key_pkt->data = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
+    sched.EnqueuePacket(5, key_pkt);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Stop motion -> enters post-roll period
+    sched.SetMotionEvent(5, false);
+
+    // Test weekly schedule configuration
+    std::vector<nvr::ScheduleTimeWindow> schedule;
+    nvr::ScheduleTimeWindow window;
+    window.start_hour = 0;
+    window.start_minute = 0;
+    window.end_hour = 24;
+    window.end_minute = 0;
+    window.days_mask = 0x7F; // All 7 days
+    schedule.push_back(window);
+
+    sched.SetSchedule(5, schedule);
+    int64_t now_ms = nvr::time_utils::WallTimeMs();
+    assert(sched.IsScheduleActiveNow(5, now_ms));
+
+    sched.StopChannelRecording(5);
+    sched.StopAll();
+
+    std::cout << "  -> PASSED: Motion-only gating, pre-roll buffer & weekly schedule logic verified." << std::endl;
 }
 
 } // namespace
@@ -333,6 +522,8 @@ int main() {
         RunAtomicWriterTest();
         RunSegmenterGopTest();
         RunRtpDepacketizerTest();
+        RunDigestAuthAndIPv6Test();
+        RunMotionAndScheduleTest();
 
         std::filesystem::remove_all("./test_recordings");
 

@@ -2,6 +2,7 @@
 #include "nvr/media/stream_broker.h"
 #include "nvr/common/logger.h"
 #include "nvr/common/time_utils.h"
+#include "nvr/common/md5.h"
 
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -120,21 +121,35 @@ std::string StreamSession::GetUrl() const {
     return rtsp_url_;
 }
 
-bool StreamSession::ParseRtspUrl(const std::string& url, std::string& host, int& port, std::string& path, std::string& auth_header) {
+bool StreamSession::ParseRtspUrl(const std::string& url, std::string& host, int& port, std::string& path,
+                                 std::string& auth_header, std::string& username, std::string& password) {
     // Format: rtsp://[user:pass@]host[:port][/path]
+    // host can be IPv4, hostname, or bracketed IPv6 [2001:db8::1]
     std::string prefix = "rtsp://";
     if (url.rfind(prefix, 0) != 0) {
         return false;
     }
 
     std::string rem = url.substr(prefix.length());
-    size_t at_pos = rem.find('@');
-    if (at_pos != std::string::npos) {
+    size_t first_slash = rem.find('/');
+    size_t search_end = (first_slash != std::string::npos) ? first_slash : rem.size();
+    size_t at_pos = rem.rfind('@', search_end);
+    if (at_pos != std::string::npos && at_pos < search_end) {
         std::string user_pass = rem.substr(0, at_pos);
         auth_header = "Authorization: Basic " + Base64Encode(user_pass) + "\r\n";
+        size_t colon_user = user_pass.find(':');
+        if (colon_user != std::string::npos) {
+            username = user_pass.substr(0, colon_user);
+            password = user_pass.substr(colon_user + 1);
+        } else {
+            username = user_pass;
+            password.clear();
+        }
         rem = rem.substr(at_pos + 1);
     } else {
         auth_header.clear();
+        username.clear();
+        password.clear();
     }
 
     size_t slash_pos = rem.find('/');
@@ -147,20 +162,132 @@ bool StreamSession::ParseRtspUrl(const std::string& url, std::string& host, int&
         path = "/";
     }
 
-    size_t colon_pos = host_port.rfind(':');
-    if (colon_pos != std::string::npos) {
-        host = host_port.substr(0, colon_pos);
-        try {
-            port = std::stoi(host_port.substr(colon_pos + 1));
-        } catch (...) {
+    if (!host_port.empty() && host_port.front() == '[') {
+        size_t close_bracket = host_port.find(']');
+        if (close_bracket != std::string::npos) {
+            host = host_port.substr(1, close_bracket - 1);
+            if (close_bracket + 1 < host_port.size() && host_port[close_bracket + 1] == ':') {
+                try {
+                    port = std::stoi(host_port.substr(close_bracket + 2));
+                } catch (...) {
+                    port = 554;
+                }
+            } else {
+                port = 554;
+            }
+        } else {
+            host = host_port;
             port = 554;
         }
     } else {
-        host = host_port;
-        port = 554;
+        size_t colon_pos = host_port.rfind(':');
+        if (colon_pos != std::string::npos) {
+            host = host_port.substr(0, colon_pos);
+            try {
+                port = std::stoi(host_port.substr(colon_pos + 1));
+            } catch (...) {
+                port = 554;
+            }
+        } else {
+            host = host_port;
+            port = 554;
+        }
     }
 
     return true;
+}
+
+bool StreamSession::ParseRtspUrl(const std::string& url, std::string& host, int& port, std::string& path, std::string& auth_header) {
+    return ParseRtspUrl(url, host, port, path, auth_header, username_, password_);
+}
+
+void StreamSession::ParseDigestChallenge(const std::string& response, std::string& realm,
+                                         std::string& nonce, std::string& opaque, std::string& qop) {
+    size_t pos = response.find("WWW-Authenticate: Digest");
+    if (pos == std::string::npos) pos = response.find("www-authenticate: digest");
+    if (pos == std::string::npos) pos = response.find("WWW-Authenticate: digest");
+    if (pos == std::string::npos) pos = response.find("www-authenticate: Digest");
+    if (pos == std::string::npos) return;
+
+    size_t end_line = response.find("\r\n", pos);
+    std::string challenge = (end_line != std::string::npos) ?
+        response.substr(pos, end_line - pos) : response.substr(pos);
+
+    auto extract_param = [&](const std::string& key) -> std::string {
+        size_t kpos = challenge.find(key + "=");
+        if (kpos == std::string::npos) return "";
+        size_t vstart = kpos + key.size() + 1;
+        if (vstart >= challenge.size()) return "";
+        if (challenge[vstart] == '"') {
+            vstart++;
+            size_t vend = challenge.find('"', vstart);
+            if (vend != std::string::npos) {
+                return challenge.substr(vstart, vend - vstart);
+            }
+        } else {
+            size_t vend = challenge.find_first_of(", \r\n", vstart);
+            return (vend != std::string::npos) ?
+                challenge.substr(vstart, vend - vstart) : challenge.substr(vstart);
+        }
+        return "";
+    };
+
+    realm = extract_param("realm");
+    nonce = extract_param("nonce");
+    opaque = extract_param("opaque");
+    qop = extract_param("qop");
+}
+
+void StreamSession::ParseDigestChallenge(const std::string& response) {
+    ParseDigestChallenge(response, digest_realm_, digest_nonce_, digest_opaque_, digest_qop_);
+}
+
+bool StreamSession::BuildDigestAuthHeader(const std::string& username, const std::string& password,
+                                          const std::string& realm, const std::string& nonce,
+                                          const std::string& method, const std::string& uri,
+                                          const std::string& qop, const std::string& opaque,
+                                          std::string& out_header) {
+    if (username.empty() || realm.empty() || nonce.empty()) {
+        return false;
+    }
+
+    // HA1 = MD5(username:realm:password)
+    std::string ha1 = crypto::ComputeMD5(username + ":" + realm + ":" + password);
+    // HA2 = MD5(method:uri)
+    std::string ha2 = crypto::ComputeMD5(method + ":" + uri);
+
+    std::string response;
+    std::ostringstream oss;
+    oss << "Authorization: Digest username=\"" << username << "\", "
+        << "realm=\"" << realm << "\", "
+        << "nonce=\"" << nonce << "\", "
+        << "uri=\"" << uri << "\", ";
+
+    if (qop.find("auth") != std::string::npos) {
+        std::string nc = "00000001";
+        std::string cnonce = "0a4f113b";
+        // response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
+        response = crypto::ComputeMD5(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":auth:" + ha2);
+        oss << "qop=auth, nc=" << nc << ", cnonce=\"" << cnonce << "\", "
+            << "response=\"" << response << "\"";
+    } else {
+        // response = MD5(HA1:nonce:HA2)
+        response = crypto::ComputeMD5(ha1 + ":" + nonce + ":" + ha2);
+        oss << "response=\"" << response << "\"";
+    }
+
+    if (!opaque.empty()) {
+        oss << ", opaque=\"" << opaque << "\"";
+    }
+    oss << "\r\n";
+
+    out_header = oss.str();
+    return true;
+}
+
+bool StreamSession::BuildDigestAuthHeader(const std::string& method, const std::string& uri, std::string& out_header) {
+    return BuildDigestAuthHeader(username_, password_, digest_realm_, digest_nonce_,
+                                 method, uri, digest_qop_, digest_opaque_, out_header);
 }
 
 bool StreamSession::ConnectSocket() {
@@ -174,7 +301,7 @@ bool StreamSession::ConnectSocket() {
     }
 
     struct addrinfo hints{}, *res = nullptr;
-    hints.ai_family = AF_INET;
+    hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
 
     std::string port_str = std::to_string(port);
@@ -463,7 +590,27 @@ bool StreamSession::SendRtspDescribe() {
     if (send(sock_fd_, req.c_str(), req.size(), 0) <= 0) return false;
 
     std::string resp;
-    if (!ReadRtspResponse(resp) || resp.find("200 OK") == std::string::npos) {
+    if (!ReadRtspResponse(resp)) return false;
+
+    if (resp.find("401") != std::string::npos) {
+        LOG_INFO << "[Channel " << channel_id_ << "] RTSP DESCRIBE received 401 Unauthorized, testing Digest auth challenge";
+        ParseDigestChallenge(resp);
+        if (!digest_nonce_.empty() && !username_.empty()) {
+            BuildDigestAuthHeader("DESCRIBE", rtsp_url_, auth_header_);
+            std::ostringstream retry_oss;
+            retry_oss << "DESCRIBE " << rtsp_url_ << " RTSP/1.0\r\n"
+                      << "CSeq: " << cseq_++ << "\r\n"
+                      << "Accept: application/sdp\r\n"
+                      << "User-Agent: NVR_Core/1.0\r\n"
+                      << auth_header_
+                      << "\r\n";
+            std::string retry_req = retry_oss.str();
+            if (send(sock_fd_, retry_req.c_str(), retry_req.size(), 0) <= 0) return false;
+            if (!ReadRtspResponse(resp)) return false;
+        }
+    }
+
+    if (resp.find("200 OK") == std::string::npos) {
         LOG_WARN << "[Channel " << channel_id_ << "] RTSP DESCRIBE failed: " << resp;
         return false;
     }
@@ -518,6 +665,10 @@ bool StreamSession::SendRtspSetup(const std::string& track_control, int rtp_chan
         setup_url += track_control;
     }
 
+    if (!digest_nonce_.empty() && !username_.empty()) {
+        BuildDigestAuthHeader("SETUP", setup_url, auth_header_);
+    }
+
     std::ostringstream oss;
     oss << "SETUP " << setup_url << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
@@ -553,6 +704,10 @@ bool StreamSession::SendRtspSetup(const std::string& track_control, int rtp_chan
 }
 
 bool StreamSession::SendRtspPlay() {
+    if (!digest_nonce_.empty() && !username_.empty()) {
+        BuildDigestAuthHeader("PLAY", rtsp_url_, auth_header_);
+    }
+
     std::ostringstream oss;
     oss << "PLAY " << rtsp_url_ << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"

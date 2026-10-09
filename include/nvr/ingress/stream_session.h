@@ -22,6 +22,16 @@ public:
     SessionState GetState() const;
     std::string GetUrl() const;
 
+    static bool ParseRtspUrl(const std::string& url, std::string& host, int& port, std::string& path,
+                             std::string& auth_header, std::string& username, std::string& password);
+    static bool BuildDigestAuthHeader(const std::string& username, const std::string& password,
+                                      const std::string& realm, const std::string& nonce,
+                                      const std::string& method, const std::string& uri,
+                                      const std::string& qop, const std::string& opaque,
+                                      std::string& out_header);
+    static void ParseDigestChallenge(const std::string& response, std::string& realm,
+                                     std::string& nonce, std::string& opaque, std::string& qop);
+
 private:
     void WorkerLoop();
 
@@ -39,10 +49,19 @@ private:
     bool ReadExact(uint8_t* buffer, size_t length, int timeout_ms = 4000);
 
     void ParseSdp(const std::string& sdp, std::string& track_control, CodecType& codec, int& payload_type);
+    bool BuildDigestAuthHeader(const std::string& method, const std::string& uri, std::string& out_header);
+    void ParseDigestChallenge(const std::string& response);
 
     int channel_id_{0};
     StreamType stream_type_{StreamType::MAIN};
     std::string rtsp_url_;
+    std::string rtsp_path_;
+    std::string username_;
+    std::string password_;
+    std::string digest_realm_;
+    std::string digest_nonce_;
+    std::string digest_opaque_;
+    std::string digest_qop_;
 
     std::atomic<bool> running_{false};
     std::atomic<SessionState> state_{SessionState::DISCONNECTED};

@@ -44,8 +44,13 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
         }
     }
 
-    int64_t now_ms = (packet->wall_time_ms > 0) ? packet->wall_time_ms : time_utils::WallTimeMs();
-    int64_t elapsed_ms = now_ms - writer_.GetSegmentStartTimeMs();
+    int64_t elapsed_ms = 0;
+    if (writer_.GetSegmentStartPtsUs() >= 0 && packet->pts_us > writer_.GetSegmentStartPtsUs()) {
+        elapsed_ms = (packet->pts_us - writer_.GetSegmentStartPtsUs()) / 1000;
+    } else {
+        int64_t now_ms = (packet->wall_time_ms > 0) ? packet->wall_time_ms : time_utils::WallTimeMs();
+        elapsed_ms = now_ms - writer_.GetSegmentStartTimeMs();
+    }
 
     // Check if segment duration reached and packet is a keyframe (GOP alignment)
     if (elapsed_ms >= segment_duration_ms_ && packet->is_keyframe) {

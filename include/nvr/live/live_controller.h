@@ -8,8 +8,10 @@
 #include "nvr/media/stream_broker.h"
 #include <memory>
 #include <vector>
+#include <deque>
 #include <unordered_map>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <atomic>
 #include <functional>
@@ -76,6 +78,10 @@ private:
         StreamBroker::SubscriptionId sub_id{0};
         std::atomic<bool> active{false};
         std::atomic<bool> paused{false};
+        std::mutex packet_mutex;
+        std::condition_variable packet_cv;
+        std::deque<MediaPacketPtr> packet_queue;
+        const size_t max_packet_depth{4};
         std::thread worker_thread;
         std::atomic<uint64_t> rendered_count{0};
         std::chrono::steady_clock::time_point last_frame_time;

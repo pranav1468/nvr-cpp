@@ -2,7 +2,10 @@ CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread -I./include -I./include/3rdparty
 LDFLAGS ?= -pthread -ldl
 
-SQLITE_LIB := $(shell if [ -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 ]; then echo "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0"; else echo "-lsqlite3"; fi)
+SQLITE_LIB ?= $(shell if $(CXX) -shared -x c /dev/null -o /dev/null -lsqlite3 >/dev/null 2>&1; then echo "-lsqlite3"; \
+                      elif [ -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 ]; then echo "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0"; \
+                      elif [ -f /usr/lib/aarch64-linux-gnu/libsqlite3.so.0 ]; then echo "/usr/lib/aarch64-linux-gnu/libsqlite3.so.0"; \
+                      else echo "-lsqlite3"; fi)
 
 SRCS = src/common/logger.cpp \
        src/common/time_utils.cpp \

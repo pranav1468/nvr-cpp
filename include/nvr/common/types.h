@@ -126,6 +126,43 @@ enum class LiveGridLayout {
     FULLSCREEN = 100
 };
 
+template <typename T, size_t Alignment = 64>
+class AlignedAllocator {
+public:
+    using value_type = T;
+    using size_type = std::size_t;
+    using difference_type = std::ptrdiff_t;
+
+    AlignedAllocator() noexcept = default;
+
+    template <typename U>
+    AlignedAllocator(const AlignedAllocator<U, Alignment>&) noexcept {}
+
+    T* allocate(size_t n) {
+        if (n == 0) return nullptr;
+        void* ptr = nullptr;
+        size_t bytes = n * sizeof(T);
+        if (posix_memalign(&ptr, Alignment, bytes) != 0) {
+            throw std::bad_alloc();
+        }
+        return static_cast<T*>(ptr);
+    }
+
+    void deallocate(T* p, size_t) noexcept {
+        free(p);
+    }
+
+    template <typename U>
+    struct rebind {
+        using other = AlignedAllocator<U, Alignment>;
+    };
+
+    bool operator==(const AlignedAllocator&) const noexcept { return true; }
+    bool operator!=(const AlignedAllocator&) const noexcept { return false; }
+};
+
+using AlignedByteBuffer = std::vector<uint8_t, AlignedAllocator<uint8_t, 64>>;
+
 struct DecodedFrame {
     int channel_id{0};
     StreamType stream_type{StreamType::SUB};
@@ -136,7 +173,7 @@ struct DecodedFrame {
     int64_t pts_us{0};
     int64_t wall_time_ms{0};
     uint64_t frame_index{0};
-    std::vector<uint8_t> data;
+    AlignedByteBuffer data;
     int dmabuf_fd{-1};
 
     size_t GetSizeBytes() const {

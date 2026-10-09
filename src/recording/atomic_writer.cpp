@@ -167,6 +167,7 @@ bool AtomicWriter::StartSegment(int64_t start_wall_time_ms) {
     }
 
     is_active_ = true;
+    has_io_error_ = false;
     frame_count_ = 0;
     keyframe_count_ = 0;
     total_bytes_written_ = 0;
@@ -363,7 +364,11 @@ void AtomicWriter::WriteFtyp() {
     PutFourCC(buf, "mp41");
     UpdateBoxSize(buf, 0);
 
-    WriteAll(fd_, buf.data(), buf.size());
+    if (!WriteAll(fd_, buf.data(), buf.size())) {
+        has_io_error_ = true;
+        LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write ftyp box";
+        return;
+    }
     total_bytes_written_ += buf.size();
 }
 
@@ -835,7 +840,11 @@ void AtomicWriter::WriteMoov() {
 
     UpdateBoxSize(buf, moov_start);
 
-    WriteAll(fd_, buf.data(), buf.size());
+    if (!WriteAll(fd_, buf.data(), buf.size())) {
+        has_io_error_ = true;
+        LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write moov box";
+        return;
+    }
     total_bytes_written_ += buf.size();
     has_header_written_ = true;
 }
@@ -967,7 +976,11 @@ void AtomicWriter::WriteMoof(const std::vector<SampleEntry>& video_samples, uint
         buf[audio_data_offset_pos + 3] = static_cast<uint8_t>(audio_data_offset & 0xFF);
     }
 
-    WriteAll(fd_, buf.data(), buf.size());
+    if (!WriteAll(fd_, buf.data(), buf.size())) {
+        has_io_error_ = true;
+        LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write moof box";
+        return;
+    }
     total_bytes_written_ += buf.size();
 }
 
@@ -976,15 +989,27 @@ void AtomicWriter::WriteMdat(const std::vector<uint8_t>& video_payload, const st
     std::vector<uint8_t> mdat_hdr;
     PutU32(mdat_hdr, total_payload + 8);
     PutFourCC(mdat_hdr, "mdat");
-    WriteAll(fd_, mdat_hdr.data(), mdat_hdr.size());
+    if (!WriteAll(fd_, mdat_hdr.data(), mdat_hdr.size())) {
+        has_io_error_ = true;
+        LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write mdat box header";
+        return;
+    }
     total_bytes_written_ += mdat_hdr.size();
 
     if (!video_payload.empty()) {
-        WriteAll(fd_, video_payload.data(), video_payload.size());
+        if (!WriteAll(fd_, video_payload.data(), video_payload.size())) {
+            has_io_error_ = true;
+            LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write video mdat payload";
+            return;
+        }
         total_bytes_written_ += video_payload.size();
     }
     if (has_audio_ && !audio_payload.empty()) {
-        WriteAll(fd_, audio_payload.data(), audio_payload.size());
+        if (!WriteAll(fd_, audio_payload.data(), audio_payload.size())) {
+            has_io_error_ = true;
+            LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write audio mdat payload";
+            return;
+        }
         total_bytes_written_ += audio_payload.size();
     }
 }
@@ -1194,6 +1219,34 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
     return true;
 }
 
+bool AtomicWriter::ValidateMp4File(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+    file.seekg(0, std::ios::end);
+    std::streampos fsize = file.tellg();
+    if (fsize < 32) {
+        return false;
+    }
+    file.seekg(0, std::ios::beg);
+    uint8_t header[12];
+    if (!file.read(reinterpret_cast<char*>(header), 12)) {
+        return false;
+    }
+    uint32_t box_size = (static_cast<uint32_t>(header[0]) << 24) |
+                        (static_cast<uint32_t>(header[1]) << 16) |
+                        (static_cast<uint32_t>(header[2]) << 8) |
+                        static_cast<uint32_t>(header[3]);
+    if (box_size < 8 || static_cast<std::streampos>(box_size) > fsize) {
+        return false;
+    }
+    if (std::memcmp(header + 4, "ftyp", 4) != 0) {
+        return false;
+    }
+    return true;
+}
+
 bool AtomicWriter::FinalizeSegment(SegmentMetadata& out_meta) {
     if (!is_active_) {
         return false;
@@ -1203,9 +1256,30 @@ bool AtomicWriter::FinalizeSegment(SegmentMetadata& out_meta) {
 
     if (fd_ >= 0) {
         // Two-phase commit: flush to disk surface
-        fdatasync(fd_);
+        if (fdatasync(fd_) != 0) {
+            has_io_error_ = true;
+            LOG_ERROR << "[Channel " << channel_id_ << "] fdatasync failed: " << strerror(errno);
+        }
         close(fd_);
         fd_ = -1;
+    }
+
+    if (has_io_error_) {
+        LOG_ERROR << "[Channel " << channel_id_ << "] Aborting segment commit due to disk I/O error";
+        AbortSegment();
+        return false;
+    }
+
+    if (frame_count_ == 0) {
+        LOG_WARN << "[Channel " << channel_id_ << "] Aborting segment commit with 0 frames";
+        AbortSegment();
+        return false;
+    }
+
+    if (!ValidateMp4File(tmp_file_path_)) {
+        LOG_ERROR << "[Channel " << channel_id_ << "] MP4 container validation failed on temporary file: " << tmp_file_path_;
+        AbortSegment();
+        return false;
     }
 
     // Atomic filesystem commit: rename .tmp -> .mp4
@@ -1213,12 +1287,20 @@ bool AtomicWriter::FinalizeSegment(SegmentMetadata& out_meta) {
     if (res != 0) {
         LOG_ERROR << "Failed to atomically rename temporary file " << tmp_file_path_
                   << " to " << final_file_path_ << ": " << strerror(errno);
-        is_active_ = false;
+        AbortSegment();
         return false;
     }
 
-    int64_t end_time_ms = time_utils::WallTimeMs();
-    int64_t duration_ms = end_time_ms - start_time_ms_;
+    int64_t duration_ms = 0;
+    if (segment_start_pts_us_ >= 0 && last_pts_us_ > segment_start_pts_us_) {
+        duration_ms = (last_pts_us_ - segment_start_pts_us_) / 1000;
+    } else {
+        int64_t end_time_ms = time_utils::WallTimeMs();
+        duration_ms = end_time_ms - start_time_ms_;
+    }
+    if (duration_ms <= 0) duration_ms = 1;
+
+    int64_t end_time_ms = start_time_ms_ + duration_ms;
 
     out_meta.channel_id = channel_id_;
     out_meta.file_path = final_file_path_;

@@ -12,7 +12,7 @@ BufferAllocator::~BufferAllocator() {
     ClearPool();
 }
 
-std::vector<uint8_t> BufferAllocator::Allocate(size_t size) {
+AlignedByteBuffer BufferAllocator::Allocate(size_t size) {
     if (size == 0) {
         return {};
     }
@@ -23,7 +23,7 @@ std::vector<uint8_t> BufferAllocator::Allocate(size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& pool = pools_[aligned_size];
     if (!pool.empty()) {
-        std::vector<uint8_t> buf = std::move(pool.back());
+        AlignedByteBuffer buf = std::move(pool.back());
         pool.pop_back();
         buf.resize(size);
         return buf;
@@ -34,12 +34,12 @@ std::vector<uint8_t> BufferAllocator::Allocate(size_t size) {
         peak_allocated_bytes_ = total_allocated_bytes_.load();
     }
 
-    std::vector<uint8_t> buf;
+    AlignedByteBuffer buf;
     buf.resize(size);
     return buf;
 }
 
-void BufferAllocator::Release(std::vector<uint8_t>&& buffer) {
+void BufferAllocator::Release(AlignedByteBuffer&& buffer) {
     if (buffer.empty()) {
         return;
     }

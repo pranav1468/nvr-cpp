@@ -15,9 +15,15 @@ include_directories(
 )
 
 # Resolve SQLite3 library
-find_library(SQLITE3_LIB NAMES sqlite3 libsqlite3.so.0 libsqlite3.so
-    PATHS /usr/lib/x86_64-linux-gnu /usr/lib /usr/local/lib
-)
+find_package(SQLite3)
+if (TARGET SQLite3::SQLite3)
+    set(SQLITE3_LIB SQLite3::SQLite3)
+else()
+    find_library(SQLITE3_LIB NAMES sqlite3 libsqlite3.so)
+    if (NOT SQLITE3_LIB)
+        set(SQLITE3_LIB sqlite3)
+    endif()
+endif()
 
 # Core backend source files
 set(CORE_SOURCES

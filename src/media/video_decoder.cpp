@@ -5,6 +5,13 @@
 #include <fcntl.h>
 #include <cstring>
 #include <algorithm>
+#include <linux/videodev2.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+
+#ifndef V4L2_PIX_FMT_HEVC
+#define V4L2_PIX_FMT_HEVC v4l2_fourcc('H', 'E', 'V', 'C')
+#endif
 
 namespace nvr {
 
@@ -156,17 +163,40 @@ public:
             const char* vpu_devs[] = {"/dev/video10", "/dev/video11", "/dev/video-dec0", "/dev/mxc_vpu"};
             for (const char* dev : vpu_devs) {
                 if (access(dev, F_OK) == 0) {
-                    v4l2_device_path_ = dev;
-                    is_hardware_ = true;
-                    break;
+                    int fd = open(dev, O_RDWR | O_NONBLOCK);
+                    if (fd >= 0) {
+                        struct v4l2_capability cap{};
+                        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+                            uint32_t caps = cap.capabilities;
+                            if (caps & V4L2_CAP_DEVICE_CAPS) {
+                                caps = cap.device_caps;
+                            }
+                            if (caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE)) {
+                                v4l2_fd_ = fd;
+                                v4l2_device_path_ = dev;
+                                is_hardware_ = true;
+                                output_buf_type_ = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) ?
+                                    V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE : V4L2_BUF_TYPE_VIDEO_OUTPUT;
+                                capture_buf_type_ = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) ?
+                                    V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                                
+                                if (SetupV4l2Queues()) {
+                                    LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 M2M VPU device configured at " 
+                                             << v4l2_device_path_;
+                                    break;
+                                }
+                            }
+                        }
+                        close(fd);
+                    }
                 }
             }
         }
 
         if (is_hardware_) {
-            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU device active at " << v4l2_device_path_;
+            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming active at " << v4l2_device_path_;
         } else {
-            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 device not found, using optimized engine (" 
+            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 device not available, using optimized engine (" 
                      << CodecToString(codec_) << ")";
         }
 
@@ -241,6 +271,16 @@ public:
     }
 
     void Close() override {
+        if (v4l2_fd_ >= 0) {
+            if (streamon_) {
+                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
+                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+                streamon_ = false;
+            }
+            close(v4l2_fd_);
+            v4l2_fd_ = -1;
+        }
+        is_hardware_ = false;
         initialized_ = false;
     }
 
@@ -254,6 +294,83 @@ public:
 
     uint32_t GetWidth() const override { return width_; }
     uint32_t GetHeight() const override { return height_; }
+
+private:
+    bool SetupV4l2Queues() {
+        if (v4l2_fd_ < 0) return false;
+
+        // 1. Output queue format (bitstream input)
+        struct v4l2_format fmt_out{};
+        fmt_out.type = output_buf_type_;
+        uint32_t pix_fmt = (codec_ == CodecType::H264) ? V4L2_PIX_FMT_H264 : V4L2_PIX_FMT_HEVC;
+
+        if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+            fmt_out.fmt.pix_mp.pixelformat = pix_fmt;
+            fmt_out.fmt.pix_mp.width = (width_ > 0) ? width_ : 1920;
+            fmt_out.fmt.pix_mp.height = (height_ > 0) ? height_ : 1080;
+            fmt_out.fmt.pix_mp.num_planes = 1;
+            fmt_out.fmt.pix_mp.plane_fmt[0].sizeimage = 1024 * 1024;
+        } else {
+            fmt_out.fmt.pix.pixelformat = pix_fmt;
+            fmt_out.fmt.pix.width = (width_ > 0) ? width_ : 1920;
+            fmt_out.fmt.pix.height = (height_ > 0) ? height_ : 1080;
+            fmt_out.fmt.pix.sizeimage = 1024 * 1024;
+        }
+
+        if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt_out) < 0) {
+            LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_S_FMT failed";
+            return false;
+        }
+
+        // 2. Capture queue format (decoded NV12 frames)
+        struct v4l2_format fmt_cap{};
+        fmt_cap.type = capture_buf_type_;
+        if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+            fmt_cap.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
+            fmt_cap.fmt.pix_mp.width = (width_ > 0) ? width_ : 1920;
+            fmt_cap.fmt.pix_mp.height = (height_ > 0) ? height_ : 1080;
+            fmt_cap.fmt.pix_mp.num_planes = 1;
+        } else {
+            fmt_cap.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+            fmt_cap.fmt.pix.width = (width_ > 0) ? width_ : 1920;
+            fmt_cap.fmt.pix.height = (height_ > 0) ? height_ : 1080;
+        }
+
+        if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt_cap) < 0) {
+            LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_S_FMT failed";
+            return false;
+        }
+
+        // 3. Request buffers for output queue
+        struct v4l2_requestbuffers req_out{};
+        req_out.count = 4;
+        req_out.type = output_buf_type_;
+        req_out.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_out) < 0) {
+            LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_REQBUFS failed";
+            return false;
+        }
+
+        // 4. Request buffers for capture queue
+        struct v4l2_requestbuffers req_cap{};
+        req_cap.count = 4;
+        req_cap.type = capture_buf_type_;
+        req_cap.memory = V4L2_MEMORY_MMAP;
+        if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_cap) < 0) {
+            LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_REQBUFS failed";
+            return false;
+        }
+
+        // 5. Start streaming on both queues
+        if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &output_buf_type_) < 0 ||
+            ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_) < 0) {
+            LOG_WARN << "[VpuVideoDecoder] VIDIOC_STREAMON failed";
+            return false;
+        }
+
+        streamon_ = true;
+        return true;
+    }
 
 private:
     void ExtractSpsAndConfigure(const std::vector<uint8_t>& data) {
@@ -294,6 +411,10 @@ private:
     bool is_hardware_{false};
     bool initialized_{false};
     std::string v4l2_device_path_;
+    int v4l2_fd_{-1};
+    uint32_t output_buf_type_{0};
+    uint32_t capture_buf_type_{0};
+    bool streamon_{false};
     uint64_t frame_counter_{0};
 };
 

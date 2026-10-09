@@ -159,12 +159,14 @@ bool LiveController::SetFullscreen(int channel_id) {
     ChannelPipeline* raw_pipe = fullscreen_pipeline_.get();
     fullscreen_pipeline_->sub_id = StreamBroker::Instance().Subscribe(
         channel_id, StreamType::MAIN,
-        [this, raw_pipe](const MediaPacketPtr& pkt) {
+        [raw_pipe](const MediaPacketPtr& pkt) {
             if (!raw_pipe->active || raw_pipe->paused || !pkt || pkt->IsAudio()) return;
-            DecodedFramePtr frame;
-            if (raw_pipe->decoder && raw_pipe->decoder->Decode(pkt, frame)) {
-                raw_pipe->queue->Push(frame);
+            std::lock_guard<std::mutex> lk(raw_pipe->packet_mutex);
+            if (raw_pipe->packet_queue.size() >= raw_pipe->max_packet_depth) {
+                raw_pipe->packet_queue.pop_front();
             }
+            raw_pipe->packet_queue.push_back(pkt);
+            raw_pipe->packet_cv.notify_one();
         }
     );
 
@@ -182,6 +184,7 @@ bool LiveController::ExitFullscreen() {
     int closing_channel = fullscreen_channel_id_;
     if (fullscreen_pipeline_) {
         fullscreen_pipeline_->active = false;
+        fullscreen_pipeline_->packet_cv.notify_all();
         if (fullscreen_pipeline_->queue) fullscreen_pipeline_->queue->Stop();
         if (fullscreen_pipeline_->sub_id != 0) {
             StreamBroker::Instance().Unsubscribe(fullscreen_pipeline_->sub_id);
@@ -313,6 +316,7 @@ void LiveController::SetupGridPipelines() {
 void LiveController::TeardownGridPipelines() {
     for (auto& [id, pipe] : pipelines_) {
         pipe->active = false;
+        pipe->packet_cv.notify_all();
         if (pipe->queue) pipe->queue->Stop();
         if (pipe->sub_id != 0) {
             StreamBroker::Instance().Unsubscribe(pipe->sub_id);
@@ -342,12 +346,14 @@ void LiveController::StartChannelPipeline(int channel_id, int tile_index, Stream
     ChannelPipeline* raw_pipe = pipe.get();
     pipe->sub_id = StreamBroker::Instance().Subscribe(
         channel_id, stream_type,
-        [this, raw_pipe](const MediaPacketPtr& pkt) {
+        [raw_pipe](const MediaPacketPtr& pkt) {
             if (!raw_pipe->active || raw_pipe->paused || !pkt || pkt->IsAudio()) return;
-            DecodedFramePtr frame;
-            if (raw_pipe->decoder && raw_pipe->decoder->Decode(pkt, frame)) {
-                raw_pipe->queue->Push(frame);
+            std::lock_guard<std::mutex> lk(raw_pipe->packet_mutex);
+            if (raw_pipe->packet_queue.size() >= raw_pipe->max_packet_depth) {
+                raw_pipe->packet_queue.pop_front();
             }
+            raw_pipe->packet_queue.push_back(pkt);
+            raw_pipe->packet_cv.notify_one();
         }
     );
 
@@ -359,37 +365,61 @@ void LiveController::ChannelWorkerLoop(ChannelPipeline* pipeline, uint32_t targe
     (void)target_w;
     (void)target_h;
     while (pipeline->active && running_) {
-        DecodedFramePtr frame;
-        bool pop_ok = false;
-        if (config_.drop_stale_frames) {
-            pop_ok = pipeline->queue->PopLatest(frame);
-            if (!pop_ok) {
-                pop_ok = pipeline->queue->Pop(frame, 50);
+        MediaPacketPtr pkt;
+        {
+            std::unique_lock<std::mutex> lk(pipeline->packet_mutex);
+            pipeline->packet_cv.wait_for(lk, std::chrono::milliseconds(50), [pipeline]() {
+                return !pipeline->active || !pipeline->packet_queue.empty();
+            });
+            if (!pipeline->active) break;
+            if (pipeline->paused) {
+                pipeline->packet_queue.clear();
+                continue;
             }
-        } else {
-            pop_ok = pipeline->queue->Pop(frame, 50);
+            if (!pipeline->packet_queue.empty()) {
+                pkt = pipeline->packet_queue.front();
+                pipeline->packet_queue.pop_front();
+            }
         }
 
-        if (pop_ok && frame) {
-            DecodedFramePtr scaled_frame;
-            if (pipeline->scaler && pipeline->scaler->Scale(frame, scaled_frame)) {
-                if (display_backend_) {
-                    display_backend_->RenderTile(pipeline->tile_index, pipeline->channel_id, scaled_frame);
-                }
-                pipeline->rendered_count++;
+        if (!pkt) continue;
 
-                // Track FPS
-                auto now = std::chrono::steady_clock::now();
-                if (pipeline->last_frame_time.time_since_epoch().count() > 0) {
-                    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(now - pipeline->last_frame_time).count();
-                    if (elapsed_us > 0) {
-                        double instant_fps = 1000000.0 / elapsed_us;
-                        pipeline->current_fps = 0.9 * pipeline->current_fps + 0.1 * instant_fps;
-                    }
-                } else {
-                    pipeline->current_fps = 25.0;
+        DecodedFramePtr frame;
+        if (pipeline->decoder && pipeline->decoder->Decode(pkt, frame)) {
+            pipeline->queue->Push(frame);
+
+            DecodedFramePtr live_frame;
+            bool pop_ok = false;
+            if (config_.drop_stale_frames) {
+                pop_ok = pipeline->queue->PopLatest(live_frame);
+                if (!pop_ok) {
+                    pop_ok = pipeline->queue->Pop(live_frame, 10);
                 }
-                pipeline->last_frame_time = now;
+            } else {
+                pop_ok = pipeline->queue->Pop(live_frame, 10);
+            }
+
+            if (pop_ok && live_frame) {
+                DecodedFramePtr scaled_frame;
+                if (pipeline->scaler && pipeline->scaler->Scale(live_frame, scaled_frame)) {
+                    if (display_backend_) {
+                        display_backend_->RenderTile(pipeline->tile_index, pipeline->channel_id, scaled_frame);
+                    }
+                    pipeline->rendered_count++;
+
+                    // Track FPS
+                    auto now = std::chrono::steady_clock::now();
+                    if (pipeline->last_frame_time.time_since_epoch().count() > 0) {
+                        auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(now - pipeline->last_frame_time).count();
+                        if (elapsed_us > 0) {
+                            double instant_fps = 1000000.0 / elapsed_us;
+                            pipeline->current_fps = 0.9 * pipeline->current_fps + 0.1 * instant_fps;
+                        }
+                    } else {
+                        pipeline->current_fps = 25.0;
+                    }
+                    pipeline->last_frame_time = now;
+                }
             }
         }
     }

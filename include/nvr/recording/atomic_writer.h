@@ -24,12 +24,15 @@ public:
 
     bool IsActive() const;
     int64_t GetSegmentStartTimeMs() const;
+    int64_t GetSegmentStartPtsUs() const { return segment_start_pts_us_; }
     uint32_t GetFrameCount() const;
     uint64_t GetCurrentBytesWritten() const;
+    bool HasIoError() const { return has_io_error_; }
     bool HasAudio() const { return has_audio_; }
     CodecType GetAudioCodec() const { return audio_codec_; }
     void ConfigureAudio(CodecType codec, uint32_t sample_rate = 8000, uint8_t channels = 1);
 
+    static bool ValidateMp4File(const std::string& path);
     static void CleanOrphanedTmpFiles(const std::string& directory);
 
 private:
@@ -58,6 +61,7 @@ private:
     std::string final_file_path_;
     int fd_{-1};
     bool is_active_{false};
+    bool has_io_error_{false};
 
     int64_t start_time_ms_{0};
     int64_t segment_start_pts_us_{-1};

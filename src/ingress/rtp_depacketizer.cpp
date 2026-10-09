@@ -10,30 +10,125 @@ RtpDepacketizer::RtpDepacketizer(int channel_id, StreamType stream_type, CodecTy
 }
 
 void RtpDepacketizer::Reset() {
+    FlushAu();
     fu_buffer_.clear();
     fu_in_progress_ = false;
     fu_is_keyframe_ = false;
     fu_start_seq_ = 0;
     fu_last_seq_ = 0;
+    has_seq_ = false;
+    expected_seq_ = 0;
+    reorder_buffer_.clear();
     has_base_pts_ = false;
     unwrapped_rtp_timestamp_ = 0;
+}
+
+void RtpDepacketizer::Flush() {
+    FlushAu();
 }
 
 void RtpDepacketizer::ProcessRtpPacket(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit) {
     if (!payload || size == 0) return;
 
+    if (codec_ == CodecType::AAC) {
+        ProcessAac(payload, size, rtp_timestamp, seq_num);
+        return;
+    } else if (codec_ == CodecType::PCMA || codec_ == CodecType::PCMU) {
+        ProcessG711(payload, size, rtp_timestamp, seq_num);
+        return;
+    }
+
+    // Video streams (H.264 / H.265): pass through sequence reordering buffer
+    if (!has_seq_) {
+        has_seq_ = true;
+        expected_seq_ = seq_num;
+    }
+
+    if (seq_num == expected_seq_) {
+        ProcessVideoPacketInternal(payload, size, rtp_timestamp, seq_num, marker_bit);
+        expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+
+        while (!reorder_buffer_.empty()) {
+            auto it = reorder_buffer_.find(expected_seq_);
+            if (it != reorder_buffer_.end()) {
+                QueuedRtpPacket qp = std::move(it->second);
+                reorder_buffer_.erase(it);
+                ProcessVideoPacketInternal(qp.payload.data(), qp.payload.size(), qp.timestamp, qp.seq_num, qp.marker);
+                expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+            } else {
+                break;
+            }
+        }
+    } else {
+        int16_t diff = static_cast<int16_t>(seq_num - expected_seq_);
+        if (diff > 0) {
+            QueuedRtpPacket qp;
+            qp.seq_num = seq_num;
+            qp.timestamp = rtp_timestamp;
+            qp.marker = marker_bit;
+            qp.payload.assign(payload, payload + size);
+            reorder_buffer_[seq_num] = std::move(qp);
+
+            if (reorder_buffer_.size() >= 16) {
+                auto lowest_it = reorder_buffer_.begin();
+                expected_seq_ = lowest_it->first;
+                QueuedRtpPacket qp_low = std::move(lowest_it->second);
+                reorder_buffer_.erase(lowest_it);
+                ProcessVideoPacketInternal(qp_low.payload.data(), qp_low.payload.size(), qp_low.timestamp, qp_low.seq_num, qp_low.marker);
+                expected_seq_ = static_cast<uint16_t>(expected_seq_ + 1);
+            }
+        }
+    }
+}
+
+void RtpDepacketizer::ProcessVideoPacketInternal(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit) {
     if (codec_ == CodecType::H264) {
         ProcessH264(payload, size, rtp_timestamp, seq_num, marker_bit);
     } else if (codec_ == CodecType::H265) {
         ProcessH265(payload, size, rtp_timestamp, seq_num, marker_bit);
-    } else if (codec_ == CodecType::AAC) {
-        ProcessAac(payload, size, rtp_timestamp, seq_num);
-    } else if (codec_ == CodecType::PCMA || codec_ == CodecType::PCMU) {
-        ProcessG711(payload, size, rtp_timestamp, seq_num);
     }
 }
 
-void RtpDepacketizer::ProcessH264(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool /*marker_bit*/) {
+void RtpDepacketizer::AppendNalToAu(const uint8_t* nal_data, size_t nal_len, bool is_key, uint32_t rtp_timestamp, uint16_t seq_num) {
+    if (!nal_data || nal_len == 0) return;
+
+    if (au_has_data_ && rtp_timestamp != au_timestamp_) {
+        FlushAu();
+    }
+
+    if (!au_has_data_) {
+        au_buffer_.clear();
+        au_timestamp_ = rtp_timestamp;
+        au_seq_num_ = seq_num;
+        au_is_keyframe_ = false;
+        au_has_data_ = true;
+    }
+
+    // Prepend 4-byte Annex-B start code
+    au_buffer_.push_back(0x00);
+    au_buffer_.push_back(0x00);
+    au_buffer_.push_back(0x00);
+    au_buffer_.push_back(0x01);
+    au_buffer_.insert(au_buffer_.end(), nal_data, nal_data + nal_len);
+
+    if (is_key) {
+        au_is_keyframe_ = true;
+    }
+    au_seq_num_ = seq_num;
+}
+
+void RtpDepacketizer::FlushAu() {
+    if (!au_has_data_ || au_buffer_.empty()) {
+        au_has_data_ = false;
+        return;
+    }
+    EmitPacket(au_buffer_, au_is_keyframe_, au_timestamp_, au_seq_num_);
+    au_buffer_.clear();
+    au_has_data_ = false;
+    au_is_keyframe_ = false;
+}
+
+void RtpDepacketizer::ProcessH264(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit) {
     if (size < 1) return;
 
     uint8_t nal_header = payload[0];
@@ -41,16 +136,11 @@ void RtpDepacketizer::ProcessH264(const uint8_t* payload, size_t size, uint32_t 
 
     // Single NAL unit packet (1..23)
     if (nal_type >= 1 && nal_type <= 23) {
-        std::vector<uint8_t> frame;
-        frame.reserve(4 + size);
-        frame.push_back(0x00);
-        frame.push_back(0x00);
-        frame.push_back(0x00);
-        frame.push_back(0x01);
-        frame.insert(frame.end(), payload, payload + size);
-
-        bool is_key = (nal_type == 5); // IDR slice
-        EmitPacket(frame, is_key, rtp_timestamp, seq_num);
+        bool is_key = (nal_type == 5);
+        AppendNalToAu(payload, size, is_key, rtp_timestamp, seq_num);
+        if (marker_bit) {
+            FlushAu();
+        }
         return;
     }
 
@@ -65,18 +155,12 @@ void RtpDepacketizer::ProcessH264(const uint8_t* payload, size_t size, uint32_t 
             if (nalu_size > 0) {
                 uint8_t sub_type = payload[offset] & 0x1F;
                 bool is_key = (sub_type == 5);
-
-                std::vector<uint8_t> frame;
-                frame.reserve(4 + nalu_size);
-                frame.push_back(0x00);
-                frame.push_back(0x00);
-                frame.push_back(0x00);
-                frame.push_back(0x01);
-                frame.insert(frame.end(), payload + offset, payload + offset + nalu_size);
-
-                EmitPacket(frame, is_key, rtp_timestamp, seq_num);
+                AppendNalToAu(payload + offset, nalu_size, is_key, rtp_timestamp, seq_num);
             }
             offset += nalu_size;
+        }
+        if (marker_bit) {
+            FlushAu();
         }
         return;
     }
@@ -92,16 +176,8 @@ void RtpDepacketizer::ProcessH264(const uint8_t* payload, size_t size, uint32_t 
 
         if (start_bit) {
             fu_buffer_.clear();
-            // Prefix 4-byte Annex-B start code
-            fu_buffer_.push_back(0x00);
-            fu_buffer_.push_back(0x00);
-            fu_buffer_.push_back(0x00);
-            fu_buffer_.push_back(0x01);
-
-            // Reconstruct original NAL header
             uint8_t reconstructed_hdr = (fu_indicator & 0xE0) | original_nal_type;
             fu_buffer_.push_back(reconstructed_hdr);
-
             fu_buffer_.insert(fu_buffer_.end(), payload + 2, payload + size);
             fu_in_progress_ = true;
             fu_is_keyframe_ = (original_nal_type == 5);
@@ -111,7 +187,6 @@ void RtpDepacketizer::ProcessH264(const uint8_t* payload, size_t size, uint32_t 
         } else if (fu_in_progress_) {
             uint16_t expected_seq = static_cast<uint16_t>(fu_last_seq_ + 1);
             if (seq_num != expected_seq) {
-                // Packet dropped; abort damaged FU sequence
                 fu_buffer_.clear();
                 fu_in_progress_ = false;
                 return;
@@ -121,30 +196,49 @@ void RtpDepacketizer::ProcessH264(const uint8_t* payload, size_t size, uint32_t 
         }
 
         if (end_bit && fu_in_progress_) {
-            EmitPacket(fu_buffer_, fu_is_keyframe_, fu_timestamp_, seq_num);
+            AppendNalToAu(fu_buffer_.data(), fu_buffer_.size(), fu_is_keyframe_, fu_timestamp_, seq_num);
             fu_buffer_.clear();
             fu_in_progress_ = false;
+            if (marker_bit) {
+                FlushAu();
+            }
         }
     }
 }
 
-void RtpDepacketizer::ProcessH265(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool /*marker_bit*/) {
+void RtpDepacketizer::ProcessH265(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit) {
     if (size < 2) return;
 
     uint8_t nal_type = (payload[0] >> 1) & 0x3F;
 
     // Single NAL (types 0..47)
     if (nal_type <= 47) {
-        std::vector<uint8_t> frame;
-        frame.reserve(4 + size);
-        frame.push_back(0x00);
-        frame.push_back(0x00);
-        frame.push_back(0x00);
-        frame.push_back(0x01);
-        frame.insert(frame.end(), payload, payload + size);
+        bool is_key = (nal_type >= 16 && nal_type <= 21);
+        AppendNalToAu(payload, size, is_key, rtp_timestamp, seq_num);
+        if (marker_bit) {
+            FlushAu();
+        }
+        return;
+    }
 
-        bool is_key = (nal_type >= 16 && nal_type <= 21); // IDR / CRA / BLA
-        EmitPacket(frame, is_key, rtp_timestamp, seq_num);
+    // AP Aggregation Packet (type 48)
+    if (nal_type == 48) {
+        size_t offset = 2;
+        while (offset + 2 <= size) {
+            uint16_t nalu_size = (static_cast<uint16_t>(payload[offset]) << 8) | payload[offset + 1];
+            offset += 2;
+            if (offset + nalu_size > size) break;
+
+            if (nalu_size > 0) {
+                uint8_t sub_type = (payload[offset] >> 1) & 0x3F;
+                bool is_key = (sub_type >= 16 && sub_type <= 21);
+                AppendNalToAu(payload + offset, nalu_size, is_key, rtp_timestamp, seq_num);
+            }
+            offset += nalu_size;
+        }
+        if (marker_bit) {
+            FlushAu();
+        }
         return;
     }
 
@@ -158,17 +252,10 @@ void RtpDepacketizer::ProcessH265(const uint8_t* payload, size_t size, uint32_t 
 
         if (start_bit) {
             fu_buffer_.clear();
-            fu_buffer_.push_back(0x00);
-            fu_buffer_.push_back(0x00);
-            fu_buffer_.push_back(0x00);
-            fu_buffer_.push_back(0x01);
-
-            // Reconstruct 2-byte H.265 NAL header
             uint8_t hdr1 = (payload[0] & 0x81) | (original_nal_type << 1);
             uint8_t hdr2 = payload[1];
             fu_buffer_.push_back(hdr1);
             fu_buffer_.push_back(hdr2);
-
             fu_buffer_.insert(fu_buffer_.end(), payload + 3, payload + size);
             fu_in_progress_ = true;
             fu_is_keyframe_ = (original_nal_type >= 16 && original_nal_type <= 21);
@@ -187,9 +274,12 @@ void RtpDepacketizer::ProcessH265(const uint8_t* payload, size_t size, uint32_t 
         }
 
         if (end_bit && fu_in_progress_) {
-            EmitPacket(fu_buffer_, fu_is_keyframe_, fu_timestamp_, seq_num);
+            AppendNalToAu(fu_buffer_.data(), fu_buffer_.size(), fu_is_keyframe_, fu_timestamp_, seq_num);
             fu_buffer_.clear();
             fu_in_progress_ = false;
+            if (marker_bit) {
+                FlushAu();
+            }
         }
     }
 }
