@@ -71,6 +71,9 @@ bool LiveController::SetLayout(LiveGridLayout layout) {
 
     current_layout_ = layout;
     previous_layout_ = layout;
+    custom_tiles_.clear();
+    custom_cols_ = 0;
+    custom_rows_ = 0;
 
     if (running_) {
         SetupGridPipelines();
@@ -90,7 +93,181 @@ LiveGridLayout LiveController::GetCurrentLayout() const {
 int LiveController::GetActiveTileCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     if (fullscreen_channel_id_ != -1) return 1;
+    if (current_layout_ == LiveGridLayout::CUSTOM) {
+        if (!custom_tiles_.empty()) return static_cast<int>(custom_tiles_.size());
+        if (custom_cols_ > 0 && custom_rows_ > 0) return custom_cols_ * custom_rows_;
+        return static_cast<int>(pipelines_.size());
+    }
     return static_cast<int>(current_layout_);
+}
+
+bool LiveController::SetCustomGrid(int cols, int rows, const std::vector<int>& channel_ids) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (cols <= 0 || rows <= 0) return false;
+
+    if (fullscreen_channel_id_ != -1) {
+        if (fullscreen_pipeline_) {
+            fullscreen_pipeline_->active = false;
+            fullscreen_pipeline_->packet_cv.notify_all();
+            if (fullscreen_pipeline_->queue) fullscreen_pipeline_->queue->Stop();
+            if (fullscreen_pipeline_->sub_id != 0) {
+                StreamBroker::Instance().Unsubscribe(fullscreen_pipeline_->sub_id);
+            }
+            if (fullscreen_pipeline_->worker_thread.joinable()) {
+                fullscreen_pipeline_->worker_thread.join();
+            }
+            fullscreen_pipeline_.reset();
+        }
+        if (was_main_created_for_fullscreen_) {
+            if (!RecordingScheduler::Instance().IsChannelActive(fullscreen_channel_id_)) {
+                CameraManager::Instance().StopCamera(fullscreen_channel_id_);
+            }
+            was_main_created_for_fullscreen_ = false;
+        }
+        fullscreen_channel_id_ = -1;
+    }
+
+    current_layout_ = LiveGridLayout::CUSTOM;
+    previous_layout_ = LiveGridLayout::CUSTOM;
+    custom_cols_ = cols;
+    custom_rows_ = rows;
+    custom_tiles_.clear();
+
+    if (!channel_ids.empty()) {
+        assigned_channels_ = channel_ids;
+    }
+
+    if (running_) {
+        SetupGridPipelines();
+    }
+    LOG_INFO << "[LiveController] Custom grid configured: " << cols << "x" << rows << " (" << (cols * rows) << " tiles)";
+    return true;
+}
+
+bool LiveController::SetTileLayout(const std::vector<TileConfig>& tiles) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (fullscreen_channel_id_ != -1) {
+        if (fullscreen_pipeline_) {
+            fullscreen_pipeline_->active = false;
+            fullscreen_pipeline_->packet_cv.notify_all();
+            if (fullscreen_pipeline_->queue) fullscreen_pipeline_->queue->Stop();
+            if (fullscreen_pipeline_->sub_id != 0) {
+                StreamBroker::Instance().Unsubscribe(fullscreen_pipeline_->sub_id);
+            }
+            if (fullscreen_pipeline_->worker_thread.joinable()) {
+                fullscreen_pipeline_->worker_thread.join();
+            }
+            fullscreen_pipeline_.reset();
+        }
+        if (was_main_created_for_fullscreen_) {
+            if (!RecordingScheduler::Instance().IsChannelActive(fullscreen_channel_id_)) {
+                CameraManager::Instance().StopCamera(fullscreen_channel_id_);
+            }
+            was_main_created_for_fullscreen_ = false;
+        }
+        fullscreen_channel_id_ = -1;
+    }
+
+    current_layout_ = LiveGridLayout::CUSTOM;
+    previous_layout_ = LiveGridLayout::CUSTOM;
+    custom_tiles_ = tiles;
+    custom_cols_ = 0;
+    custom_rows_ = 0;
+
+    if (running_) {
+        SetupGridPipelines();
+    }
+    LOG_INFO << "[LiveController] Custom tile layout configured with " << tiles.size() << " independent tiles";
+    return true;
+}
+
+bool LiveController::ActivateChannel(int channel_id, int tile_index, StreamType stream_type, uint32_t target_w, uint32_t target_h) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!CameraManager::Instance().HasCamera(channel_id)) {
+        LOG_WARN << "[LiveController] Cannot activate unknown channel " << channel_id;
+        return false;
+    }
+
+    int disp_w = display_backend_ ? display_backend_->GetWidth() : 1920;
+    int disp_h = display_backend_ ? display_backend_->GetHeight() : 1080;
+    if (disp_w <= 0) disp_w = 1920;
+    if (disp_h <= 0) disp_h = 1080;
+
+    uint32_t tw = (target_w > 0) ? target_w : static_cast<uint32_t>(disp_w / 2);
+    uint32_t th = (target_h > 0) ? target_h : static_cast<uint32_t>(disp_h / 2);
+    int tidx = (tile_index >= 0) ? tile_index : static_cast<int>(pipelines_.size());
+
+    StopChannelPipeline(channel_id);
+    StartChannelPipeline(channel_id, tidx, stream_type, tw, th);
+    LOG_INFO << "[LiveController] On-demand channel " << channel_id << " activated on tile " << tidx;
+    return true;
+}
+
+bool LiveController::DeactivateChannel(int channel_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = pipelines_.find(channel_id);
+    if (it == pipelines_.end()) {
+        return false;
+    }
+
+    int tidx = it->second->tile_index;
+    StopChannelPipeline(channel_id);
+    if (display_backend_) {
+        display_backend_->ClearTile(tidx);
+    }
+    LOG_INFO << "[LiveController] On-demand channel " << channel_id << " deactivated";
+    return true;
+}
+
+bool LiveController::SetActiveChannels(const std::vector<int>& channel_ids, StreamType stream_type) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    assigned_channels_ = channel_ids;
+    if (running_) {
+        std::vector<int> to_remove;
+        for (const auto& [id, pipe] : pipelines_) {
+            if (std::find(channel_ids.begin(), channel_ids.end(), id) == channel_ids.end()) {
+                to_remove.push_back(id);
+            }
+        }
+        for (int id : to_remove) {
+            StopChannelPipeline(id);
+        }
+
+        int disp_w = display_backend_ ? display_backend_->GetWidth() : 1920;
+        int disp_h = display_backend_ ? display_backend_->GetHeight() : 1080;
+        int count = std::max(1, static_cast<int>(channel_ids.size()));
+        int cols = (count == 1) ? 1 : ((count <= 4) ? 2 : ((count <= 6) ? 3 : 4));
+        int rows = (count == 1) ? 1 : 2;
+        uint32_t tw = static_cast<uint32_t>(disp_w / cols);
+        uint32_t th = static_cast<uint32_t>(disp_h / rows);
+
+        int tidx = 0;
+        for (int id : channel_ids) {
+            if (pipelines_.find(id) == pipelines_.end()) {
+                StartChannelPipeline(id, tidx, stream_type, tw, th);
+            }
+            tidx++;
+        }
+    }
+    return true;
+}
+
+void LiveController::StopChannelPipeline(int channel_id) {
+    auto it = pipelines_.find(channel_id);
+    if (it != pipelines_.end()) {
+        auto& pipe = it->second;
+        pipe->active = false;
+        pipe->packet_cv.notify_all();
+        if (pipe->queue) pipe->queue->Stop();
+        if (pipe->sub_id != 0) {
+            StreamBroker::Instance().Unsubscribe(pipe->sub_id);
+        }
+        if (pipe->worker_thread.joinable()) {
+            pipe->worker_thread.join();
+        }
+        CameraManager::Instance().StopSubStream(channel_id);
+        pipelines_.erase(it);
+    }
 }
 
 bool LiveController::SetFullscreen(int channel_id) {
@@ -283,6 +460,44 @@ void LiveController::Stop() {
 void LiveController::SetupGridPipelines() {
     TeardownGridPipelines();
 
+    int disp_w = display_backend_ ? display_backend_->GetWidth() : 1920;
+    int disp_h = display_backend_ ? display_backend_->GetHeight() : 1080;
+    if (disp_w <= 0) disp_w = 1920;
+    if (disp_h <= 0) disp_h = 1080;
+
+    if (current_layout_ == LiveGridLayout::CUSTOM) {
+        if (!custom_tiles_.empty()) {
+            for (const auto& t : custom_tiles_) {
+                uint32_t tw = (t.target_w > 0) ? t.target_w : static_cast<uint32_t>(disp_w / 2);
+                uint32_t th = (t.target_h > 0) ? t.target_h : static_cast<uint32_t>(disp_h / 2);
+                StartChannelPipeline(t.channel_id, t.tile_index, t.stream_type, tw, th);
+            }
+            return;
+        }
+
+        int cols = (custom_cols_ > 0) ? custom_cols_ : 2;
+        int rows = (custom_rows_ > 0) ? custom_rows_ : 2;
+        int max_tiles = cols * rows;
+        uint32_t tile_w = static_cast<uint32_t>(disp_w / cols);
+        uint32_t tile_h = static_cast<uint32_t>(disp_h / rows);
+
+        std::vector<int> channels_to_use = assigned_channels_;
+        if (channels_to_use.empty()) {
+            auto cams = CameraManager::Instance().GetCameras();
+            for (const auto& c : cams) {
+                channels_to_use.push_back(c.id);
+            }
+        }
+
+        int tile_idx = 0;
+        for (int ch : channels_to_use) {
+            if (tile_idx >= max_tiles) break;
+            StartChannelPipeline(ch, tile_idx, StreamType::SUB, tile_w, tile_h);
+            tile_idx++;
+        }
+        return;
+    }
+
     int max_tiles = static_cast<int>(current_layout_);
     std::vector<int> channels_to_use = assigned_channels_;
 
@@ -293,11 +508,6 @@ void LiveController::SetupGridPipelines() {
             channels_to_use.push_back(c.id);
         }
     }
-
-    int disp_w = display_backend_ ? display_backend_->GetWidth() : 1920;
-    int disp_h = display_backend_ ? display_backend_->GetHeight() : 1080;
-    if (disp_w <= 0) disp_w = 1920;
-    if (disp_h <= 0) disp_h = 1080;
 
     int cols = 1, rows = 1;
     switch (current_layout_) {

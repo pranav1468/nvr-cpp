@@ -32,6 +32,7 @@ public:
     void RequestLayout(int layout_count);
     void RequestFullscreen(int channel_id);
     void RequestExitFullscreen();
+    bool ExecuteCommandJson(const std::string& command_json);
 
     // JSON state serialization for QML view bindings
     std::string GetGridStateJson() const;

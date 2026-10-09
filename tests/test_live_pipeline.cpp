@@ -500,6 +500,139 @@ void TestExhaustiveEdgeCasesAndStress() {
     std::cout << "  -> PASSED: Exhaustive edge cases & concurrency stress tests passed with 0 crashes." << std::endl;
 }
 
+void TestDynamicGridLayoutsAndOnDemandFeeds() {
+    std::cout << "[TEST 9] Testing fully dynamic custom grids, tile layouts & on-demand feed control..." << std::endl;
+
+    auto& live = nvr::LiveController::Instance();
+    auto display = std::make_shared<nvr::HeadlessDisplayBackend>();
+    display->Initialize(1920, 1080);
+    live.SetDisplayBackend(display);
+    live.Start();
+
+    // 1. Custom 3x3 Grid (9 tiles)
+    bool ok_grid = live.SetCustomGrid(3, 3, {1, 2, 3, 4, 5, 6, 7, 8});
+    assert(ok_grid);
+    assert(live.GetCurrentLayout() == nvr::LiveGridLayout::CUSTOM);
+    assert(live.GetActiveTileCount() == 9);
+
+    auto metrics_grid = live.GetTileMetrics();
+    for (const auto& m : metrics_grid) {
+        assert(m.width == 1920 / 3);
+        assert(m.height == 1080 / 3);
+    }
+
+    // 2. Custom Tile Layout (Spotlight layout: 1 large tile + 2 smaller tiles)
+    std::vector<nvr::TileConfig> custom_tiles;
+    nvr::TileConfig t0{0, 1, nvr::StreamType::SUB, 1280, 720};
+    nvr::TileConfig t1{1, 2, nvr::StreamType::SUB, 640, 360};
+    nvr::TileConfig t2{2, 3, nvr::StreamType::SUB, 640, 360};
+    custom_tiles.push_back(t0);
+    custom_tiles.push_back(t1);
+    custom_tiles.push_back(t2);
+
+    bool ok_tiles = live.SetTileLayout(custom_tiles);
+    assert(ok_tiles);
+    assert(live.GetActiveTileCount() == 3);
+
+    auto m_t0 = live.GetChannelMetrics(1);
+    assert(m_t0.width == 1280);
+    assert(m_t0.height == 720);
+
+    auto m_t1 = live.GetChannelMetrics(2);
+    assert(m_t1.width == 640);
+    assert(m_t1.height == 360);
+
+    // 3. On-demand Channel Deactivation and Activation
+    bool deact_ok = live.DeactivateChannel(2);
+    assert(deact_ok);
+    auto m_t1_after = live.GetChannelMetrics(2);
+    assert(m_t1_after.width == 0); // inactive channel has 0 width and 0 height
+    assert(m_t1_after.height == 0);
+
+    // Re-activate channel 2 with custom dimensions
+    bool act_ok = live.ActivateChannel(2, 1, nvr::StreamType::SUB, 800, 450);
+    assert(act_ok);
+    auto m_t1_react = live.GetChannelMetrics(2);
+    assert(m_t1_react.width == 800);
+    assert(m_t1_react.height == 450);
+
+    // 4. SetActiveChannels filter
+    bool act_list_ok = live.SetActiveChannels({1, 4});
+    assert(act_list_ok);
+
+    // 5. Frontend JSON Command Dispatch via QmlVideoBridge
+    auto& bridge = nvr::QmlVideoBridge::Instance();
+    bridge.Initialize(1920, 1080);
+    assert(bridge.GetWidth() == 1920);
+    assert(bridge.GetHeight() == 1080);
+
+    // Dynamic grid command
+    bool json_cmd1 = bridge.ExecuteCommandJson(R"({
+        "action": "set_custom_grid",
+        "cols": 2,
+        "rows": 3,
+        "channels": [1, 2, 3, 4, 5, 6]
+    })");
+    assert(json_cmd1);
+    assert(live.GetActiveTileCount() == 6);
+
+    // Dynamic tile command
+    bool json_cmd2 = bridge.ExecuteCommandJson(R"({
+        "action": "set_tiles",
+        "tiles": [
+            {"tile_index": 0, "channel_id": 1, "stream_type": "SUB", "width": 960, "height": 540},
+            {"tile_index": 1, "channel_id": 3, "stream_type": "SUB", "width": 960, "height": 540}
+        ]
+    })");
+    assert(json_cmd2);
+    assert(live.GetActiveTileCount() == 2);
+
+    // Dynamic activation/deactivation via JSON
+    bool json_cmd3 = bridge.ExecuteCommandJson(R"({
+        "action": "activate_channel",
+        "channel_id": 4,
+        "tile_index": 2,
+        "stream_type": "SUB",
+        "width": 640,
+        "height": 360
+    })");
+    assert(json_cmd3);
+
+    bool json_cmd4 = bridge.ExecuteCommandJson(R"({
+        "action": "deactivate_channel",
+        "channel_id": 4
+    })");
+    assert(json_cmd4);
+
+    // Fullscreen and exit fullscreen via JSON
+    bool json_cmd5 = bridge.ExecuteCommandJson(R"({
+        "action": "set_fullscreen",
+        "channel_id": 1
+    })");
+    assert(json_cmd5);
+    assert(live.IsFullscreen());
+
+    bool json_cmd6 = bridge.ExecuteCommandJson(R"({
+        "action": "exit_fullscreen"
+    })");
+    assert(json_cmd6);
+    assert(!live.IsFullscreen());
+
+    // Verify GetGridStateJson contains width, height, and valid structure
+    std::string state_json = bridge.GetGridStateJson();
+    auto state_obj = json::parse(state_json);
+    assert(state_obj["width"] == 1920);
+    assert(state_obj["height"] == 1080);
+
+    // Negative / Malformed JSON test cases
+    assert(!bridge.ExecuteCommandJson("invalid json text"));
+    assert(!bridge.ExecuteCommandJson(R"({"unsupported": 123})"));
+    assert(!bridge.ExecuteCommandJson(R"({"action": "unknown_action"})"));
+
+    live.Stop();
+    std::cout << "  -> PASSED: Fully dynamic custom grids & on-demand feed control verified." << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -515,6 +648,7 @@ int main() {
     TestDecouplingFromRecording();
     TestQmlVideoBridge();
     TestExhaustiveEdgeCasesAndStress();
+    TestDynamicGridLayoutsAndOnDemandFeeds();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "ALL LIVE VIEW PIPELINE TESTS PASSED WITH 100% SUCCESS!" << std::endl;

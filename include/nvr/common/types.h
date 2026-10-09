@@ -119,6 +119,7 @@ inline const char* PixelFormatToString(PixelFormat fmt) {
 }
 
 enum class LiveGridLayout {
+    CUSTOM = 0,
     SINGLE = 1,
     GRID_4 = 4,
     GRID_6 = 6,

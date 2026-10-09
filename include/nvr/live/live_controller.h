@@ -31,6 +31,14 @@ struct LiveTileMetrics {
     bool is_fullscreen{false};
 };
 
+struct TileConfig {
+    int tile_index{0};
+    int channel_id{0};
+    StreamType stream_type{StreamType::SUB};
+    uint32_t target_w{0};
+    uint32_t target_h{0};
+};
+
 class LiveController {
 public:
     static LiveController& Instance();
@@ -39,10 +47,19 @@ public:
     void SetDisplayBackend(DisplayBackendPtr backend);
     DisplayBackendPtr GetDisplayBackend() const;
 
-    // Layout configuration (1, 4, 6, 8 cameras)
+    // Preset Layouts (1, 4, 6, 8 cameras)
     bool SetLayout(LiveGridLayout layout);
     LiveGridLayout GetCurrentLayout() const;
     int GetActiveTileCount() const;
+
+    // Fully Dynamic Frontend-Driven Layouts
+    bool SetCustomGrid(int cols, int rows, const std::vector<int>& channel_ids = {});
+    bool SetTileLayout(const std::vector<TileConfig>& tiles);
+
+    // On-Demand Channel Feed Activation/Deactivation
+    bool ActivateChannel(int channel_id, int tile_index = -1, StreamType stream_type = StreamType::SUB, uint32_t target_w = 0, uint32_t target_h = 0);
+    bool DeactivateChannel(int channel_id);
+    bool SetActiveChannels(const std::vector<int>& channel_ids, StreamType stream_type = StreamType::SUB);
 
     // Fullscreen single-camera view
     bool SetFullscreen(int channel_id);
@@ -104,6 +121,9 @@ private:
     bool was_main_created_for_fullscreen_{false};
 
     std::vector<int> assigned_channels_;
+    int custom_cols_{0};
+    int custom_rows_{0};
+    std::vector<TileConfig> custom_tiles_;
     std::unordered_map<int, std::unique_ptr<ChannelPipeline>> pipelines_;
     std::unique_ptr<ChannelPipeline> fullscreen_pipeline_;
 
