@@ -162,12 +162,12 @@ public:
     bool Initialize(CodecType codec) {
         if (initialized_) return true;
 
-        const char* codec_libs[] = {"libavcodec.so.58", "libavcodec.so.59", "libavcodec.so.60", "libavcodec.so.61", "libavcodec.so"};
+        const char* codec_libs[] = {"libavcodec.so.58", "libavcodec.so"};
         for (const char* name : codec_libs) {
             avcodec_lib_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
             if (avcodec_lib_) break;
         }
-        const char* util_libs[] = {"libavutil.so.56", "libavutil.so.57", "libavutil.so.58", "libavutil.so.59", "libavutil.so"};
+        const char* util_libs[] = {"libavutil.so.56", "libavutil.so"};
         for (const char* name : util_libs) {
             avutil_lib_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
             if (avutil_lib_) break;
@@ -188,9 +188,9 @@ public:
 
         const unsigned int codec_major = avcodec_version_() >> 16;
         const unsigned int util_major = avutil_version_() >> 16;
-        if (codec_major < 58 || codec_major > 61 || util_major != (codec_major - 2)) {
-            LOG_WARN << "[SoftwareDecoder] Incompatible FFmpeg ABI: libavcodec major "
-                     << codec_major << ", libavutil major " << util_major;
+        if (codec_major != 58 || util_major != 56) {
+            LOG_WARN << "[SoftwareDecoder] Unsupported FFmpeg ABI: requires libavcodec 58 and libavutil 56 (found "
+                     << codec_major << " / " << util_major << ")";
             Close();
             return false;
         }
@@ -408,6 +408,7 @@ public:
                                 }
                             }
                         }
+                        CleanupV4l2Buffers();
                         close(fd);
                         v4l2_fd_ = -1;
                         is_hardware_ = false;
@@ -520,29 +521,35 @@ public:
         sw_decoder_.Flush();
     }
 
+    void CleanupV4l2Buffers() {
+        if (streamon_ && v4l2_fd_ >= 0) {
+            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
+            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+            streamon_ = false;
+        }
+        for (auto& b : output_buffers_) {
+            if (b.start && b.start != MAP_FAILED) {
+                munmap(b.start, b.length);
+                b.start = nullptr;
+            }
+        }
+        output_buffers_.clear();
+        for (auto& b : capture_buffers_) {
+            if (b.dmabuf_fd >= 0) {
+                close(b.dmabuf_fd);
+                b.dmabuf_fd = -1;
+            }
+            if (b.start && b.start != MAP_FAILED) {
+                munmap(b.start, b.length);
+                b.start = nullptr;
+            }
+        }
+        capture_buffers_.clear();
+    }
+
     void Close() override {
+        CleanupV4l2Buffers();
         if (v4l2_fd_ >= 0) {
-            if (streamon_) {
-                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
-                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
-                streamon_ = false;
-            }
-            for (auto& b : output_buffers_) {
-                if (b.start && b.start != MAP_FAILED) {
-                    munmap(b.start, b.length);
-                }
-            }
-            output_buffers_.clear();
-            for (auto& b : capture_buffers_) {
-                if (b.dmabuf_fd >= 0) {
-                    close(b.dmabuf_fd);
-                    b.dmabuf_fd = -1;
-                }
-                if (b.start && b.start != MAP_FAILED) {
-                    munmap(b.start, b.length);
-                }
-            }
-            capture_buffers_.clear();
             close(v4l2_fd_);
             v4l2_fd_ = -1;
         }
@@ -566,8 +573,10 @@ public:
 
 private:
     bool DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
-        uint32_t stride = (width_ + 63) & ~size_t(63);
-        size_t surface_size = BufferAllocator::CalculateSurfaceSize(width_, height_, 1, 1, 64);
+        uint32_t frame_w = (width_ > 0) ? width_ : (negotiated_width_ > 0 ? negotiated_width_ : 1920);
+        uint32_t frame_h = (height_ > 0) ? height_ : (negotiated_height_ > 0 ? negotiated_height_ : 1080);
+        uint32_t stride = (negotiated_stride_ > 0) ? negotiated_stride_ : ((frame_w + 63) & ~size_t(63));
+        size_t surface_size = BufferAllocator::CalculateSurfaceSize(frame_w, frame_h, 1, 1, 64);
 
         int out_idx = -1;
         for (size_t i = 0; i < output_buffers_.size(); ++i) {
@@ -592,7 +601,14 @@ private:
         }
 
         if (out_idx >= 0 && output_buffers_[out_idx].start) {
-            size_t copy_bytes = std::min(packet->data.size(), output_buffers_[out_idx].length);
+            // Reject oversized compressed packets; never silently truncate encoded video
+            if (packet->data.size() > output_buffers_[out_idx].length) {
+                LOG_WARN << "[VpuVideoDecoder] Rejecting oversized compressed packet (" 
+                         << packet->data.size() << " bytes > buffer limit " 
+                         << output_buffers_[out_idx].length << " bytes)";
+                return false;
+            }
+            size_t copy_bytes = packet->data.size();
             std::memcpy(output_buffers_[out_idx].start, packet->data.data(), copy_bytes);
 
             struct v4l2_buffer q{};
@@ -600,6 +616,9 @@ private:
             q.memory = V4L2_MEMORY_MMAP;
             q.index = out_idx;
             q.bytesused = copy_bytes;
+            // Associate packet PTS with output buffer so driver preserves timestamp
+            q.timestamp.tv_sec = packet->pts_us / 1000000;
+            q.timestamp.tv_usec = packet->pts_us % 1000000;
             struct v4l2_plane q_planes[1]{};
             if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
                 q_planes[0].bytesused = copy_bytes;
@@ -625,10 +644,19 @@ private:
             uint32_t cap_idx = dq_cap.index;
             capture_buffers_[cap_idx].queued = false;
 
-            out_frame->width = width_;
-            out_frame->height = height_;
+            out_frame->width = frame_w;
+            out_frame->height = frame_h;
             out_frame->stride = stride;
-            out_frame->dmabuf_fd = capture_buffers_[cap_idx].dmabuf_fd;
+            // Safe buffer ownership: downstream consumes owned memory in out_frame->data.
+            // dmabuf_fd is set to -1 to prevent premature reuse race conditions.
+            out_frame->dmabuf_fd = -1;
+
+            // Associate driver-propagated PTS from capture buffer
+            int64_t cap_pts = static_cast<int64_t>(dq_cap.timestamp.tv_sec) * 1000000LL + dq_cap.timestamp.tv_usec;
+            if (cap_pts > 0) {
+                out_frame->pts_us = cap_pts;
+            }
+
             out_frame->data = BufferAllocator::Instance().Allocate(surface_size);
             if (out_frame->data.size() < surface_size) {
                 out_frame->data.resize(surface_size, 0);
@@ -637,6 +665,7 @@ private:
             size_t copy_size = std::min(surface_size, capture_buffers_[cap_idx].length);
             std::memcpy(out_frame->data.data(), capture_buffers_[cap_idx].start, copy_size);
 
+            // Requeue capture buffer only AFTER copy has fully completed
             struct v4l2_buffer req_q{};
             req_q.type = capture_buf_type_;
             req_q.memory = V4L2_MEMORY_MMAP;
@@ -660,27 +689,7 @@ private:
         if (v4l2_fd_ < 0) return false;
 
         // Clean up previous buffers/streaming if re-configuring
-        if (streamon_) {
-            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
-            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
-            streamon_ = false;
-        }
-        for (auto& b : output_buffers_) {
-            if (b.start && b.start != MAP_FAILED) {
-                munmap(b.start, b.length);
-            }
-        }
-        output_buffers_.clear();
-        for (auto& b : capture_buffers_) {
-            if (b.dmabuf_fd >= 0) {
-                close(b.dmabuf_fd);
-                b.dmabuf_fd = -1;
-            }
-            if (b.start && b.start != MAP_FAILED) {
-                munmap(b.start, b.length);
-            }
-        }
-        capture_buffers_.clear();
+        CleanupV4l2Buffers();
 
         // 1. Output queue format (bitstream input)
         struct v4l2_format fmt_out{};
@@ -700,6 +709,7 @@ private:
         }
         if (!has_codec_fmt) {
             LOG_WARN << "[VpuVideoDecoder] Hardware V4L2 device does not support format " << CodecToString(codec_);
+            CleanupV4l2Buffers();
             return false;
         }
 
@@ -716,6 +726,7 @@ private:
         }
         if (!has_nv12) {
             LOG_WARN << "[VpuVideoDecoder] Hardware V4L2 device does not support NV12 capture format";
+            CleanupV4l2Buffers();
             return false;
         }
 
@@ -734,6 +745,7 @@ private:
 
         if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt_out) < 0) {
             LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_S_FMT failed";
+            CleanupV4l2Buffers();
             return false;
         }
 
@@ -753,8 +765,27 @@ private:
 
         if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt_cap) < 0) {
             LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_S_FMT failed";
+            CleanupV4l2Buffers();
             return false;
         }
+
+        // Query driver negotiated format & stride
+        struct v4l2_format gfmt_cap{};
+        gfmt_cap.type = capture_buf_type_;
+        if (ioctl(v4l2_fd_, VIDIOC_G_FMT, &gfmt_cap) == 0) {
+            if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                negotiated_width_ = gfmt_cap.fmt.pix_mp.width;
+                negotiated_height_ = gfmt_cap.fmt.pix_mp.height;
+                negotiated_stride_ = gfmt_cap.fmt.pix_mp.plane_fmt[0].bytesperline;
+            } else {
+                negotiated_width_ = gfmt_cap.fmt.pix.width;
+                negotiated_height_ = gfmt_cap.fmt.pix.height;
+                negotiated_stride_ = gfmt_cap.fmt.pix.bytesperline;
+            }
+        }
+        if (negotiated_width_ == 0) negotiated_width_ = (width_ > 0) ? width_ : 1920;
+        if (negotiated_height_ == 0) negotiated_height_ = (height_ > 0) ? height_ : 1080;
+        if (negotiated_stride_ == 0) negotiated_stride_ = (negotiated_width_ + 63) & ~size_t(63);
 
         // 3. Request buffers for output queue
         struct v4l2_requestbuffers req_out{};
@@ -763,6 +794,7 @@ private:
         req_out.memory = V4L2_MEMORY_MMAP;
         if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_out) < 0 || req_out.count == 0) {
             LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_REQBUFS failed";
+            CleanupV4l2Buffers();
             return false;
         }
 
@@ -779,6 +811,7 @@ private:
             }
             if (ioctl(v4l2_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
                 LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_QUERYBUF failed for index " << i;
+                CleanupV4l2Buffers();
                 return false;
             }
             size_t length = (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) ? planes[0].length : buf.length;
@@ -786,6 +819,7 @@ private:
             void* ptr = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, v4l2_fd_, offset);
             if (ptr == MAP_FAILED) {
                 LOG_WARN << "[VpuVideoDecoder] Output mmap failed for index " << i;
+                CleanupV4l2Buffers();
                 return false;
             }
             output_buffers_[i].start = ptr;
@@ -800,6 +834,7 @@ private:
         req_cap.memory = V4L2_MEMORY_MMAP;
         if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_cap) < 0 || req_cap.count == 0) {
             LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_REQBUFS failed";
+            CleanupV4l2Buffers();
             return false;
         }
 
@@ -816,6 +851,7 @@ private:
             }
             if (ioctl(v4l2_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
                 LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_QUERYBUF failed for index " << i;
+                CleanupV4l2Buffers();
                 return false;
             }
             size_t length = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) ? planes[0].length : buf.length;
@@ -823,22 +859,13 @@ private:
             void* ptr = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, v4l2_fd_, offset);
             if (ptr == MAP_FAILED) {
                 LOG_WARN << "[VpuVideoDecoder] Capture mmap failed for index " << i;
+                CleanupV4l2Buffers();
                 return false;
             }
             capture_buffers_[i].start = ptr;
             capture_buffers_[i].length = length;
             capture_buffers_[i].queued = false;
-
-            // Attempt to export DMA-BUF descriptor for zero-copy downstream rendering & NPU inference
-            struct v4l2_exportbuffer expbuf{};
-            expbuf.type = capture_buf_type_;
-            expbuf.index = i;
-            expbuf.flags = O_RDONLY | O_CLOEXEC;
-            if (ioctl(v4l2_fd_, VIDIOC_EXPBUF, &expbuf) == 0) {
-                capture_buffers_[i].dmabuf_fd = expbuf.fd;
-            } else {
-                capture_buffers_[i].dmabuf_fd = -1;
-            }
+            capture_buffers_[i].dmabuf_fd = -1;
 
             // Initial queueing of capture buffers
             struct v4l2_buffer qbuf{};
@@ -860,6 +887,7 @@ private:
         if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &output_buf_type_) < 0 ||
             ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_) < 0) {
             LOG_WARN << "[VpuVideoDecoder] VIDIOC_STREAMON failed";
+            CleanupV4l2Buffers();
             return false;
         }
 
@@ -903,6 +931,9 @@ private:
     CodecType codec_{CodecType::H264};
     uint32_t width_{0};
     uint32_t height_{0};
+    uint32_t negotiated_width_{0};
+    uint32_t negotiated_height_{0};
+    uint32_t negotiated_stride_{0};
     bool prefer_vpu_{true};
     bool is_hardware_{false};
     bool initialized_{false};
