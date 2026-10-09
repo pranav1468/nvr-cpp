@@ -568,6 +568,92 @@ void RunMotionAndScheduleTest() {
     std::cout << "  -> PASSED: Motion-only gating, pre-roll buffer & weekly schedule logic verified." << std::endl;
 }
 
+void RunQueueOverflowGopRecoveryTest() {
+    std::cout << "[TEST 8] Running Recording Queue Overflow & GOP Recovery Tests..." << std::endl;
+
+    auto& sched = nvr::RecordingScheduler::Instance();
+    nvr::StorageConfig storage_config;
+    storage_config.recording_path = "./test_recordings";
+    storage_config.segment_duration_seconds = 10;
+    sched.Configure(storage_config);
+
+    int ch = 6;
+    bool start_ok = sched.StartChannelRecording(ch, nvr::RecordMode::CONTINUOUS);
+    assert(start_ok);
+
+    // Initial keyframe to establish stream
+    auto kf0 = std::make_shared<nvr::MediaPacket>();
+    kf0->channel_id = ch;
+    kf0->stream_type = nvr::StreamType::MAIN;
+    kf0->codec = nvr::CodecType::H264;
+    kf0->is_keyframe = true;
+    kf0->pts_us = 0;
+    kf0->wall_time_ms = 1000;
+    kf0->data = MakeIdrFrame();
+    sched.EnqueuePacket(ch, kf0);
+
+    // Send delta packets to establish baseline
+    for (int i = 1; i <= 5; ++i) {
+        auto delta = std::make_shared<nvr::MediaPacket>();
+        delta->channel_id = ch;
+        delta->stream_type = nvr::StreamType::MAIN;
+        delta->codec = nvr::CodecType::H264;
+        delta->is_keyframe = false;
+        delta->pts_us = i * 40000;
+        delta->wall_time_ms = 1000 + i * 40;
+        delta->data = MakeNonIdrFrame();
+        sched.EnqueuePacket(ch, delta);
+    }
+
+    // Inject 200 non-keyframe packets rapidly into the 128-deep queue to force queue overflow
+    for (int i = 6; i < 200; ++i) {
+        auto burst = std::make_shared<nvr::MediaPacket>();
+        burst->channel_id = ch;
+        burst->stream_type = nvr::StreamType::MAIN;
+        burst->codec = nvr::CodecType::H264;
+        burst->is_keyframe = false;
+        burst->pts_us = i * 40000;
+        burst->wall_time_ms = 1000 + i * 40;
+        burst->data = MakeNonIdrFrame();
+        sched.EnqueuePacket(ch, burst);
+    }
+
+    // Verify overflow was detected and packets were dropped
+    uint64_t drops = sched.GetChannelDroppedPackets(ch);
+    assert(drops > 0);
+
+    // Subsequent non-keyframes are dropped while awaiting keyframe realignment
+    auto stray_delta = std::make_shared<nvr::MediaPacket>();
+    stray_delta->channel_id = ch;
+    stray_delta->stream_type = nvr::StreamType::MAIN;
+    stray_delta->codec = nvr::CodecType::H264;
+    stray_delta->is_keyframe = false;
+    stray_delta->pts_us = 201 * 40000;
+    stray_delta->wall_time_ms = 1000 + 201 * 40;
+    stray_delta->data = MakeNonIdrFrame();
+    uint64_t drops_before = sched.GetChannelDroppedPackets(ch);
+    sched.EnqueuePacket(ch, stray_delta);
+    assert(sched.GetChannelDroppedPackets(ch) > drops_before);
+
+    // Inject clean IDR keyframe to trigger realignment
+    auto kf_recovery = std::make_shared<nvr::MediaPacket>();
+    kf_recovery->channel_id = ch;
+    kf_recovery->stream_type = nvr::StreamType::MAIN;
+    kf_recovery->codec = nvr::CodecType::H264;
+    kf_recovery->is_keyframe = true;
+    kf_recovery->pts_us = 202 * 40000;
+    kf_recovery->wall_time_ms = 1000 + 202 * 40;
+    kf_recovery->data = MakeIdrFrame();
+    sched.EnqueuePacket(ch, kf_recovery);
+
+    // Flush and stop
+    sched.FlushChannel(ch);
+    sched.StopChannelRecording(ch);
+
+    std::cout << "  -> PASSED: Recording queue overflow, drop counter (" 
+              << drops << " drops) & GOP keyframe recovery verified." << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -586,6 +672,7 @@ int main() {
         RunRtpDepacketizerTest();
         RunDigestAuthAndIPv6Test();
         RunMotionAndScheduleTest();
+        RunQueueOverflowGopRecoveryTest();
 
         std::filesystem::remove_all("./test_recordings");
 

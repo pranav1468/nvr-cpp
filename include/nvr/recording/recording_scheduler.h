@@ -36,6 +36,7 @@ public:
 
     uint32_t GetChannelFrameCount(int channel_id) const;
     uint64_t GetChannelBytesWritten(int channel_id) const;
+    uint64_t GetChannelDroppedPackets(int channel_id) const;
 
     // Motion event control for RecordMode::MOTION_ONLY
     void SetMotionEvent(int channel_id, bool motion_active);
@@ -67,6 +68,8 @@ private:
         std::mutex queue_mutex;
         std::condition_variable queue_cv;
         std::deque<MediaPacketPtr> input_queue;
+        std::atomic<uint64_t> dropped_packets_count{0};
+        std::atomic<bool> needs_keyframe_resync{false};
 
         // Motion mode state machine
         std::atomic<bool> motion_active{false};

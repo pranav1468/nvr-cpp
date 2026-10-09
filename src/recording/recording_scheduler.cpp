@@ -141,6 +141,15 @@ uint64_t RecordingScheduler::GetChannelBytesWritten(int channel_id) const {
     return 0;
 }
 
+uint64_t RecordingScheduler::GetChannelDroppedPackets(int channel_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = channels_.find(channel_id);
+    if (it != channels_.end()) {
+        return it->second->dropped_packets_count.load();
+    }
+    return 0;
+}
+
 void RecordingScheduler::SetMotionEvent(int channel_id, bool motion_active) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = channels_.find(channel_id);
@@ -193,6 +202,8 @@ bool RecordingScheduler::IsScheduleActiveNow(int channel_id, int64_t now_ms) con
 }
 
 void RecordingScheduler::EnqueuePacket(int channel_id, const MediaPacketPtr& packet) {
+    if (!packet) return;
+
     std::shared_ptr<ChannelRecordState> state;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -202,14 +213,43 @@ void RecordingScheduler::EnqueuePacket(int channel_id, const MediaPacketPtr& pac
         }
     }
 
-    if (state && state->running) {
-        std::lock_guard<std::mutex> q_lock(state->queue_mutex);
-        if (state->input_queue.size() >= 128) {
-            state->input_queue.pop_front(); // Bounded head-drop
+    if (!state || !state->running) return;
+
+    std::lock_guard<std::mutex> q_lock(state->queue_mutex);
+
+    // Recording queue overflow protection (128 compressed packets budget)
+    if (state->input_queue.size() >= 128) {
+        if (!state->needs_keyframe_resync) {
+            state->needs_keyframe_resync = true;
+            LOG_WARN << "[Channel " << channel_id << "] Recording queue overflow (size=" 
+                     << state->input_queue.size() << "); dropping packets and awaiting IDR keyframe";
         }
-        state->input_queue.push_back(packet);
-        state->queue_cv.notify_one();
+        state->dropped_packets_count++;
+
+        // Drop incoming non-keyframe video packet immediately to prevent orphaned frames
+        if (packet->IsVideo() && !packet->is_keyframe) {
+            return;
+        }
+
+        // If keyframe arrived or audio, make room in bounded queue
+        while (state->input_queue.size() >= 128) {
+            state->input_queue.pop_front();
+            state->dropped_packets_count++;
+        }
     }
+
+    // If awaiting keyframe realignment after packet drop
+    if (state->needs_keyframe_resync && packet->IsVideo()) {
+        if (!packet->is_keyframe) {
+            state->dropped_packets_count++;
+            return;
+        }
+        // Recovered IDR keyframe boundary!
+        state->needs_keyframe_resync = false;
+    }
+
+    state->input_queue.push_back(packet);
+    state->queue_cv.notify_one();
 }
 
 void RecordingScheduler::FlushChannel(int channel_id) {
@@ -268,6 +308,15 @@ void RecordingScheduler::ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> s
                 }
             }
             continue;
+        }
+
+        // Realignment check: if recovery active, skip orphaned non-keyframes until IDR keyframe
+        if (state->needs_keyframe_resync && packet->IsVideo()) {
+            if (!packet->is_keyframe) {
+                state->dropped_packets_count++;
+                continue;
+            }
+            state->needs_keyframe_resync = false;
         }
 
         if (state->mode == RecordMode::CONTINUOUS) {
