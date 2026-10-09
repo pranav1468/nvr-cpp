@@ -15,6 +15,8 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 #include <libavutil/pixfmt.h>
+#include <libavcodec/version.h>
+#include <libavutil/version.h>
 }
 
 #ifndef V4L2_PIX_FMT_HEVC
@@ -179,14 +181,22 @@ public:
         }
 
         avcodec_version_ = reinterpret_cast<unsigned int(*)()>(dlsym(avcodec_lib_, "avcodec_version"));
-        if (avcodec_version_) {
-            unsigned int ver = avcodec_version_();
-            unsigned int major = ver >> 16;
-            if (major < 57 || major > 62) {
-                LOG_WARN << "[SoftwareDecoder] Unsupported libavcodec major version: " << major;
-                Close();
-                return false;
-            }
+        avutil_version_ = reinterpret_cast<unsigned int(*)()>(dlsym(avutil_lib_, "avutil_version"));
+        if (!avcodec_version_ || !avutil_version_) {
+            LOG_WARN << "[SoftwareDecoder] FFmpeg version functions are unavailable";
+            Close();
+            return false;
+        }
+
+        const unsigned int codec_major = avcodec_version_() >> 16;
+        const unsigned int util_major = avutil_version_() >> 16;
+        if (codec_major != LIBAVCODEC_VERSION_MAJOR ||
+            util_major != LIBAVUTIL_VERSION_MAJOR) {
+            LOG_WARN << "[SoftwareDecoder] FFmpeg ABI mismatch: headers expect libavcodec "
+                     << LIBAVCODEC_VERSION_MAJOR << " / libavutil " << LIBAVUTIL_VERSION_MAJOR
+                     << ", runtime provides " << codec_major << " / " << util_major;
+            Close();
+            return false;
         }
 
         find_decoder_by_name_ = reinterpret_cast<const AVCodec*(*)(const char*)>(dlsym(avcodec_lib_, "avcodec_find_decoder_by_name"));
@@ -202,8 +212,9 @@ public:
         frame_free_ = reinterpret_cast<void(*)(AVFrame**)>(dlsym(avutil_lib_, "av_frame_free"));
         frame_unref_ = reinterpret_cast<void(*)(AVFrame*)>(dlsym(avutil_lib_, "av_frame_unref"));
 
-        if (!find_decoder_by_name_ || !alloc_context3_ || !open2_ || !send_packet_ || !receive_frame_ ||
-            !frame_alloc_ || !frame_free_ || !packet_alloc_ || !packet_free_) {
+        if (!find_decoder_by_name_ || !alloc_context3_ || !open2_ || !free_context_ ||
+            !send_packet_ || !receive_frame_ || !frame_alloc_ || !frame_free_ ||
+            !frame_unref_ || !packet_alloc_ || !packet_free_ || !packet_unref_) {
             Close();
             return false;
         }
@@ -223,6 +234,10 @@ public:
 
         pkt_ = packet_alloc_();
         frame_ = frame_alloc_();
+        if (!pkt_ || !frame_) {
+            Close();
+            return false;
+        }
 
         initialized_ = true;
         return true;
@@ -322,6 +337,7 @@ private:
     bool initialized_{false};
 
     unsigned int(*avcodec_version_)(){nullptr};
+    unsigned int(*avutil_version_)(){nullptr};
     const AVCodec*(*find_decoder_by_name_)(const char*){nullptr};
     AVCodecContext*(*alloc_context3_)(const AVCodec*){nullptr};
     int(*open2_)(AVCodecContext*, const AVCodec*, void**){nullptr};
