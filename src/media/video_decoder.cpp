@@ -46,7 +46,7 @@ public:
         int zeros = 0;
         while (ReadBit() == 0 && byte_offset_ < size_) {
             zeros++;
-            if (zeros > 32) return 0;
+            if (zeros >= 31) return 0;
         }
         if (zeros == 0) return 0;
         uint32_t val = ReadBits(zeros);
@@ -300,6 +300,7 @@ public:
         if (ctx_ && free_context_) free_context_(&ctx_);
         if (avutil_lib_) { dlclose(avutil_lib_); avutil_lib_ = nullptr; }
         if (avcodec_lib_) { dlclose(avcodec_lib_); avcodec_lib_ = nullptr; }
+        codec_ = nullptr;
         ctx_ = nullptr;
         pkt_ = nullptr;
         frame_ = nullptr;
@@ -642,6 +643,25 @@ private:
     bool SetupV4l2Queues() {
         if (v4l2_fd_ < 0) return false;
 
+        // Clean up previous buffers/streaming if re-configuring
+        if (streamon_) {
+            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
+            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+            streamon_ = false;
+        }
+        for (auto& b : output_buffers_) {
+            if (b.start && b.start != MAP_FAILED) {
+                munmap(b.start, b.length);
+            }
+        }
+        output_buffers_.clear();
+        for (auto& b : capture_buffers_) {
+            if (b.start && b.start != MAP_FAILED) {
+                munmap(b.start, b.length);
+            }
+        }
+        capture_buffers_.clear();
+
         // 1. Output queue format (bitstream input)
         struct v4l2_format fmt_out{};
         fmt_out.type = output_buf_type_;
@@ -792,6 +812,7 @@ private:
                 ((data[i+2] == 0x01) || (data[i+2] == 0x00 && i + 3 < data.size() && data[i+3] == 0x01))) {
                 size_t prefix_len = (data[i+2] == 0x01) ? 3 : 4;
                 size_t nal_start = i + prefix_len;
+                if (nal_start >= data.size()) break;
                 uint8_t nal_type = data[nal_start] & 0x1F;
                 if (nal_type == 7) { // SPS
                     size_t nal_end = data.size();

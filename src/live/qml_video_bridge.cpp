@@ -48,10 +48,6 @@ void QmlVideoBridge::Shutdown() {
     tiles_.clear();
 }
 
-const char* GetBackendName() {
-    return "QmlVideoBridge";
-}
-
 const char* QmlVideoBridge::GetBackendName() const {
     return "QmlVideoBridge";
 }

@@ -265,7 +265,13 @@ void LiveController::StopChannelPipeline(int channel_id) {
         if (pipe->worker_thread.joinable()) {
             pipe->worker_thread.join();
         }
-        CameraManager::Instance().StopSubStream(channel_id);
+        if (pipe->stream_type == StreamType::MAIN) {
+            if (!RecordingScheduler::Instance().IsChannelActive(channel_id)) {
+                CameraManager::Instance().StopCamera(channel_id);
+            }
+        } else {
+            CameraManager::Instance().StopSubStream(channel_id);
+        }
         pipelines_.erase(it);
     }
 }
@@ -377,11 +383,13 @@ bool LiveController::ExitFullscreen() {
         fullscreen_pipeline_.reset();
     }
 
-    if (!RecordingScheduler::Instance().IsChannelActive(closing_channel)) {
-        CameraManager::Instance().StopCamera(closing_channel);
-        LOG_INFO << "[LiveController] Released on-demand MAIN session for channel " << closing_channel;
+    if (was_main_created_for_fullscreen_) {
+        if (!RecordingScheduler::Instance().IsChannelActive(closing_channel)) {
+            CameraManager::Instance().StopCamera(closing_channel);
+            LOG_INFO << "[LiveController] Released on-demand MAIN session for channel " << closing_channel;
+        }
+        was_main_created_for_fullscreen_ = false;
     }
-    was_main_created_for_fullscreen_ = false;
 
     fullscreen_channel_id_ = -1;
     current_layout_ = previous_layout_;
@@ -541,14 +549,24 @@ void LiveController::TeardownGridPipelines() {
         if (pipe->worker_thread.joinable()) {
             pipe->worker_thread.join();
         }
-        CameraManager::Instance().StopSubStream(id);
+        if (pipe->stream_type == StreamType::MAIN) {
+            if (!RecordingScheduler::Instance().IsChannelActive(id)) {
+                CameraManager::Instance().StopCamera(id);
+            }
+        } else {
+            CameraManager::Instance().StopSubStream(id);
+        }
     }
     pipelines_.clear();
 }
 
 void LiveController::StartChannelPipeline(int channel_id, int tile_index, StreamType stream_type, uint32_t target_w, uint32_t target_h) {
-    // Start SUB session via CameraManager
-    CameraManager::Instance().StartSubStream(channel_id);
+    // Start appropriate stream session via CameraManager
+    if (stream_type == StreamType::MAIN) {
+        CameraManager::Instance().EnsureMainStream(channel_id);
+    } else {
+        CameraManager::Instance().StartSubStream(channel_id);
+    }
 
     auto pipe = std::make_unique<ChannelPipeline>();
     pipe->channel_id = channel_id;
@@ -619,8 +637,9 @@ void LiveController::ChannelWorkerLoop(ChannelPipeline* pipeline, uint32_t targe
             if (pop_ok && live_frame) {
                 DecodedFramePtr scaled_frame;
                 if (pipeline->scaler && pipeline->scaler->Scale(live_frame, scaled_frame)) {
-                    if (display_backend_) {
-                        display_backend_->RenderTile(pipeline->tile_index, pipeline->channel_id, scaled_frame);
+                    auto backend = display_backend_;
+                    if (backend) {
+                        backend->RenderTile(pipeline->tile_index, pipeline->channel_id, scaled_frame);
                     }
                     pipeline->rendered_count++;
 
