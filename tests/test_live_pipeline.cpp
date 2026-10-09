@@ -644,6 +644,137 @@ void TestDynamicGridLayoutsAndOnDemandFeeds() {
     std::cout << "  -> PASSED: Fully dynamic custom grids & on-demand feed control verified." << std::endl;
 }
 
+class ConcurrencyTestDisplayBackend : public nvr::IDisplayBackend {
+public:
+    ConcurrencyTestDisplayBackend() = default;
+    ~ConcurrencyTestDisplayBackend() override = default;
+
+    bool Initialize(int width, int height) override {
+        width_ = width;
+        height_ = height;
+        return true;
+    }
+
+    void Shutdown() override {}
+
+    void RenderTile(int tile_index, int channel_id, const nvr::DecodedFramePtr& frame) override {
+        (void)tile_index;
+        (void)channel_id;
+        (void)frame;
+        render_calls_++;
+
+        // Simulate rendering work (e.g. GPU upload or display refresh)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+        // Re-entrant queries: while rendering, proactively query LiveController metrics and layout
+        auto metrics = nvr::LiveController::Instance().GetTileMetrics();
+        (void)metrics;
+        auto layout = nvr::LiveController::Instance().GetCurrentLayout();
+        (void)layout;
+        int tile_count = nvr::LiveController::Instance().GetActiveTileCount();
+        (void)tile_count;
+    }
+
+    void ClearTile(int tile_index) override {
+        (void)tile_index;
+    }
+
+    int GetWidth() const override { return width_; }
+    int GetHeight() const override { return height_; }
+    const char* GetBackendName() const override { return "ConcurrencyTestDisplayBackend"; }
+
+    uint64_t GetRenderCalls() const { return render_calls_.load(); }
+
+private:
+    int width_{1920};
+    int height_{1080};
+    std::atomic<uint64_t> render_calls_{0};
+};
+
+void TestConcurrentRebuildAndDeadlockSafety() {
+    std::cout << "[TEST 10] Testing Live Grid Rebuild & Concurrency Deadlock Safety..." << std::endl;
+
+    auto& live = nvr::LiveController::Instance();
+    auto test_backend = std::make_shared<ConcurrencyTestDisplayBackend>();
+    test_backend->Initialize(1920, 1080);
+    live.SetDisplayBackend(test_backend);
+
+    live.SetLayout(nvr::LiveGridLayout::GRID_4);
+    live.AssignChannels({1, 2, 3, 4});
+    live.Start();
+
+    std::atomic<bool> stress_running{true};
+
+    // Thread 1: Ingress packet feeder pushing frames to channels 1..4
+    std::thread feeder_thread([&]() {
+        int seq = 0;
+        while (stress_running) {
+            for (int ch = 1; ch <= 4; ++ch) {
+                auto pkt = std::make_shared<nvr::MediaPacket>();
+                pkt->channel_id = ch;
+                pkt->stream_type = nvr::StreamType::SUB;
+                pkt->codec = nvr::CodecType::H264;
+                pkt->is_keyframe = (seq % 15 == 0);
+                pkt->pts_us = seq * 40000;
+                pkt->wall_time_ms = 1000 + seq * 40;
+                pkt->data = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
+                nvr::StreamBroker::Instance().Publish(pkt);
+            }
+            seq++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    // Thread 2: Rapid layout reconfiguration (Grid 4 -> Custom 3x3 -> Single -> Fullscreen -> Exit)
+    std::thread reconfig_thread([&]() {
+        for (int i = 0; i < 20 && stress_running; ++i) {
+            live.SetLayout(nvr::LiveGridLayout::GRID_4);
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+            live.SetCustomGrid(3, 3, {1, 2, 3, 4});
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+            live.SetLayout(nvr::LiveGridLayout::SINGLE);
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+            live.SetFullscreen(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+            live.ExitFullscreen();
+            std::this_thread::sleep_for(std::chrono::milliseconds(15));
+
+            live.ActivateChannel(2, 1, nvr::StreamType::SUB, 640, 360);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+            live.DeactivateChannel(2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    // Thread 3: Display backend dynamic swapping & telemetry polling
+    std::thread telemetry_thread([&]() {
+        while (stress_running) {
+            auto m = live.GetTileMetrics();
+            (void)m;
+            auto backend = live.GetDisplayBackend();
+            (void)backend;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    });
+
+    // Wait for reconfiguration cycles to complete
+    reconfig_thread.join();
+    stress_running = false;
+    feeder_thread.join();
+    telemetry_thread.join();
+
+    // Verify clean shutdown without deadlock
+    live.Stop();
+    live.SetDisplayBackend(std::make_shared<nvr::HeadlessDisplayBackend>());
+
+    std::cout << "  -> PASSED: Rapid layout changes under concurrent rendering executed with zero deadlocks." << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -660,6 +791,7 @@ int main() {
     TestQmlVideoBridge();
     TestExhaustiveEdgeCasesAndStress();
     TestDynamicGridLayoutsAndOnDemandFeeds();
+    TestConcurrentRebuildAndDeadlockSafety();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "ALL LIVE VIEW PIPELINE TESTS PASSED WITH 100% SUCCESS!" << std::endl;

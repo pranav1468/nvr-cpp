@@ -106,12 +106,15 @@ private:
     };
 
     void SetupGridPipelines();
-    void TeardownGridPipelines();
+    void TeardownPipeline(std::shared_ptr<ChannelPipeline> pipe);
+    void TeardownPipelines(std::vector<std::shared_ptr<ChannelPipeline>>& pipes);
     void StartChannelPipeline(int channel_id, int tile_index, StreamType stream_type, uint32_t target_w, uint32_t target_h);
     void StopChannelPipeline(int channel_id);
-    void ChannelWorkerLoop(ChannelPipeline* pipeline, uint32_t target_w, uint32_t target_h);
+    void ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline, uint32_t target_w, uint32_t target_h);
 
     mutable std::mutex mutex_;
+    mutable std::mutex backend_mutex_;
+    std::mutex layout_mutex_;
     LiveConfig config_;
     DisplayBackendPtr display_backend_;
 
@@ -124,8 +127,8 @@ private:
     int custom_cols_{0};
     int custom_rows_{0};
     std::vector<TileConfig> custom_tiles_;
-    std::unordered_map<int, std::unique_ptr<ChannelPipeline>> pipelines_;
-    std::unique_ptr<ChannelPipeline> fullscreen_pipeline_;
+    std::unordered_map<int, std::shared_ptr<ChannelPipeline>> pipelines_;
+    std::shared_ptr<ChannelPipeline> fullscreen_pipeline_;
 
     std::atomic<bool> running_{false};
 };
