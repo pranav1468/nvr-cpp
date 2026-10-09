@@ -102,10 +102,15 @@ void StreamSession::Stop() {
         std::lock_guard<std::mutex> lock(stop_mutex_);
         stop_cv_.notify_all();
     }
-    DisconnectSocket();
+    // Shut down the socket cleanly so any active poll/recv in worker_thread_ unblocks immediately
+    int fd = sock_fd_;
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+    }
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
+    DisconnectSocket();
     LOG_INFO << "[Channel " << channel_id_ << "] Stopped RTSP session";
 }
 
@@ -368,10 +373,11 @@ bool StreamSession::ConnectSocket() {
 }
 
 void StreamSession::DisconnectSocket() {
-    if (sock_fd_ >= 0) {
-        shutdown(sock_fd_, SHUT_RDWR);
-        close(sock_fd_);
-        sock_fd_ = -1;
+    int fd = sock_fd_;
+    sock_fd_ = -1;
+    if (fd >= 0) {
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
     }
     state_ = SessionState::DISCONNECTED;
     if (depacketizer_) {
@@ -384,15 +390,33 @@ void StreamSession::DisconnectSocket() {
 
 bool StreamSession::ReadExact(uint8_t* buffer, size_t length, int timeout_ms) {
     size_t total = 0;
+    auto start = std::chrono::steady_clock::now();
     while (total < length && running_) {
-        struct pollfd pfd{};
-        pfd.fd = sock_fd_;
-        pfd.events = POLLIN;
-        int p = poll(&pfd, 1, timeout_ms);
-        if (p <= 0) {
+        int fd = sock_fd_;
+        if (fd < 0) return false;
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+        if (elapsed >= timeout_ms) {
             return false;
         }
-        ssize_t n = recv(sock_fd_, buffer + total, length - total, 0);
+        int remaining_ms = std::min<int>(250, static_cast<int>(timeout_ms - elapsed));
+
+        struct pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        int p = poll(&pfd, 1, remaining_ms);
+        if (p < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (p == 0) {
+            continue; // Poll slice timed out, loop re-evaluates running_
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            return false;
+        }
+        ssize_t n = recv(fd, buffer + total, length - total, 0);
         if (n <= 0) {
             return false;
         }

@@ -2,6 +2,7 @@
 #include "nvr/media/buffer_allocator.h"
 #include <algorithm>
 #include <cstring>
+#include <limits>
 
 namespace nvr {
 
@@ -32,13 +33,22 @@ public:
     }
 
     bool Scale(const DecodedFramePtr& src, DecodedFramePtr& dst) override {
-        if (!src || src->data.empty() || src->width == 0 || src->height == 0) {
+        if (!ValidateInput(src)) {
             return false;
         }
 
         uint32_t out_w = (dst_w_ > 0) ? dst_w_ : src->width;
         uint32_t out_h = (dst_h_ > 0) ? dst_h_ : src->height;
+        if (out_w == 0 || out_h == 0) {
+            return false;
+        }
+
         PixelFormat out_fmt = (dst_fmt_ != PixelFormat::UNKNOWN) ? dst_fmt_ : src->format;
+        if (out_fmt == PixelFormat::NV12) {
+            if ((out_w & 1) != 0 || (out_h & 1) != 0) {
+                return false;
+            }
+        }
 
         dst = std::make_shared<DecodedFrame>();
         dst->channel_id = src->channel_id;
@@ -51,16 +61,26 @@ public:
         dst->frame_index = src->frame_index;
 
         if (out_fmt == PixelFormat::RGBA32) {
-            dst->stride = out_w * 4;
-            size_t req_bytes = dst->stride * out_h;
+            if (out_w > std::numeric_limits<uint32_t>::max() / 4) return false;
+            uint32_t stride = out_w * 4;
+            uint64_t req_bytes64 = static_cast<uint64_t>(stride) * out_h;
+            if (req_bytes64 > std::numeric_limits<size_t>::max()) return false;
+            size_t req_bytes = static_cast<size_t>(req_bytes64);
+
+            dst->stride = stride;
             dst->data = BufferAllocator::Instance().Allocate(req_bytes);
             if (dst->data.size() < req_bytes) dst->data.resize(req_bytes, 0);
 
             // Scale & Convert from NV12 to RGBA32
             ScaleNv12ToRgba(src, dst->data.data(), out_w, out_h, dst->stride);
         } else if (out_fmt == PixelFormat::RGB24) {
-            dst->stride = out_w * 3;
-            size_t req_bytes = dst->stride * out_h;
+            if (out_w > std::numeric_limits<uint32_t>::max() / 3) return false;
+            uint32_t stride = out_w * 3;
+            uint64_t req_bytes64 = static_cast<uint64_t>(stride) * out_h;
+            if (req_bytes64 > std::numeric_limits<size_t>::max()) return false;
+            size_t req_bytes = static_cast<size_t>(req_bytes64);
+
+            dst->stride = stride;
             dst->data = BufferAllocator::Instance().Allocate(req_bytes);
             if (dst->data.size() < req_bytes) dst->data.resize(req_bytes, 0);
 
@@ -83,6 +103,28 @@ public:
     uint32_t GetDstWidth() const override { return dst_w_; }
     uint32_t GetDstHeight() const override { return dst_h_; }
     PixelFormat GetDstFormat() const override { return dst_fmt_; }
+
+private:
+    bool ValidateInput(const DecodedFramePtr& src) const {
+        if (!src || src->data.empty() || src->width == 0 || src->height == 0) {
+            return false;
+        }
+        if (src->format != PixelFormat::NV12) {
+            return false;
+        }
+        if ((src->width & 1) != 0 || (src->height & 1) != 0) {
+            return false;
+        }
+        if (src->stride < src->width) {
+            return false;
+        }
+        uint64_t total_rows = static_cast<uint64_t>(src->height) + (src->height / 2);
+        uint64_t req_size = static_cast<uint64_t>(src->stride) * total_rows;
+        if (src->data.size() < req_size) {
+            return false;
+        }
+        return true;
+    }
 
 private:
     void ScaleNv12ToRgba(const DecodedFramePtr& src, uint8_t* dst, uint32_t dw, uint32_t dh, uint32_t dst_stride) {

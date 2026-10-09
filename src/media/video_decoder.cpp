@@ -25,6 +25,50 @@ namespace nvr {
 
 namespace {
 
+bool CopyNv12Frame(
+    const uint8_t* src,
+    size_t src_size,
+    uint32_t width,
+    uint32_t height,
+    uint32_t src_stride,
+    uint32_t dst_stride,
+    uint8_t* dst,
+    size_t dst_size)
+{
+    if (!src || !dst || width == 0 || height == 0 ||
+        (width & 1) != 0 || (height & 1) != 0 ||
+        src_stride < width || dst_stride < width) {
+        return false;
+    }
+
+    uint64_t total_rows = static_cast<uint64_t>(height) + (height / 2);
+    if (src_size < static_cast<uint64_t>(src_stride) * total_rows) {
+        return false;
+    }
+    if (dst_size < static_cast<uint64_t>(dst_stride) * total_rows) {
+        return false;
+    }
+
+    // Copy Y plane row-by-row
+    for (uint32_t r = 0; r < height; ++r) {
+        std::memcpy(dst + static_cast<size_t>(r) * dst_stride,
+                    src + static_cast<size_t>(r) * src_stride,
+                    width);
+    }
+
+    // Copy interleaved UV plane row-by-row
+    const uint8_t* src_uv = src + static_cast<size_t>(height) * src_stride;
+    uint8_t* dst_uv = dst + static_cast<size_t>(height) * dst_stride;
+    uint32_t uv_rows = height / 2;
+    for (uint32_t r = 0; r < uv_rows; ++r) {
+        std::memcpy(dst_uv + static_cast<size_t>(r) * dst_stride,
+                    src_uv + static_cast<size_t>(r) * src_stride,
+                    width);
+    }
+
+    return true;
+}
+
 class BitstreamReader {
 public:
     BitstreamReader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
@@ -497,8 +541,14 @@ public:
 
     void Flush() override {
         if (is_hardware_ && v4l2_fd_ >= 0) {
-            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
-            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+            if (output_streaming_) {
+                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
+                output_streaming_ = false;
+            }
+            if (capture_streaming_) {
+                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+                capture_streaming_ = false;
+            }
             for (auto& b : output_buffers_) b.queued = false;
             for (size_t i = 0; i < capture_buffers_.size(); ++i) {
                 struct v4l2_buffer qbuf{};
@@ -515,17 +565,26 @@ public:
                     capture_buffers_[i].queued = true;
                 }
             }
-            ioctl(v4l2_fd_, VIDIOC_STREAMON, &output_buf_type_);
-            ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_);
+            if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &output_buf_type_) == 0) {
+                output_streaming_ = true;
+            }
+            if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_) == 0) {
+                capture_streaming_ = true;
+            }
         }
         sw_decoder_.Flush();
     }
 
     void CleanupV4l2Buffers() {
-        if (streamon_ && v4l2_fd_ >= 0) {
-            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
-            ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
-            streamon_ = false;
+        if (v4l2_fd_ >= 0) {
+            if (output_streaming_) {
+                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
+                output_streaming_ = false;
+            }
+            if (capture_streaming_) {
+                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+                capture_streaming_ = false;
+            }
         }
         for (auto& b : output_buffers_) {
             if (b.start && b.start != MAP_FAILED) {
@@ -545,6 +604,18 @@ public:
             }
         }
         capture_buffers_.clear();
+
+        // Release kernel buffer allocations via REQBUFS count = 0
+        if (v4l2_fd_ >= 0) {
+            struct v4l2_requestbuffers req_zero{};
+            req_zero.count = 0;
+            req_zero.memory = V4L2_MEMORY_MMAP;
+            req_zero.type = output_buf_type_;
+            ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_zero);
+
+            req_zero.type = capture_buf_type_;
+            ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_zero);
+        }
     }
 
     void Close() override {
@@ -575,7 +646,10 @@ private:
     bool DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
         uint32_t frame_w = (width_ > 0) ? width_ : (negotiated_width_ > 0 ? negotiated_width_ : 1920);
         uint32_t frame_h = (height_ > 0) ? height_ : (negotiated_height_ > 0 ? negotiated_height_ : 1080);
-        uint32_t stride = (negotiated_stride_ > 0) ? negotiated_stride_ : ((frame_w + 63) & ~size_t(63));
+        frame_w = (frame_w & ~1U);
+        frame_h = (frame_h & ~1U);
+        uint32_t dst_stride = (frame_w + 63) & ~size_t(63);
+        uint32_t src_stride = (negotiated_stride_ > 0) ? negotiated_stride_ : dst_stride;
         size_t surface_size = BufferAllocator::CalculateSurfaceSize(frame_w, frame_h, 1, 1, 64);
 
         int out_idx = -1;
@@ -640,13 +714,15 @@ private:
             dq_cap.length = 1;
         }
 
-        if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq_cap) == 0 && dq_cap.index < capture_buffers_.size()) {
+        int dq_ret = ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq_cap);
+        if (dq_ret == 0 && dq_cap.index < capture_buffers_.size()) {
             uint32_t cap_idx = dq_cap.index;
             capture_buffers_[cap_idx].queued = false;
 
             out_frame->width = frame_w;
             out_frame->height = frame_h;
-            out_frame->stride = stride;
+            out_frame->stride = dst_stride;
+            out_frame->format = PixelFormat::NV12;
             // Safe buffer ownership: downstream consumes owned memory in out_frame->data.
             // dmabuf_fd is set to -1 to prevent premature reuse race conditions.
             out_frame->dmabuf_fd = -1;
@@ -662,8 +738,16 @@ private:
                 out_frame->data.resize(surface_size, 0);
             }
 
-            size_t copy_size = std::min(surface_size, capture_buffers_[cap_idx].length);
-            std::memcpy(out_frame->data.data(), capture_buffers_[cap_idx].start, copy_size);
+            bool copy_ok = CopyNv12Frame(
+                static_cast<const uint8_t*>(capture_buffers_[cap_idx].start),
+                capture_buffers_[cap_idx].length,
+                frame_w,
+                frame_h,
+                src_stride,
+                dst_stride,
+                out_frame->data.data(),
+                out_frame->data.size()
+            );
 
             // Requeue capture buffer only AFTER copy has fully completed
             struct v4l2_buffer req_q{};
@@ -679,7 +763,11 @@ private:
             if (ioctl(v4l2_fd_, VIDIOC_QBUF, &req_q) == 0) {
                 capture_buffers_[cap_idx].queued = true;
             }
-            return true;
+            return copy_ok;
+        }
+
+        if (dq_ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return false;
         }
 
         return false;
@@ -883,15 +971,23 @@ private:
             }
         }
 
-        // 5. Start streaming on both queues
-        if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &output_buf_type_) < 0 ||
-            ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_) < 0) {
-            LOG_WARN << "[VpuVideoDecoder] VIDIOC_STREAMON failed";
+        // 5. Start streaming on both queues independently
+        if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &output_buf_type_) == 0) {
+            output_streaming_ = true;
+        } else {
+            LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_STREAMON failed";
             CleanupV4l2Buffers();
             return false;
         }
 
-        streamon_ = true;
+        if (ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_) == 0) {
+            capture_streaming_ = true;
+        } else {
+            LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_STREAMON failed";
+            CleanupV4l2Buffers();
+            return false;
+        }
+
         return true;
     }
 
@@ -941,7 +1037,8 @@ private:
     int v4l2_fd_{-1};
     uint32_t output_buf_type_{0};
     uint32_t capture_buf_type_{0};
-    bool streamon_{false};
+    bool output_streaming_{false};
+    bool capture_streaming_{false};
     uint64_t frame_counter_{0};
 
     std::vector<V4l2MmapBuffer> output_buffers_;

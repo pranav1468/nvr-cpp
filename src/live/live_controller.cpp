@@ -717,6 +717,19 @@ void LiveController::SetupGridPipelines() {
 }
 
 void LiveController::StartChannelPipeline(int channel_id, int tile_index, StreamType stream_type, uint32_t target_w, uint32_t target_h) {
+    std::shared_ptr<ChannelPipeline> old_pipe;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = pipelines_.find(channel_id);
+        if (it != pipelines_.end()) {
+            old_pipe = it->second;
+            pipelines_.erase(it);
+        }
+    }
+    if (old_pipe) {
+        TeardownPipeline(old_pipe);
+    }
+
     if (stream_type == StreamType::MAIN) {
         CameraManager::Instance().EnsureMainStream(channel_id);
     } else {

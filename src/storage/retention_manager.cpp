@@ -98,6 +98,7 @@ void RetentionManager::EnforceRetentionOnce() {
             break;
         }
 
+        bool made_progress = false;
         for (const auto& seg : segments) {
             bool file_removed = false;
             try {
@@ -113,10 +114,17 @@ void RetentionManager::EnforceRetentionOnce() {
             }
 
             if (file_removed) {
-                SegmentIndex::Instance().DeleteSegmentRecord(seg.id);
+                if (SegmentIndex::Instance().DeleteSegmentRecord(seg.id)) {
+                    made_progress = true;
+                }
             } else {
                 LOG_WARN << "RetentionManager: Retaining DB record for locked/unremoved file: " << seg.file_path;
             }
+        }
+
+        if (!made_progress) {
+            LOG_WARN << "RetentionManager: Pruning made no progress; stopping iteration to prevent infinite loop";
+            break;
         }
 
         free_bytes = GetFreeDiskSpaceBytes(check_path);

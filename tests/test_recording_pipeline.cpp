@@ -216,6 +216,10 @@ void RunAtomicWriterTest() {
     int probe_res = std::system(probe_cmd.c_str());
     assert(probe_res == 0);
 
+    std::string decode_cmd = "ffmpeg -v error -i " + meta.file_path + " -c copy -f null - > /dev/null 2>&1";
+    int decode_res = std::system(decode_cmd.c_str());
+    assert(decode_res == 0);
+
     // Deep MP4 Validator Negative Tests:
     // a. Truncated segment (e.g. power-loss or disk full during fragment write)
     std::string corrupt_trunc = test_dir + "/corrupt_trunc.mp4";
@@ -946,6 +950,8 @@ void RunAudioVideoSyncAndFormatTest() {
 
         std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
         assert(std::system(probe_cmd.c_str()) == 0);
+        std::string demux_cmd = "ffmpeg -v error -i " + meta.file_path + " -c copy -f null - > /dev/null 2>&1";
+        assert(std::system(demux_cmd.c_str()) == 0);
     }
 
     // Sub-test 2: G.711 PCMA with Non-Standard Packetization (80B, 160B, 320B)
@@ -995,6 +1001,8 @@ void RunAudioVideoSyncAndFormatTest() {
 
         std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
         assert(std::system(probe_cmd.c_str()) == 0);
+        std::string demux_cmd = "ffmpeg -v error -i " + meta.file_path + " -c copy -f null - > /dev/null 2>&1";
+        assert(std::system(demux_cmd.c_str()) == 0);
     }
 
     // Sub-test 3: Audio-First Ingress (Audio Active Before Video) & Audio-Last (Audio Outlives Video)
@@ -1061,6 +1069,8 @@ void RunAudioVideoSyncAndFormatTest() {
 
         std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
         assert(std::system(probe_cmd.c_str()) == 0);
+        std::string demux_cmd = "ffmpeg -v error -i " + meta.file_path + " -c copy -f null - > /dev/null 2>&1";
+        assert(std::system(demux_cmd.c_str()) == 0);
     }
 
     // Sub-test 4: Network Stall (2.0s Gap) & Timestamp Discontinuity Recovery
@@ -1149,6 +1159,8 @@ void RunAudioVideoSyncAndFormatTest() {
 
         std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
         assert(std::system(probe_cmd.c_str()) == 0);
+        std::string demux_cmd = "ffmpeg -v error -i " + meta.file_path + " -c copy -f null - > /dev/null 2>&1";
+        assert(std::system(demux_cmd.c_str()) == 0);
     }
 
     std::cout << "  -> PASSED: Real-stream AV sync, dynamic AAC/G.711, stall & discontinuity recovery verified." << std::endl;
