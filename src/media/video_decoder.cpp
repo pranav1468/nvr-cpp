@@ -339,6 +339,7 @@ private:
 struct V4l2MmapBuffer {
     void* start{nullptr};
     size_t length{0};
+    int dmabuf_fd{-1};
     bool queued{false};
 };
 
@@ -512,6 +513,10 @@ public:
             }
             output_buffers_.clear();
             for (auto& b : capture_buffers_) {
+                if (b.dmabuf_fd >= 0) {
+                    close(b.dmabuf_fd);
+                    b.dmabuf_fd = -1;
+                }
                 if (b.start && b.start != MAP_FAILED) {
                     munmap(b.start, b.length);
                 }
@@ -602,6 +607,7 @@ private:
             out_frame->width = width_;
             out_frame->height = height_;
             out_frame->stride = stride;
+            out_frame->dmabuf_fd = capture_buffers_[cap_idx].dmabuf_fd;
             out_frame->data = BufferAllocator::Instance().Allocate(surface_size);
             if (out_frame->data.size() < surface_size) {
                 out_frame->data.resize(surface_size, 0);
@@ -645,6 +651,10 @@ private:
         }
         output_buffers_.clear();
         for (auto& b : capture_buffers_) {
+            if (b.dmabuf_fd >= 0) {
+                close(b.dmabuf_fd);
+                b.dmabuf_fd = -1;
+            }
             if (b.start && b.start != MAP_FAILED) {
                 munmap(b.start, b.length);
             }
@@ -655,6 +665,38 @@ private:
         struct v4l2_format fmt_out{};
         fmt_out.type = output_buf_type_;
         uint32_t pix_fmt = (codec_ == CodecType::H264) ? V4L2_PIX_FMT_H264 : V4L2_PIX_FMT_HEVC;
+
+        // Verify driver output queue actually advertises the requested codec
+        bool has_codec_fmt = false;
+        struct v4l2_fmtdesc fdesc{};
+        fdesc.type = output_buf_type_;
+        while (ioctl(v4l2_fd_, VIDIOC_ENUM_FMT, &fdesc) == 0) {
+            if (fdesc.pixelformat == pix_fmt) {
+                has_codec_fmt = true;
+                break;
+            }
+            fdesc.index++;
+        }
+        if (!has_codec_fmt) {
+            LOG_WARN << "[VpuVideoDecoder] Hardware V4L2 device does not support format " << CodecToString(codec_);
+            return false;
+        }
+
+        // Verify driver capture queue actually advertises NV12
+        bool has_nv12 = false;
+        struct v4l2_fmtdesc fdesc_cap{};
+        fdesc_cap.type = capture_buf_type_;
+        while (ioctl(v4l2_fd_, VIDIOC_ENUM_FMT, &fdesc_cap) == 0) {
+            if (fdesc_cap.pixelformat == V4L2_PIX_FMT_NV12) {
+                has_nv12 = true;
+                break;
+            }
+            fdesc_cap.index++;
+        }
+        if (!has_nv12) {
+            LOG_WARN << "[VpuVideoDecoder] Hardware V4L2 device does not support NV12 capture format";
+            return false;
+        }
 
         if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
             fmt_out.fmt.pix_mp.pixelformat = pix_fmt;
@@ -765,6 +807,17 @@ private:
             capture_buffers_[i].start = ptr;
             capture_buffers_[i].length = length;
             capture_buffers_[i].queued = false;
+
+            // Attempt to export DMA-BUF descriptor for zero-copy downstream rendering & NPU inference
+            struct v4l2_exportbuffer expbuf{};
+            expbuf.type = capture_buf_type_;
+            expbuf.index = i;
+            expbuf.flags = O_RDONLY | O_CLOEXEC;
+            if (ioctl(v4l2_fd_, VIDIOC_EXPBUF, &expbuf) == 0) {
+                capture_buffers_[i].dmabuf_fd = expbuf.fd;
+            } else {
+                capture_buffers_[i].dmabuf_fd = -1;
+            }
 
             // Initial queueing of capture buffers
             struct v4l2_buffer qbuf{};
