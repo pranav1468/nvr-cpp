@@ -464,24 +464,8 @@ public:
             }
         }
 
-        // 3. Fallback surface allocation for test frames / mock bitstreams
-        uint32_t stride = (width_ + 63) & ~size_t(63);
-        size_t surface_size = BufferAllocator::CalculateSurfaceSize(width_, height_, 1, 1, 64);
-        out_frame->width = width_;
-        out_frame->height = height_;
-        out_frame->stride = stride;
-        out_frame->data = BufferAllocator::Instance().Allocate(surface_size);
-        if (out_frame->data.size() < surface_size) {
-            out_frame->data.resize(surface_size, 0);
-        }
-
-        uint8_t luma_val = static_cast<uint8_t>((packet->rtp_timestamp ^ packet->sequence_number) & 0xFF);
-        size_t y_plane_size = stride * height_;
-        std::memset(out_frame->data.data(), luma_val, y_plane_size);
-        size_t uv_plane_size = surface_size - y_plane_size;
-        std::memset(out_frame->data.data() + y_plane_size, 128, uv_plane_size);
-
-        return true;
+        // Decode failed on both hardware and software engines; do not report fake success
+        return false;
     }
 
     void Flush() override {
