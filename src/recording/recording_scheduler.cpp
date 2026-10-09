@@ -84,6 +84,11 @@ void RecordingScheduler::StopChannelRecording(int channel_id) {
         if (state->segmenter) {
             state->segmenter->FlushAndStop();
         }
+        {
+            std::lock_guard<std::mutex> p_lock(state->preroll_mutex);
+            state->preroll_buffer.clear();
+            state->preroll_bytes = 0;
+        }
         LOG_INFO << "[Channel " << channel_id << "] Stopped recording";
     }
 }
@@ -107,6 +112,11 @@ void RecordingScheduler::StopAll() {
         }
         if (state->segmenter) {
             state->segmenter->FlushAndStop();
+        }
+        {
+            std::lock_guard<std::mutex> p_lock(state->preroll_mutex);
+            state->preroll_buffer.clear();
+            state->preroll_bytes = 0;
         }
     }
     LOG_INFO << "Stopped all active recording channels";
@@ -150,12 +160,49 @@ uint64_t RecordingScheduler::GetChannelDroppedPackets(int channel_id) const {
     return 0;
 }
 
+uint64_t RecordingScheduler::GetChannelPrerollPacketCount(int channel_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = channels_.find(channel_id);
+    if (it != channels_.end()) {
+        std::lock_guard<std::mutex> p_lock(it->second->preroll_mutex);
+        return it->second->preroll_buffer.size();
+    }
+    return 0;
+}
+
+uint64_t RecordingScheduler::GetChannelPrerollBytes(int channel_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = channels_.find(channel_id);
+    if (it != channels_.end()) {
+        std::lock_guard<std::mutex> p_lock(it->second->preroll_mutex);
+        return it->second->preroll_bytes;
+    }
+    return 0;
+}
+
+void RecordingScheduler::SetPostRollSeconds(int channel_id, int seconds) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = channels_.find(channel_id);
+    if (it != channels_.end()) {
+        it->second->post_roll_seconds = std::max(0, seconds);
+    }
+}
+
+void RecordingScheduler::SetPreRollSeconds(int channel_id, int seconds) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = channels_.find(channel_id);
+    if (it != channels_.end()) {
+        it->second->preroll_seconds = std::max(0, seconds);
+    }
+}
+
 void RecordingScheduler::SetMotionEvent(int channel_id, bool motion_active) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = channels_.find(channel_id);
     if (it != channels_.end()) {
         it->second->motion_active = motion_active;
         if (motion_active) {
+            it->second->has_motion_occurred = true;
             it->second->last_motion_time = std::chrono::steady_clock::now();
         }
         it->second->queue_cv.notify_one();
@@ -190,10 +237,30 @@ bool RecordingScheduler::IsScheduleActiveNow(int channel_id, int64_t now_ms) con
     int cur_mins = tm_buf.tm_hour * 60 + tm_buf.tm_min;
 
     for (const auto& w : sched) {
-        if ((w.days_mask & (1 << cur_wday)) != 0) {
-            int start_mins = w.start_hour * 60 + w.start_minute;
-            int end_mins = w.end_hour * 60 + w.end_minute;
-            if (cur_mins >= start_mins && cur_mins < end_mins) {
+        int start_mins = w.start_hour * 60 + w.start_minute;
+        int end_mins = w.end_hour * 60 + w.end_minute;
+
+        if (start_mins == end_mins) {
+            // Full 24-hour day window
+            if ((w.days_mask & (1 << cur_wday)) != 0) {
+                return true;
+            }
+        } else if (start_mins < end_mins) {
+            // Same-day window (e.g., 08:00 to 18:00)
+            if ((w.days_mask & (1 << cur_wday)) != 0) {
+                if (cur_mins >= start_mins && cur_mins < end_mins) {
+                    return true;
+                }
+            }
+        } else {
+            // Overnight window crossing midnight (e.g., 22:00 to 06:00)
+            // 1. Evening portion on scheduled day (>= start_mins)
+            if ((w.days_mask & (1 << cur_wday)) != 0 && cur_mins >= start_mins) {
+                return true;
+            }
+            // 2. Early morning portion following scheduled day (< end_mins)
+            int prev_wday = (cur_wday + 6) % 7;
+            if ((w.days_mask & (1 << prev_wday)) != 0 && cur_mins < end_mins) {
                 return true;
             }
         }
@@ -326,15 +393,24 @@ void RecordingScheduler::ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> s
         } else if (state->mode == RecordMode::MOTION_ONLY) {
             auto now = std::chrono::steady_clock::now();
             if (state->motion_active) {
+                state->has_motion_occurred = true;
                 state->last_motion_time = now;
             }
-            auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(now - state->last_motion_time).count();
-            bool should_record = state->motion_active || (elapsed_sec < state->post_roll_seconds);
+            bool should_record = state->motion_active;
+            if (!should_record && state->has_motion_occurred) {
+                auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(now - state->last_motion_time).count();
+                if (elapsed_sec < state->post_roll_seconds) {
+                    should_record = true;
+                } else {
+                    state->has_motion_occurred = false;
+                }
+            }
 
             if (should_record) {
                 if (!state->is_in_motion_recording) {
                     state->is_in_motion_recording = true;
                     // Flush pre-roll buffer from the oldest keyframe forward
+                    std::lock_guard<std::mutex> p_lock(state->preroll_mutex);
                     size_t kf_idx = state->preroll_buffer.size();
                     for (size_t i = 0; i < state->preroll_buffer.size(); ++i) {
                         if (state->preroll_buffer[i]->is_keyframe && state->preroll_buffer[i]->IsVideo()) {
@@ -348,6 +424,7 @@ void RecordingScheduler::ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> s
                         }
                     }
                     state->preroll_buffer.clear();
+                    state->preroll_bytes = 0;
                 }
                 state->segmenter->PushPacket(packet);
             } else {
@@ -357,9 +434,70 @@ void RecordingScheduler::ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> s
                         state->segmenter->FlushAndStop();
                     }
                 }
+
+                std::lock_guard<std::mutex> p_lock(state->preroll_mutex);
+                // If buffer is empty, only accept a video keyframe to guarantee GOP alignment
+                if (state->preroll_buffer.empty() && (!packet->is_keyframe || !packet->IsVideo())) {
+                    continue;
+                }
+
                 state->preroll_buffer.push_back(packet);
-                if (state->preroll_buffer.size() > state->max_preroll_packets) {
-                    state->preroll_buffer.pop_front();
+                state->preroll_bytes += packet->data.size();
+
+                // Prune preroll_buffer to satisfy bounds:
+                // 1) Time duration <= preroll_seconds
+                // 2) preroll_bytes <= max_preroll_bytes
+                // 3) preroll_buffer.size() <= max_preroll_packets
+                // Pruning discards complete expired GOPs up to the next IDR keyframe
+                auto calc_duration_ms = [&]() -> int64_t {
+                    if (state->preroll_buffer.empty()) return 0;
+                    if (state->preroll_buffer.back()->pts_us > 0 && state->preroll_buffer.front()->pts_us > 0) {
+                        return (state->preroll_buffer.back()->pts_us - state->preroll_buffer.front()->pts_us) / 1000;
+                    }
+                    if (state->preroll_buffer.back()->wall_time_ms > 0 && state->preroll_buffer.front()->wall_time_ms > 0) {
+                        return state->preroll_buffer.back()->wall_time_ms - state->preroll_buffer.front()->wall_time_ms;
+                    }
+                    return 0;
+                };
+
+                while (!state->preroll_buffer.empty()) {
+                    int64_t dur_ms = calc_duration_ms();
+                    bool needs_prune = (state->preroll_buffer.size() > state->max_preroll_packets) ||
+                                      (state->preroll_bytes > state->max_preroll_bytes) ||
+                                      (dur_ms > static_cast<int64_t>(state->preroll_seconds) * 1000);
+                    if (!needs_prune) {
+                        break;
+                    }
+
+                    // Locate next keyframe to discard the oldest GOP as a complete chunk
+                    size_t next_kf_idx = 0;
+                    for (size_t i = 1; i < state->preroll_buffer.size(); ++i) {
+                        if (state->preroll_buffer[i]->is_keyframe && state->preroll_buffer[i]->IsVideo()) {
+                            next_kf_idx = i;
+                            break;
+                        }
+                    }
+
+                    if (next_kf_idx == 0) {
+                        // Only one keyframe exists in buffer.
+                        // If hard byte or packet limits were breached, flush entire buffer to preserve memory budget
+                        if (state->preroll_bytes > state->max_preroll_bytes ||
+                            state->preroll_buffer.size() > state->max_preroll_packets) {
+                            state->preroll_buffer.clear();
+                            state->preroll_bytes = 0;
+                        }
+                        break;
+                    }
+
+                    // Discard oldest GOP up to next_kf_idx
+                    for (size_t i = 0; i < next_kf_idx; ++i) {
+                        if (state->preroll_bytes >= state->preroll_buffer.front()->data.size()) {
+                            state->preroll_bytes -= state->preroll_buffer.front()->data.size();
+                        } else {
+                            state->preroll_bytes = 0;
+                        }
+                        state->preroll_buffer.pop_front();
+                    }
                 }
             }
         } else if (state->mode == RecordMode::SCHEDULED) {

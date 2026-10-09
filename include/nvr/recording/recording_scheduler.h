@@ -37,9 +37,13 @@ public:
     uint32_t GetChannelFrameCount(int channel_id) const;
     uint64_t GetChannelBytesWritten(int channel_id) const;
     uint64_t GetChannelDroppedPackets(int channel_id) const;
+    uint64_t GetChannelPrerollPacketCount(int channel_id) const;
+    uint64_t GetChannelPrerollBytes(int channel_id) const;
 
     // Motion event control for RecordMode::MOTION_ONLY
     void SetMotionEvent(int channel_id, bool motion_active);
+    void SetPostRollSeconds(int channel_id, int seconds);
+    void SetPreRollSeconds(int channel_id, int seconds);
 
     // Schedule configuration for RecordMode::SCHEDULED
     void SetSchedule(int channel_id, const std::vector<ScheduleTimeWindow>& schedule);
@@ -73,11 +77,16 @@ private:
 
         // Motion mode state machine
         std::atomic<bool> motion_active{false};
+        std::atomic<bool> has_motion_occurred{false};
         std::chrono::steady_clock::time_point last_motion_time;
         int post_roll_seconds{5};
+        int preroll_seconds{5};
         bool is_in_motion_recording{false};
+        std::mutex preroll_mutex;
         std::deque<MediaPacketPtr> preroll_buffer;
-        const size_t max_preroll_packets{120};
+        size_t preroll_bytes{0};
+        const size_t max_preroll_bytes{8 * 1024 * 1024}; // 8 MB bound
+        const size_t max_preroll_packets{150};
 
         // Scheduled mode configuration
         std::vector<ScheduleTimeWindow> schedule;

@@ -502,70 +502,217 @@ void RunDigestAuthAndIPv6Test() {
 }
 
 void RunMotionAndScheduleTest() {
-    std::cout << "[TEST 7] Running Motion-Triggered & Weekly Schedule Tests..." << std::endl;
+    std::cout << "[TEST 7] Running Motion-Triggered, Overnight Schedule & Bounded Pre-Roll Tests..." << std::endl;
 
     auto& sched = nvr::RecordingScheduler::Instance();
     nvr::StorageConfig storage_config;
     storage_config.recording_path = "./test_recordings";
     sched.Configure(storage_config);
 
-    // Channel 5 configured for MOTION_ONLY
-    bool start_ok = sched.StartChannelRecording(5, nvr::RecordMode::MOTION_ONLY);
-    assert(start_ok);
-    assert(sched.IsChannelActive(5));
-    assert(!sched.IsChannelRecording(5)); // Gated by motion; not recording yet
+    // =========================================================================
+    // Part A: Weekly Schedule & Midnight Rollover Validation
+    // =========================================================================
+    // Helper lambda to construct deterministic local timestamps (year 2026)
+    auto make_local_ts_ms = [](int year, int mon, int mday, int hour, int min) -> int64_t {
+        struct tm t = {};
+        t.tm_year = year - 1900;
+        t.tm_mon = mon - 1;
+        t.tm_mday = mday;
+        t.tm_hour = hour;
+        t.tm_min = min;
+        t.tm_sec = 0;
+        t.tm_isdst = -1;
+        time_t s = mktime(&t);
+        return static_cast<int64_t>(s) * 1000;
+    };
 
-    // Inject frames with motion inactive
-    for (int i = 0; i < 10; ++i) {
-        auto pkt = std::make_shared<nvr::MediaPacket>();
-        pkt->channel_id = 5;
-        pkt->stream_type = nvr::StreamType::MAIN;
-        pkt->codec = nvr::CodecType::H264;
-        pkt->is_keyframe = (i == 0);
-        pkt->pts_us = i * 40000;
-        pkt->wall_time_ms = 1000 + i * 40;
-        pkt->data = {0x00, 0x00, 0x00, 0x01, 0x41};
-        sched.EnqueuePacket(5, pkt);
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // October 5, 2026 is Monday (tm_wday = 1)
+    // October 6, 2026 is Tuesday (tm_wday = 2)
+    // October 10, 2026 is Saturday (tm_wday = 6)
+    // October 11, 2026 is Sunday (tm_wday = 0)
+    int64_t mon_2130 = make_local_ts_ms(2026, 10, 5, 21, 30);
+    int64_t mon_2230 = make_local_ts_ms(2026, 10, 5, 22, 30);
+    int64_t tue_0315 = make_local_ts_ms(2026, 10, 6, 3, 15);
+    int64_t tue_0630 = make_local_ts_ms(2026, 10, 6, 6, 30);
+    int64_t sat_2330 = make_local_ts_ms(2026, 10, 10, 23, 30);
+    int64_t sun_0400 = make_local_ts_ms(2026, 10, 11, 4, 0);
+    int64_t sun_1200 = make_local_ts_ms(2026, 10, 11, 12, 0);
 
-    // Trigger motion
-    sched.SetMotionEvent(5, true);
+    // Schedule 1: Monday overnight (22:00 -> 06:00, Monday bit 1 only)
+    std::vector<nvr::ScheduleTimeWindow> mon_overnight;
+    nvr::ScheduleTimeWindow w1;
+    w1.start_hour = 22;
+    w1.start_minute = 0;
+    w1.end_hour = 6;
+    w1.end_minute = 0;
+    w1.days_mask = (1 << 1); // Monday only
+    mon_overnight.push_back(w1);
 
-    // Inject keyframe while motion is active
-    auto key_pkt = std::make_shared<nvr::MediaPacket>();
-    key_pkt->channel_id = 5;
-    key_pkt->stream_type = nvr::StreamType::MAIN;
-    key_pkt->codec = nvr::CodecType::H264;
-    key_pkt->is_keyframe = true;
-    key_pkt->pts_us = 500000;
-    key_pkt->wall_time_ms = 1500;
-    key_pkt->data = {0x00, 0x00, 0x00, 0x01, 0x65, 0x88};
-    sched.EnqueuePacket(5, key_pkt);
+    sched.StartChannelRecording(5, nvr::RecordMode::SCHEDULED);
+    sched.SetSchedule(5, mon_overnight);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Prior to Monday 22:00 -> Inactive
+    assert(!sched.IsScheduleActiveNow(5, mon_2130));
+    // Monday 22:30 -> Active (evening portion)
+    assert(sched.IsScheduleActiveNow(5, mon_2230));
+    // Tuesday 03:15 -> Active (overnight continuation of Monday schedule)
+    assert(sched.IsScheduleActiveNow(5, tue_0315));
+    // Tuesday 06:30 -> Inactive (overnight window expired at 06:00)
+    assert(!sched.IsScheduleActiveNow(5, tue_0630));
 
-    // Stop motion -> enters post-roll period
-    sched.SetMotionEvent(5, false);
+    // Schedule 2: Weekend overnight crossing Saturday into Sunday (22:00 -> 05:00, Saturday bit 6)
+    std::vector<nvr::ScheduleTimeWindow> sat_overnight;
+    nvr::ScheduleTimeWindow w2;
+    w2.start_hour = 22;
+    w2.start_minute = 0;
+    w2.end_hour = 5;
+    w2.end_minute = 0;
+    w2.days_mask = (1 << 6); // Saturday only
+    sat_overnight.push_back(w2);
 
-    // Test weekly schedule configuration
-    std::vector<nvr::ScheduleTimeWindow> schedule;
-    nvr::ScheduleTimeWindow window;
-    window.start_hour = 0;
-    window.start_minute = 0;
-    window.end_hour = 24;
-    window.end_minute = 0;
-    window.days_mask = 0x7F; // All 7 days
-    schedule.push_back(window);
+    sched.SetSchedule(5, sat_overnight);
+    // Saturday 23:30 -> Active
+    assert(sched.IsScheduleActiveNow(5, sat_2330));
+    // Sunday 04:00 -> Active (overnight from Saturday)
+    assert(sched.IsScheduleActiveNow(5, sun_0400));
+    // Sunday 12:00 -> Inactive
+    assert(!sched.IsScheduleActiveNow(5, sun_1200));
 
-    sched.SetSchedule(5, schedule);
-    int64_t now_ms = nvr::time_utils::WallTimeMs();
-    assert(sched.IsScheduleActiveNow(5, now_ms));
+    // Schedule 3: Full 24-hour window (start_mins == end_mins or 0..24)
+    std::vector<nvr::ScheduleTimeWindow> all_day;
+    nvr::ScheduleTimeWindow w3;
+    w3.start_hour = 0;
+    w3.start_minute = 0;
+    w3.end_hour = 0;
+    w3.end_minute = 0;
+    w3.days_mask = 0x7F; // All days
+    all_day.push_back(w3);
+
+    sched.SetSchedule(5, all_day);
+    assert(sched.IsScheduleActiveNow(5, mon_2130));
+    assert(sched.IsScheduleActiveNow(5, tue_0315));
+    assert(sched.IsScheduleActiveNow(5, sun_1200));
 
     sched.StopChannelRecording(5);
+
+    // =========================================================================
+    // Part B: GOP-Aligned Pre-Roll Buffering, Retention & Time/Byte Pruning
+    // =========================================================================
+    // Configure Channel 7 for MOTION_ONLY with 2 seconds pre-roll and 1 second post-roll
+    bool start_ok = sched.StartChannelRecording(7, nvr::RecordMode::MOTION_ONLY);
+    assert(start_ok);
+    sched.SetPreRollSeconds(7, 2);
+    sched.SetPostRollSeconds(7, 1);
+    assert(sched.IsChannelActive(7));
+    assert(!sched.IsChannelRecording(7));
+
+    // 1. Send orphan delta frames before any keyframe - must NOT be buffered into preroll
+    for (int i = 0; i < 5; ++i) {
+        auto delta = std::make_shared<nvr::MediaPacket>();
+        delta->channel_id = 7;
+        delta->stream_type = nvr::StreamType::MAIN;
+        delta->codec = nvr::CodecType::H264;
+        delta->is_keyframe = false;
+        delta->pts_us = i * 40000;
+        delta->wall_time_ms = 1000 + i * 40;
+        delta->data = MakeNonIdrFrame();
+        sched.EnqueuePacket(7, delta);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    assert(sched.GetChannelPrerollPacketCount(7) == 0);
+
+    // 2. Push GOP 1: KF at pts = 0 ms, 3 delta frames up to pts = 300 ms
+    auto kf1 = std::make_shared<nvr::MediaPacket>();
+    kf1->channel_id = 7;
+    kf1->stream_type = nvr::StreamType::MAIN;
+    kf1->codec = nvr::CodecType::H264;
+    kf1->is_keyframe = true;
+    kf1->pts_us = 0;
+    kf1->wall_time_ms = 2000;
+    kf1->data = MakeIdrFrame();
+    sched.EnqueuePacket(7, kf1);
+
+    for (int i = 1; i <= 3; ++i) {
+        auto delta = std::make_shared<nvr::MediaPacket>();
+        delta->channel_id = 7;
+        delta->stream_type = nvr::StreamType::MAIN;
+        delta->codec = nvr::CodecType::H264;
+        delta->is_keyframe = false;
+        delta->pts_us = i * 100000;
+        delta->wall_time_ms = 2000 + i * 100;
+        delta->data = MakeNonIdrFrame();
+        sched.EnqueuePacket(7, delta);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    assert(sched.GetChannelPrerollPacketCount(7) == 4);
+
+    // 3. Push GOP 2: KF at pts = 1000 ms, 2 delta frames up to pts = 1200 ms
+    auto kf2 = std::make_shared<nvr::MediaPacket>();
+    kf2->channel_id = 7;
+    kf2->stream_type = nvr::StreamType::MAIN;
+    kf2->codec = nvr::CodecType::H264;
+    kf2->is_keyframe = true;
+    kf2->pts_us = 1000000;
+    kf2->wall_time_ms = 3000;
+    kf2->data = MakeIdrFrame();
+    sched.EnqueuePacket(7, kf2);
+
+    for (int i = 1; i <= 2; ++i) {
+        auto delta = std::make_shared<nvr::MediaPacket>();
+        delta->channel_id = 7;
+        delta->stream_type = nvr::StreamType::MAIN;
+        delta->codec = nvr::CodecType::H264;
+        delta->is_keyframe = false;
+        delta->pts_us = 1000000 + i * 100000;
+        delta->wall_time_ms = 3000 + i * 100;
+        delta->data = MakeNonIdrFrame();
+        sched.EnqueuePacket(7, delta);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    assert(sched.GetChannelPrerollPacketCount(7) == 7); // 4 + 3 = 7
+
+    // 4. Push GOP 3: KF at pts = 2500 ms (exceeds 2.0s duration from GOP 1 at 0 ms!)
+    auto kf3 = std::make_shared<nvr::MediaPacket>();
+    kf3->channel_id = 7;
+    kf3->stream_type = nvr::StreamType::MAIN;
+    kf3->codec = nvr::CodecType::H264;
+    kf3->is_keyframe = true;
+    kf3->pts_us = 2500000;
+    kf3->wall_time_ms = 4500;
+    kf3->data = MakeIdrFrame();
+    sched.EnqueuePacket(7, kf3);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // GOP 1 (4 packets) must have been evicted as a complete chunk.
+    // Remaining in buffer: GOP 2 (3 packets) + GOP 3 (1 packet) = 4 packets.
+    assert(sched.GetChannelPrerollPacketCount(7) == 4);
+    assert(sched.GetChannelPrerollBytes(7) > 0);
+
+    // 5. Trigger motion: scheduler flushes preroll buffer starting with GOP 2's IDR keyframe
+    sched.SetMotionEvent(7, true);
+    auto motion_delta = std::make_shared<nvr::MediaPacket>();
+    motion_delta->channel_id = 7;
+    motion_delta->stream_type = nvr::StreamType::MAIN;
+    motion_delta->codec = nvr::CodecType::H264;
+    motion_delta->is_keyframe = false;
+    motion_delta->pts_us = 2600000;
+    motion_delta->wall_time_ms = 4600;
+    motion_delta->data = MakeNonIdrFrame();
+    sched.EnqueuePacket(7, motion_delta);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    assert(sched.IsChannelRecording(7));
+    // Preroll buffer was flushed into segmenter on motion activation
+    assert(sched.GetChannelPrerollPacketCount(7) == 0);
+
+    // Stop motion and wait for post-roll to expire
+    sched.SetMotionEvent(7, false);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+    sched.StopChannelRecording(7);
     sched.StopAll();
 
-    std::cout << "  -> PASSED: Motion-only gating, pre-roll buffer & weekly schedule logic verified." << std::endl;
+    std::cout << "  -> PASSED: Overnight midnight schedules, GOP-aligned pre-roll & bounded memory verified." << std::endl;
 }
 
 void RunQueueOverflowGopRecoveryTest() {
