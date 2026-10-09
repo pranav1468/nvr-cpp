@@ -8,6 +8,8 @@
 #include <filesystem>
 #include <cstring>
 #include <algorithm>
+#include <fstream>
+#include <map>
 
 namespace nvr {
 
@@ -54,6 +56,113 @@ inline bool WriteAll(int fd, const void* data, size_t size) {
         written += static_cast<size_t>(n);
     }
     return true;
+}
+
+// Deep ISOBMFF Box Parsing Structures and Helpers
+struct BoxHeader {
+    uint64_t size{0};
+    uint32_t header_size{8};
+    char type[5]{0};
+    uint64_t offset{0};
+};
+
+inline uint32_t ReadU32BE(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+inline uint64_t ReadU64BE(const uint8_t* p) {
+    return (static_cast<uint64_t>(ReadU32BE(p)) << 32) |
+           static_cast<uint64_t>(ReadU32BE(p + 4));
+}
+
+inline bool ReadBoxHeader(std::ifstream& file, uint64_t file_size, BoxHeader& box) {
+    uint64_t pos = static_cast<uint64_t>(file.tellg());
+    box.offset = pos;
+    if (pos + 8 > file_size) return false;
+
+    uint8_t hdr[8];
+    if (!file.read(reinterpret_cast<char*>(hdr), 8)) return false;
+
+    uint32_t s32 = ReadU32BE(hdr);
+    std::memcpy(box.type, hdr + 4, 4);
+    box.type[4] = '\0';
+    box.header_size = 8;
+
+    if (s32 == 1) {
+        if (pos + 16 > file_size) return false;
+        uint8_t large[8];
+        if (!file.read(reinterpret_cast<char*>(large), 8)) return false;
+        box.size = ReadU64BE(large);
+        box.header_size = 16;
+        if (box.size < 16) return false;
+    } else if (s32 == 0) {
+        box.size = file_size - pos;
+    } else if (s32 < 8) {
+        return false;
+    } else {
+        box.size = s32;
+    }
+
+    if (pos + box.size > file_size) {
+        return false;
+    }
+    return true;
+}
+
+struct MemBox {
+    char type[5]{0};
+    size_t header_size{8};
+    size_t payload_offset{8};
+    size_t total_size{0};
+    const uint8_t* payload{nullptr};
+    size_t payload_size{0};
+};
+
+inline bool ParseMemBoxes(const uint8_t* data, size_t size, std::vector<MemBox>& out_boxes) {
+    size_t offset = 0;
+    while (offset + 8 <= size) {
+        uint32_t s32 = ReadU32BE(data + offset);
+        char type[5];
+        std::memcpy(type, data + offset + 4, 4);
+        type[4] = '\0';
+
+        size_t total_box_size = s32;
+        size_t hdr_size = 8;
+        if (s32 == 1) {
+            if (offset + 16 > size) return false;
+            total_box_size = static_cast<size_t>(ReadU64BE(data + offset + 8));
+            hdr_size = 16;
+            if (total_box_size < 16) return false;
+        } else if (s32 == 0) {
+            total_box_size = size - offset;
+        } else if (s32 < 8) {
+            return false;
+        }
+
+        if (offset + total_box_size > size) return false;
+
+        MemBox b;
+        std::memcpy(b.type, type, 5);
+        b.header_size = hdr_size;
+        b.payload_offset = offset + hdr_size;
+        b.total_size = total_box_size;
+        b.payload = data + offset + hdr_size;
+        b.payload_size = total_box_size - hdr_size;
+        out_boxes.push_back(b);
+
+        offset += total_box_size;
+    }
+    return (offset == size);
+}
+
+inline const MemBox* FindBox(const std::vector<MemBox>& boxes, const char* type) {
+    for (const auto& b : boxes) {
+        if (std::strcmp(b.type, type) == 0) return &b;
+    }
+    return nullptr;
 }
 
 // Simple bit reader for SPS parsing
@@ -1222,28 +1331,362 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
 bool AtomicWriter::ValidateMp4File(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
+        LOG_ERROR << "MP4 validation failed: cannot open file " << path;
         return false;
     }
+
     file.seekg(0, std::ios::end);
-    std::streampos fsize = file.tellg();
-    if (fsize < 32) {
+    std::streampos fsize_pos = file.tellg();
+    if (fsize_pos < 32) {
+        LOG_ERROR << "MP4 validation failed: file size " << fsize_pos << " bytes is smaller than minimum header";
         return false;
     }
+    uint64_t file_size = static_cast<uint64_t>(fsize_pos);
     file.seekg(0, std::ios::beg);
-    uint8_t header[12];
-    if (!file.read(reinterpret_cast<char*>(header), 12)) {
+
+    // 1. First box MUST be 'ftyp'
+    BoxHeader ftyp_box;
+    if (!ReadBoxHeader(file, file_size, ftyp_box) || std::strcmp(ftyp_box.type, "ftyp") != 0) {
+        LOG_ERROR << "MP4 validation failed: missing ftyp box at head of file: " << path;
         return false;
     }
-    uint32_t box_size = (static_cast<uint32_t>(header[0]) << 24) |
-                        (static_cast<uint32_t>(header[1]) << 16) |
-                        (static_cast<uint32_t>(header[2]) << 8) |
-                        static_cast<uint32_t>(header[3]);
-    if (box_size < 8 || static_cast<std::streampos>(box_size) > fsize) {
+    if (ftyp_box.size < 16) {
+        LOG_ERROR << "MP4 validation failed: malformed ftyp box size: " << ftyp_box.size;
         return false;
     }
-    if (std::memcmp(header + 4, "ftyp", 4) != 0) {
+
+    uint64_t current_pos = ftyp_box.offset + ftyp_box.size;
+    bool found_ftyp = true;
+    bool found_moov = false;
+    bool has_mvex = false;
+    bool found_video_trak = false;
+    std::vector<uint32_t> declared_tracks;
+
+    uint32_t expected_fragment_seq = 1;
+    uint32_t fragment_count = 0;
+    uint64_t total_sample_count = 0;
+    std::map<uint32_t, uint64_t> last_decode_times;
+
+    while (current_pos < file_size) {
+        file.seekg(current_pos);
+        BoxHeader box;
+        if (!ReadBoxHeader(file, file_size, box)) {
+            LOG_ERROR << "MP4 validation failed: invalid box header at offset " << current_pos << " in " << path;
+            return false;
+        }
+
+        if (std::strcmp(box.type, "moov") == 0) {
+            if (found_moov) {
+                LOG_ERROR << "MP4 validation failed: multiple moov boxes found in " << path;
+                return false;
+            }
+            if (box.size < 16 || box.size > 10 * 1024 * 1024) {
+                LOG_ERROR << "MP4 validation failed: invalid moov box size " << box.size << " in " << path;
+                return false;
+            }
+
+            std::vector<uint8_t> moov_payload(box.size - box.header_size);
+            if (!file.read(reinterpret_cast<char*>(moov_payload.data()), moov_payload.size())) {
+                LOG_ERROR << "MP4 validation failed: could not read moov payload in " << path;
+                return false;
+            }
+
+            std::vector<MemBox> moov_children;
+            if (!ParseMemBoxes(moov_payload.data(), moov_payload.size(), moov_children)) {
+                LOG_ERROR << "MP4 validation failed: corrupted sub-boxes in moov in " << path;
+                return false;
+            }
+
+            const MemBox* mvhd = FindBox(moov_children, "mvhd");
+            if (!mvhd || mvhd->payload_size < 16) {
+                LOG_ERROR << "MP4 validation failed: missing or malformed mvhd box in " << path;
+                return false;
+            }
+            uint8_t mvhd_ver = mvhd->payload[0];
+            uint32_t timescale = (mvhd_ver == 1) ? ((mvhd->payload_size >= 24) ? ReadU32BE(mvhd->payload + 20) : 0)
+                                                 : ReadU32BE(mvhd->payload + 12);
+            if (timescale == 0) {
+                LOG_ERROR << "MP4 validation failed: invalid zero timescale in mvhd in " << path;
+                return false;
+            }
+
+            for (const auto& child : moov_children) {
+                if (std::strcmp(child.type, "trak") == 0) {
+                    std::vector<MemBox> trak_children;
+                    if (!ParseMemBoxes(child.payload, child.payload_size, trak_children)) continue;
+
+                    const MemBox* tkhd = FindBox(trak_children, "tkhd");
+                    if (!tkhd || tkhd->payload_size < 20) continue;
+                    uint8_t tkhd_ver = tkhd->payload[0];
+                    uint32_t track_id = (tkhd_ver == 1) ? ((tkhd->payload_size >= 28) ? ReadU32BE(tkhd->payload + 20) : 0)
+                                                        : ReadU32BE(tkhd->payload + 12);
+                    if (track_id == 0) continue;
+                    declared_tracks.push_back(track_id);
+
+                    const MemBox* mdia = FindBox(trak_children, "mdia");
+                    if (!mdia) continue;
+                    std::vector<MemBox> mdia_children;
+                    if (!ParseMemBoxes(mdia->payload, mdia->payload_size, mdia_children)) continue;
+
+                    const MemBox* hdlr = FindBox(mdia_children, "hdlr");
+                    if (!hdlr || hdlr->payload_size < 12) continue;
+                    char handler[5]{0};
+                    std::memcpy(handler, hdlr->payload + 8, 4);
+
+                    const MemBox* minf = FindBox(mdia_children, "minf");
+                    if (!minf) continue;
+                    std::vector<MemBox> minf_children;
+                    if (!ParseMemBoxes(minf->payload, minf->payload_size, minf_children)) continue;
+
+                    const MemBox* stbl = FindBox(minf_children, "stbl");
+                    if (!stbl) continue;
+                    std::vector<MemBox> stbl_children;
+                    if (!ParseMemBoxes(stbl->payload, stbl->payload_size, stbl_children)) continue;
+
+                    const MemBox* stsd = FindBox(stbl_children, "stsd");
+                    if (!stsd || stsd->payload_size < 8) continue;
+                    uint32_t entry_count = ReadU32BE(stsd->payload + 4);
+                    if (entry_count == 0) continue;
+
+                    if (std::strcmp(handler, "vide") == 0) {
+                        std::vector<MemBox> stsd_entries;
+                        if (ParseMemBoxes(stsd->payload + 8, stsd->payload_size - 8, stsd_entries)) {
+                            for (const auto& entry : stsd_entries) {
+                                if (std::strcmp(entry.type, "avc1") == 0 && entry.payload_size > 78) {
+                                    std::vector<MemBox> avc1_children;
+                                    if (ParseMemBoxes(entry.payload + 78, entry.payload_size - 78, avc1_children)) {
+                                        const MemBox* avcc = FindBox(avc1_children, "avcC");
+                                        if (avcc && avcc->payload_size >= 7 && avcc->payload[0] == 1) {
+                                            uint8_t sps_count = avcc->payload[5] & 0x1F;
+                                            if (sps_count > 0) {
+                                                found_video_trak = true;
+                                            }
+                                        }
+                                    }
+                                } else if ((std::strcmp(entry.type, "hvc1") == 0 || std::strcmp(entry.type, "hev1") == 0) &&
+                                           entry.payload_size > 78) {
+                                    std::vector<MemBox> hvc1_children;
+                                    if (ParseMemBoxes(entry.payload + 78, entry.payload_size - 78, hvc1_children)) {
+                                        const MemBox* hvcc = FindBox(hvc1_children, "hvcC");
+                                        if (hvcc && hvcc->payload_size >= 23 && hvcc->payload[0] == 1) {
+                                            found_video_trak = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            const MemBox* mvex = FindBox(moov_children, "mvex");
+            if (mvex) {
+                has_mvex = true;
+            }
+
+            if (!found_video_trak) {
+                LOG_ERROR << "MP4 validation failed: no valid video track with AVC/HEVC codec config found in " << path;
+                return false;
+            }
+
+            found_moov = true;
+            current_pos = box.offset + box.size;
+
+        } else if (std::strcmp(box.type, "moof") == 0) {
+            if (!found_moov) {
+                LOG_ERROR << "MP4 validation failed: moof encountered before moov in " << path;
+                return false;
+            }
+
+            uint64_t moof_offset = box.offset;
+            uint64_t moof_size = box.size;
+            std::vector<uint8_t> moof_payload(box.size - box.header_size);
+            if (!file.read(reinterpret_cast<char*>(moof_payload.data()), moof_payload.size())) {
+                LOG_ERROR << "MP4 validation failed: could not read moof payload in " << path;
+                return false;
+            }
+
+            std::vector<MemBox> moof_children;
+            if (!ParseMemBoxes(moof_payload.data(), moof_payload.size(), moof_children)) {
+                LOG_ERROR << "MP4 validation failed: corrupted sub-boxes in moof in " << path;
+                return false;
+            }
+
+            const MemBox* mfhd = FindBox(moof_children, "mfhd");
+            if (!mfhd || mfhd->payload_size < 8) {
+                LOG_ERROR << "MP4 validation failed: missing mfhd in moof in " << path;
+                return false;
+            }
+            uint32_t seq = ReadU32BE(mfhd->payload + 4);
+            if (seq != expected_fragment_seq) {
+                LOG_ERROR << "MP4 validation failed: fragment sequence gap (expected "
+                          << expected_fragment_seq << ", got " << seq << ") in " << path;
+                return false;
+            }
+            expected_fragment_seq++;
+
+            struct TrafInfo {
+                uint32_t track_id{0};
+                int32_t data_offset{0};
+                bool has_data_offset{false};
+                uint64_t sample_bytes{0};
+                uint32_t sample_count{0};
+            };
+            std::vector<TrafInfo> trafs;
+            uint64_t fragment_sample_bytes = 0;
+
+            for (const auto& child : moof_children) {
+                if (std::strcmp(child.type, "traf") == 0) {
+                    std::vector<MemBox> traf_children;
+                    if (!ParseMemBoxes(child.payload, child.payload_size, traf_children)) continue;
+
+                    const MemBox* tfhd = FindBox(traf_children, "tfhd");
+                    if (!tfhd || tfhd->payload_size < 8) continue;
+                    uint32_t t_id = ReadU32BE(tfhd->payload + 4);
+
+                    const MemBox* tfdt = FindBox(traf_children, "tfdt");
+                    if (tfdt && tfdt->payload_size >= 8) {
+                        uint8_t tfdt_ver = tfdt->payload[0];
+                        uint64_t dtime = (tfdt_ver == 1) ? ((tfdt->payload_size >= 12) ? ReadU64BE(tfdt->payload + 4) : 0)
+                                                         : ReadU32BE(tfdt->payload + 4);
+                        if (last_decode_times.count(t_id) && dtime < last_decode_times[t_id]) {
+                            LOG_ERROR << "MP4 validation failed: non-monotonic decode time in track "
+                                      << t_id << " (" << dtime << " < " << last_decode_times[t_id] << ") in " << path;
+                            return false;
+                        }
+                        last_decode_times[t_id] = dtime;
+                    }
+
+                    const MemBox* trun = FindBox(traf_children, "trun");
+                    if (!trun || trun->payload_size < 8) {
+                        LOG_ERROR << "MP4 validation failed: missing or empty trun in traf in " << path;
+                        return false;
+                    }
+                    uint32_t trun_flags = (static_cast<uint32_t>(trun->payload[1]) << 16) |
+                                          (static_cast<uint32_t>(trun->payload[2]) << 8) |
+                                          static_cast<uint32_t>(trun->payload[3]);
+                    uint32_t scount = ReadU32BE(trun->payload + 4);
+                    if (scount == 0) {
+                        LOG_ERROR << "MP4 validation failed: trun sample count is 0 in " << path;
+                        return false;
+                    }
+
+                    size_t trun_pos = 8;
+                    int32_t data_off = 0;
+                    bool has_data_off = false;
+                    if (trun_flags & 0x000001) { // data-offset-present
+                        if (trun_pos + 4 > trun->payload_size) return false;
+                        data_off = static_cast<int32_t>(ReadU32BE(trun->payload + trun_pos));
+                        trun_pos += 4;
+                        has_data_off = true;
+                    }
+                    if (trun_flags & 0x000004) { // first-sample-flags-present
+                        if (trun_pos + 4 > trun->payload_size) return false;
+                        trun_pos += 4;
+                    }
+
+                    uint64_t t_bytes = 0;
+                    for (uint32_t s = 0; s < scount; ++s) {
+                        if (trun_flags & 0x000100) { // duration
+                            if (trun_pos + 4 > trun->payload_size) return false;
+                            trun_pos += 4;
+                        }
+                        if (trun_flags & 0x000200) { // size
+                            if (trun_pos + 4 > trun->payload_size) return false;
+                            uint32_t s_sz = ReadU32BE(trun->payload + trun_pos);
+                            if (s_sz == 0) {
+                                LOG_ERROR << "MP4 validation failed: zero sample size in trun in " << path;
+                                return false;
+                            }
+                            t_bytes += s_sz;
+                            trun_pos += 4;
+                        }
+                        if (trun_flags & 0x000400) { // flags
+                            if (trun_pos + 4 > trun->payload_size) return false;
+                            trun_pos += 4;
+                        }
+                        if (trun_flags & 0x000800) { // composition time offset
+                            if (trun_pos + 4 > trun->payload_size) return false;
+                            trun_pos += 4;
+                        }
+                    }
+
+                    TrafInfo ti;
+                    ti.track_id = t_id;
+                    ti.data_offset = data_off;
+                    ti.has_data_offset = has_data_off;
+                    ti.sample_bytes = t_bytes;
+                    ti.sample_count = scount;
+                    trafs.push_back(ti);
+                    fragment_sample_bytes += t_bytes;
+                }
+            }
+
+            if (trafs.empty()) {
+                LOG_ERROR << "MP4 validation failed: moof contains no valid traf boxes in " << path;
+                return false;
+            }
+
+            // Next box MUST be mdat!
+            uint64_t next_box_offset = moof_offset + moof_size;
+            file.seekg(next_box_offset);
+            BoxHeader mdat_box;
+            if (!ReadBoxHeader(file, file_size, mdat_box) || std::strcmp(mdat_box.type, "mdat") != 0) {
+                LOG_ERROR << "MP4 validation failed: moof is not followed by mdat in " << path;
+                return false;
+            }
+
+            uint64_t mdat_payload_size = mdat_box.size - mdat_box.header_size;
+            if (mdat_payload_size != fragment_sample_bytes) {
+                LOG_ERROR << "MP4 validation failed: mdat payload size (" << mdat_payload_size
+                          << ") does not match sum of trun sample sizes (" << fragment_sample_bytes
+                          << ") in " << path;
+                return false;
+            }
+
+            uint64_t expected_data_off = moof_size + mdat_box.header_size;
+            for (const auto& ti : trafs) {
+                if (ti.has_data_offset) {
+                    if (static_cast<uint64_t>(ti.data_offset) != expected_data_off) {
+                        LOG_ERROR << "MP4 validation failed: trun data_offset " << ti.data_offset
+                                  << " does not point to expected offset " << expected_data_off
+                                  << " in " << path;
+                        return false;
+                    }
+                    expected_data_off += ti.sample_bytes;
+                }
+                total_sample_count += ti.sample_count;
+            }
+
+            fragment_count++;
+            current_pos = mdat_box.offset + mdat_box.size;
+
+        } else if (std::strcmp(box.type, "mfra") == 0) {
+            current_pos = box.offset + box.size;
+        } else {
+            // Permissible top-level boxes: skip, free, void, etc.
+            current_pos = box.offset + box.size;
+        }
+    }
+
+    if (current_pos != file_size) {
+        LOG_ERROR << "MP4 validation failed: trailing unparsed bytes at end of file (parsed "
+                  << current_pos << " of " << file_size << " bytes) in " << path;
         return false;
     }
+
+    if (!found_ftyp || !found_moov) {
+        LOG_ERROR << "MP4 validation failed: missing ftyp or moov box in " << path;
+        return false;
+    }
+
+    if (has_mvex && (fragment_count == 0 || total_sample_count == 0)) {
+        LOG_ERROR << "MP4 validation failed: fragmented MP4 has 0 valid fragments or 0 samples in " << path;
+        return false;
+    }
+
+    LOG_DEBUG << "Deep MP4 validation PASSED for " << path << " ("
+              << fragment_count << " fragments, " << total_sample_count << " samples verified)";
     return true;
 }
 

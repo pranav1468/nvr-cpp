@@ -128,11 +128,18 @@ std::vector<uint8_t> MakePps() {
 }
 
 std::vector<uint8_t> MakeIdrFrame() {
-    return {
+    auto sps = MakeSps1080p();
+    auto pps = MakePps();
+    std::vector<uint8_t> data = sps;
+    data.insert(data.end(), pps.begin(), pps.end());
+    std::vector<uint8_t> idr_slice = {
         0x00, 0x00, 0x00, 0x01,
         0x65, 0x88, 0x84, 0x00, 0x10, 0xff, 0xaa, 0xbb, 0xcc
     };
+    data.insert(data.end(), idr_slice.begin(), idr_slice.end());
+    return data;
 }
+
 
 std::vector<uint8_t> MakeNonIdrFrame() {
     return {
@@ -202,16 +209,38 @@ void RunAtomicWriterTest() {
     assert(meta.file_path.find(".mp4") != std::string::npos);
     assert(!std::filesystem::exists(meta.file_path.substr(0, meta.file_path.size() - 4) + ".tmp"));
 
-    // Verify ISOBMFF header inside generated file
-    std::ifstream mp4_file(meta.file_path, std::ios::binary);
-    assert(mp4_file.is_open());
-    char hdr[8];
-    mp4_file.read(hdr, 8);
-    assert(std::memcmp(hdr + 4, "ftyp", 4) == 0); // Must begin with ftyp box
+    // Verify ISOBMFF header and deep box integrity inside generated file
+    assert(nvr::AtomicWriter::ValidateMp4File(meta.file_path));
+
+    std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path;
+    int probe_res = std::system(probe_cmd.c_str());
+    assert(probe_res == 0);
+
+    // Deep MP4 Validator Negative Tests:
+    // a. Truncated segment (e.g. power-loss or disk full during fragment write)
+    std::string corrupt_trunc = test_dir + "/corrupt_trunc.mp4";
+    {
+        std::ifstream src(meta.file_path, std::ios::binary);
+        std::vector<uint8_t> buffer((std::istreambuf_iterator<char>(src)), std::istreambuf_iterator<char>());
+        assert(buffer.size() > 50);
+        std::ofstream dst(corrupt_trunc, std::ios::binary);
+        dst.write(reinterpret_cast<const char*>(buffer.data()), buffer.size() - 50);
+    }
+    assert(!nvr::AtomicWriter::ValidateMp4File(corrupt_trunc));
+    std::filesystem::remove(corrupt_trunc);
+
+    // b. Non-MP4 garbage payload
+    std::string corrupt_garbage = test_dir + "/corrupt_garbage.mp4";
+    {
+        std::ofstream dst(corrupt_garbage, std::ios::binary);
+        dst << "This is not an ISOBMFF MP4 file, it is plain text content.";
+    }
+    assert(!nvr::AtomicWriter::ValidateMp4File(corrupt_garbage));
+    std::filesystem::remove(corrupt_garbage);
 
     std::cout << "  -> PASSED: In-process MP4 container generated (" 
               << meta.file_size_bytes << " bytes, " << meta.frame_count 
-              << " frames, file: " << meta.file_path << ")." << std::endl;
+              << " frames, file: " << meta.file_path << ") and verified via deep box validator & ffprobe." << std::endl;
 }
 
 void RunSegmenterGopTest() {
