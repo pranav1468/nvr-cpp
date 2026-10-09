@@ -8,6 +8,7 @@
 #include "nvr/recording/atomic_writer.h"
 #include "nvr/recording/recording_scheduler.h"
 #include "nvr/ingress/camera_manager.h"
+#include "nvr/live/live_controller.h"
 #include "3rdparty/nlohmann/json.hpp"
 
 #include <csignal>
@@ -55,6 +56,13 @@ nvr::NvrConfig LoadConfig(const std::string& config_path) {
             if (st.contains("segment_duration_seconds")) config.storage.segment_duration_seconds = st["segment_duration_seconds"];
             if (st.contains("min_free_space_mb")) config.storage.min_free_space_mb = st["min_free_space_mb"];
             if (st.contains("max_retention_days")) config.storage.max_retention_days = st["max_retention_days"];
+        }
+
+        if (j.contains("live")) {
+            auto& lv = j["live"];
+            if (lv.contains("grid_layout")) config.live.grid_layout = lv["grid_layout"];
+            if (lv.contains("max_queue_depth")) config.live.max_queue_depth = lv["max_queue_depth"];
+            if (lv.contains("drop_stale_frames")) config.live.drop_stale_frames = lv["drop_stale_frames"];
         }
 
         if (j.contains("cameras") && j["cameras"].is_array()) {
@@ -136,7 +144,20 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    LOG_INFO << "NVR Recording Pipeline initialized and operational.";
+    // Initialize Live View Pipeline
+    nvr::LiveController::Instance().Configure(config.live);
+    if (config.live.grid_layout == 1) {
+        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::SINGLE);
+    } else if (config.live.grid_layout == 6) {
+        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_6);
+    } else if (config.live.grid_layout == 8) {
+        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_8);
+    } else {
+        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_4);
+    }
+    nvr::LiveController::Instance().Start();
+
+    LOG_INFO << "NVR Recording and Live View Pipelines initialized and operational.";
 
     // Supervisor Telemetry Loop
     int loop_counter = 0;
@@ -169,10 +190,13 @@ int main(int argc, char* argv[]) {
 
     LOG_INFO << "Shutting down NVR subsystems gracefully...";
 
-    // 1. Stop Camera Ingress
+    // 1. Stop Live View Pipeline
+    nvr::LiveController::Instance().Stop();
+
+    // 2. Stop Camera Ingress
     nvr::CameraManager::Instance().StopAll();
 
-    // 2. Flush and Finalize Recording Segments
+    // 3. Flush and Finalize Recording Segments
     nvr::RecordingScheduler::Instance().StopAll();
 
     // 3. Stop Retention Manager

@@ -6,6 +6,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 
 namespace nvr {
 
@@ -46,6 +47,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<SessionState> state_{SessionState::DISCONNECTED};
     std::thread worker_thread_;
+    std::mutex stop_mutex_;
+    std::condition_variable stop_cv_;
 
     int sock_fd_{-1};
     int cseq_{1};

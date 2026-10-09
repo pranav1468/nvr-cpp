@@ -97,6 +97,10 @@ void StreamSession::Stop() {
     if (!running_.exchange(false)) {
         return;
     }
+    {
+        std::lock_guard<std::mutex> lock(stop_mutex_);
+        stop_cv_.notify_all();
+    }
     DisconnectSocket();
     if (worker_thread_.joinable()) {
         worker_thread_.join();
@@ -201,8 +205,14 @@ bool StreamSession::ConnectSocket() {
         struct pollfd pfd{};
         pfd.fd = sock_fd_;
         pfd.events = POLLOUT;
-        int poll_ret = poll(&pfd, 1, 4000); // 4.0s timeout
-        if (poll_ret <= 0) {
+        int poll_ret = 0;
+        int waited = 0;
+        while (running_ && waited < 4000) {
+            poll_ret = poll(&pfd, 1, 100);
+            if (poll_ret != 0) break;
+            waited += 100;
+        }
+        if (!running_ || poll_ret <= 0) {
             DisconnectSocket();
             return false;
         }
@@ -232,6 +242,7 @@ bool StreamSession::ConnectSocket() {
 
 void StreamSession::DisconnectSocket() {
     if (sock_fd_ >= 0) {
+        shutdown(sock_fd_, SHUT_RDWR);
         close(sock_fd_);
         sock_fd_ = -1;
     }
@@ -589,8 +600,11 @@ void StreamSession::WorkerLoop() {
                      << backoff_sec << "s...";
             state_ = SessionState::ERROR_BACKOFF;
             DisconnectSocket();
-            for (int i = 0; i < backoff_sec * 10 && running_; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            {
+                std::unique_lock<std::mutex> lock(stop_mutex_);
+                stop_cv_.wait_for(lock, std::chrono::seconds(backoff_sec), [this] {
+                    return !running_.load();
+                });
             }
             backoff_sec = std::min(backoff_sec * 2, 30);
             continue;

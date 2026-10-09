@@ -129,7 +129,11 @@ Feeds decoded video frames to the screen smoothly and without latency.
 
 | File Path | What It Does (In Plain English) | Why We Need It |
 | :--- | :--- | :--- |
+| `include/nvr/live/live_controller.h`<br>`src/live/live_controller.cpp` | Live grid and fullscreen manager. | Coordinates 1/4/6/8-camera views and switches to 1080p single-camera fullscreen, reusing existing recording sessions without redundant connections. |
 | `include/nvr/live/live_queue.h`<br>`src/live/live_queue.cpp` | Real-time video frame queue. | Holds frames ready for display. If the screen is slow, it drops older frames ("head-drop") so live video **never falls behind real time**. |
+| `include/nvr/live/display_backend.h` | Decoupled display output interface. | Renders decoded video frames to screen or headless virtual frames without depending on a physical monitor. |
+| `include/nvr/live/qml_video_bridge.h`<br>`src/live/qml_video_bridge.cpp` | High-speed C++ to Qt/QML bridge. | Delivers rendered video frames and JSON state to Qt Quick surveillance tiles with zero frame stutter. |
+| `ui/VideoTile.qml`<br>`ui/LiveGrid.qml` | Surveillance grid UI components. | Renders surveillance video tiles with status badges (REC, MAIN/SUB, FPS, drops) and handles double-click fullscreen toggles. |
 
 ---
 
@@ -338,16 +342,14 @@ Sent to UI Video Surface -> Screen shows recorded video
 ## How to Build and Run the Backend
 
 ```bash
-# 1. Create a build directory
-mkdir build
-cd build
-
-# 2. Configure with CMake
-cmake ..
-
-# 3. Compile
+# 1. Compile with Makefile or CMake
 make -j$(nproc)
 
-# 4. Start the backend service
-./nvr_server
+# 2. Run automated test suites
+./bin/test_recording_pipeline
+./bin/test_live_pipeline
+
+# 3. Start the backend service
+./bin/nvr_server
 ```
+

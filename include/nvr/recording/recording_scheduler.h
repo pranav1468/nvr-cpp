@@ -22,6 +22,7 @@ public:
     void StopAll();
 
     bool IsChannelRecording(int channel_id) const;
+    bool IsChannelActive(int channel_id) const;
 
     uint32_t GetChannelFrameCount(int channel_id) const;
     uint64_t GetChannelBytesWritten(int channel_id) const;

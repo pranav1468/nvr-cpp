@@ -91,6 +91,11 @@ bool RecordingScheduler::IsChannelRecording(int channel_id) const {
     return (it != channels_.end() && it->second.segmenter && it->second.segmenter->IsRecording());
 }
 
+bool RecordingScheduler::IsChannelActive(int channel_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return channels_.find(channel_id) != channels_.end();
+}
+
 uint32_t RecordingScheduler::GetChannelFrameCount(int channel_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = channels_.find(channel_id);

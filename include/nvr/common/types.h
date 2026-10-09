@@ -100,6 +100,52 @@ struct MediaPacket {
 
 using MediaPacketPtr = std::shared_ptr<MediaPacket>;
 
+enum class PixelFormat {
+    NV12 = 0,
+    YUV420P,
+    RGB24,
+    RGBA32,
+    UNKNOWN
+};
+
+inline const char* PixelFormatToString(PixelFormat fmt) {
+    switch (fmt) {
+        case PixelFormat::NV12:    return "NV12";
+        case PixelFormat::YUV420P: return "YUV420P";
+        case PixelFormat::RGB24:   return "RGB24";
+        case PixelFormat::RGBA32:  return "RGBA32";
+        default:                   return "UNKNOWN";
+    }
+}
+
+enum class LiveGridLayout {
+    SINGLE = 1,
+    GRID_4 = 4,
+    GRID_6 = 6,
+    GRID_8 = 8,
+    FULLSCREEN = 100
+};
+
+struct DecodedFrame {
+    int channel_id{0};
+    StreamType stream_type{StreamType::SUB};
+    uint32_t width{0};
+    uint32_t height{0};
+    uint32_t stride{0};
+    PixelFormat format{PixelFormat::NV12};
+    int64_t pts_us{0};
+    int64_t wall_time_ms{0};
+    uint64_t frame_index{0};
+    std::vector<uint8_t> data;
+    int dmabuf_fd{-1};
+
+    size_t GetSizeBytes() const {
+        return data.size();
+    }
+};
+
+using DecodedFramePtr = std::shared_ptr<DecodedFrame>;
+
 struct CameraConfig {
     int id{0};
     std::string name;

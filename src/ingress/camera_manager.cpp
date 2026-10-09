@@ -43,6 +43,9 @@ bool CameraManager::RemoveCamera(int channel_id) {
         if (it->second.main_session) {
             it->second.main_session->Stop();
         }
+        if (it->second.sub_session) {
+            it->second.sub_session->Stop();
+        }
         cameras_.erase(it);
         LOG_INFO << "[Channel " << channel_id << "] Removed camera";
         return true;
@@ -82,6 +85,66 @@ void CameraManager::StopCamera(int channel_id) {
     }
 }
 
+bool CameraManager::StartSubStream(int channel_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = cameras_.find(channel_id);
+    if (it == cameras_.end()) {
+        return false;
+    }
+
+    std::string sub_url = it->second.config.sub_rtsp_url;
+    if (sub_url.empty()) {
+        sub_url = it->second.config.rtsp_url;
+    }
+    if (sub_url.empty()) {
+        LOG_WARN << "[Channel " << channel_id << "] No RTSP URL available for SUB stream";
+        return false;
+    }
+
+    if (!it->second.sub_session) {
+        it->second.sub_session = std::make_unique<StreamSession>(
+            channel_id,
+            StreamType::SUB,
+            sub_url
+        );
+    }
+
+    it->second.sub_session->Start();
+    return true;
+}
+
+void CameraManager::StopSubStream(int channel_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = cameras_.find(channel_id);
+    if (it != cameras_.end() && it->second.sub_session) {
+        it->second.sub_session->Stop();
+    }
+}
+
+bool CameraManager::EnsureMainStream(int channel_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = cameras_.find(channel_id);
+    if (it == cameras_.end()) {
+        return false;
+    }
+    if (it->second.main_session && it->second.main_session->IsConnected()) {
+        // Reused existing active MAIN session without duplicating connections
+        return true;
+    }
+    if (!it->second.main_session) {
+        if (it->second.config.rtsp_url.empty()) {
+            return false;
+        }
+        it->second.main_session = std::make_unique<StreamSession>(
+            channel_id,
+            StreamType::MAIN,
+            it->second.config.rtsp_url
+        );
+    }
+    it->second.main_session->Start();
+    return true;
+}
+
 void CameraManager::StartAll() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [id, entry] : cameras_) {
@@ -104,6 +167,9 @@ void CameraManager::StopAll() {
         if (entry.main_session) {
             entry.main_session->Stop();
         }
+        if (entry.sub_session) {
+            entry.sub_session->Stop();
+        }
     }
 }
 
@@ -111,6 +177,17 @@ bool CameraManager::IsCameraOnline(int channel_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cameras_.find(channel_id);
     return (it != cameras_.end() && it->second.main_session && it->second.main_session->IsConnected());
+}
+
+bool CameraManager::IsSubStreamOnline(int channel_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = cameras_.find(channel_id);
+    return (it != cameras_.end() && it->second.sub_session && it->second.sub_session->IsConnected());
+}
+
+bool CameraManager::HasCamera(int channel_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cameras_.find(channel_id) != cameras_.end();
 }
 
 std::vector<CameraConfig> CameraManager::GetCameras() const {

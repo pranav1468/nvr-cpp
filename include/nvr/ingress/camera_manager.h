@@ -21,10 +21,17 @@ public:
     bool StartCamera(int channel_id);
     void StopCamera(int channel_id);
 
+    bool StartSubStream(int channel_id);
+    void StopSubStream(int channel_id);
+
+    bool EnsureMainStream(int channel_id);
+
     void StartAll();
     void StopAll();
 
     bool IsCameraOnline(int channel_id) const;
+    bool IsSubStreamOnline(int channel_id) const;
+    bool HasCamera(int channel_id) const;
     std::vector<CameraConfig> GetCameras() const;
 
 private:
@@ -36,6 +43,7 @@ private:
     struct CameraEntry {
         CameraConfig config;
         std::unique_ptr<StreamSession> main_session;
+        std::unique_ptr<StreamSession> sub_session;
     };
 
     mutable std::mutex mutex_;

@@ -28,12 +28,18 @@ set(CORE_SOURCES
     src/storage/segment_index.cpp
     src/storage/retention_manager.cpp
     src/media/stream_broker.cpp
+    src/media/buffer_allocator.cpp
+    src/media/video_decoder.cpp
+    src/media/video_scaler.cpp
     src/recording/atomic_writer.cpp
     src/recording/segmenter.cpp
     src/recording/recording_scheduler.cpp
     src/ingress/rtp_depacketizer.cpp
     src/ingress/stream_session.cpp
     src/ingress/camera_manager.cpp
+    src/live/live_queue.cpp
+    src/live/live_controller.cpp
+    src/live/qml_video_bridge.cpp
 )
 
 # Core static library
@@ -51,3 +57,6 @@ target_link_libraries(nvr_server PRIVATE nvr_core)
 # Automated test executable
 add_executable(test_recording_pipeline tests/test_recording_pipeline.cpp)
 target_link_libraries(test_recording_pipeline PRIVATE nvr_core)
+
+add_executable(test_live_pipeline tests/test_live_pipeline.cpp)
+target_link_libraries(test_live_pipeline PRIVATE nvr_core)
