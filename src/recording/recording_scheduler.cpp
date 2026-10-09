@@ -451,10 +451,10 @@ void RecordingScheduler::ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> s
                 // Pruning discards complete expired GOPs up to the next IDR keyframe
                 auto calc_duration_ms = [&]() -> int64_t {
                     if (state->preroll_buffer.empty()) return 0;
-                    if (state->preroll_buffer.back()->pts_us > 0 && state->preroll_buffer.front()->pts_us > 0) {
+                    if (state->preroll_buffer.back()->pts_us >= 0 && state->preroll_buffer.front()->pts_us >= 0) {
                         return (state->preroll_buffer.back()->pts_us - state->preroll_buffer.front()->pts_us) / 1000;
                     }
-                    if (state->preroll_buffer.back()->wall_time_ms > 0 && state->preroll_buffer.front()->wall_time_ms > 0) {
+                    if (state->preroll_buffer.back()->wall_time_ms >= 0 && state->preroll_buffer.front()->wall_time_ms >= 0) {
                         return state->preroll_buffer.back()->wall_time_ms - state->preroll_buffer.front()->wall_time_ms;
                     }
                     return 0;

@@ -85,6 +85,8 @@ struct MediaPacket {
     int64_t dts_us{0};
     int64_t wall_time_ms{0};
     uint16_t sequence_number{0};
+    uint32_t sample_rate{0};
+    uint8_t channels{0};
     std::vector<uint8_t> data;
 
     bool IsAudio() const {

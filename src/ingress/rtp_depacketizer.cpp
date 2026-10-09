@@ -371,6 +371,7 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
     packet->rtp_timestamp = rtp_timestamp;
     packet->sequence_number = seq_num;
     packet->wall_time_ms = time_utils::WallTimeMs();
+    packet->sample_rate = (packet->IsAudio() && clock_rate_ > 0) ? clock_rate_ : 0;
 
     // Convert RTP timestamp to microseconds with seamless 32-bit wrap unrolling
     if (!has_base_pts_) {

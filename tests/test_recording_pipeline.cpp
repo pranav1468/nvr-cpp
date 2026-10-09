@@ -672,7 +672,9 @@ void RunMotionAndScheduleTest() {
         delta->data = MakeNonIdrFrame();
         sched.EnqueuePacket(7, delta);
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    for (int r = 0; r < 20 && sched.GetChannelPrerollPacketCount(7) < 4; ++r) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     assert(sched.GetChannelPrerollPacketCount(7) == 4);
 
     // 3. Push GOP 2: KF at pts = 1000 ms, 2 delta frames up to pts = 1200 ms
@@ -697,7 +699,9 @@ void RunMotionAndScheduleTest() {
         delta->data = MakeNonIdrFrame();
         sched.EnqueuePacket(7, delta);
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    for (int r = 0; r < 20 && sched.GetChannelPrerollPacketCount(7) < 7; ++r) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     assert(sched.GetChannelPrerollPacketCount(7) == 7); // 4 + 3 = 7
 
     // 4. Push GOP 3: KF at pts = 2500 ms (exceeds 2.0s duration from GOP 1 at 0 ms!)
@@ -711,7 +715,9 @@ void RunMotionAndScheduleTest() {
     kf3->data = MakeIdrFrame();
     sched.EnqueuePacket(7, kf3);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    for (int r = 0; r < 20 && sched.GetChannelPrerollPacketCount(7) != 4; ++r) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     // GOP 1 (4 packets) must have been evicted as a complete chunk.
     // Remaining in buffer: GOP 2 (3 packets) + GOP 3 (1 packet) = 4 packets.
     assert(sched.GetChannelPrerollPacketCount(7) == 4);
@@ -729,7 +735,9 @@ void RunMotionAndScheduleTest() {
     motion_delta->data = MakeNonIdrFrame();
     sched.EnqueuePacket(7, motion_delta);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    for (int r = 0; r < 20 && !sched.IsChannelRecording(7); ++r) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     assert(sched.IsChannelRecording(7));
     // Preroll buffer was flushed into segmenter on motion activation
     assert(sched.GetChannelPrerollPacketCount(7) == 0);
@@ -830,6 +838,322 @@ void RunQueueOverflowGopRecoveryTest() {
               << drops << " drops) & GOP keyframe recovery verified." << std::endl;
 }
 
+std::vector<uint8_t> MakeAacAdtsPacket48kStereo() {
+    return {
+        0xFF, 0xF1, 0x4C, 0x80, 0x02, 0x3F, 0xFC,
+        0x21, 0x00, 0x49, 0x90, 0x02, 0x19, 0x00, 0x23, 0x80, 0x04
+    };
+}
+
+std::vector<uint8_t> MakeAacAdtsPacket44kMono() {
+    return {
+        0xFF, 0xF1, 0x50, 0x40, 0x02, 0x3F, 0xFC,
+        0x21, 0x00, 0x49, 0x90, 0x02, 0x19, 0x00, 0x23, 0x80, 0x04
+    };
+}
+
+std::vector<uint8_t> MakeG711Packet(size_t num_bytes, uint8_t sample_val = 0xD5) {
+    return std::vector<uint8_t>(num_bytes, sample_val);
+}
+
+void RunAudioVideoSyncAndFormatTest() {
+    std::cout << "[TEST 9] Running Real-Stream AV Sync, Dynamic Audio & Stall Recovery Tests..." << std::endl;
+    std::string test_dir = "./test_recordings";
+
+    // Sub-test 1: AAC 48kHz Stereo Muxed with H.264
+    {
+        nvr::AtomicWriter writer(10, test_dir);
+        assert(writer.StartSegment(1700000000000LL));
+
+        // Video IDR keyframe
+        auto idr = std::make_shared<nvr::MediaPacket>();
+        idr->channel_id = 10;
+        idr->codec = nvr::CodecType::H264;
+        idr->is_keyframe = true;
+        idr->pts_us = 0;
+        idr->data = MakeIdrFrame();
+        writer.WritePacket(idr);
+
+        // 30 frames of video interleaved with 48kHz AAC (ADTS stereo)
+        for (int i = 1; i <= 30; ++i) {
+            auto a_pkt = std::make_shared<nvr::MediaPacket>();
+            a_pkt->channel_id = 10;
+            a_pkt->codec = nvr::CodecType::AAC;
+            a_pkt->media_type = nvr::MediaType::AUDIO;
+            a_pkt->pts_us = static_cast<int64_t>(i) * 21333LL; // ~1024 samples at 48kHz
+            a_pkt->data = MakeAacAdtsPacket48kStereo();
+            writer.WritePacket(a_pkt);
+
+            auto v_pkt = std::make_shared<nvr::MediaPacket>();
+            v_pkt->channel_id = 10;
+            v_pkt->codec = nvr::CodecType::H264;
+            v_pkt->is_keyframe = false;
+            v_pkt->pts_us = static_cast<int64_t>(i) * 40000LL; // 25 fps
+            v_pkt->data = MakeNonIdrFrame();
+            writer.WritePacket(v_pkt);
+        }
+
+        nvr::SegmentMetadata meta;
+        assert(writer.FinalizeSegment(meta));
+        assert(meta.has_audio);
+        assert(meta.audio_codec == nvr::CodecType::AAC);
+        assert(meta.audio_sample_rate == 48000);
+        assert(meta.audio_channels == 2);
+        assert(nvr::AtomicWriter::ValidateMp4File(meta.file_path));
+
+        std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
+        assert(std::system(probe_cmd.c_str()) == 0);
+    }
+
+    // Sub-test 1b: AAC 44.1kHz Mono Muxed with H.264
+    {
+        nvr::AtomicWriter writer(14, test_dir);
+        assert(writer.StartSegment(1700000005000LL));
+
+        auto idr = std::make_shared<nvr::MediaPacket>();
+        idr->channel_id = 14;
+        idr->codec = nvr::CodecType::H264;
+        idr->is_keyframe = true;
+        idr->pts_us = 0;
+        idr->data = MakeIdrFrame();
+        writer.WritePacket(idr);
+
+        for (int i = 1; i <= 20; ++i) {
+            auto a_pkt = std::make_shared<nvr::MediaPacket>();
+            a_pkt->channel_id = 14;
+            a_pkt->codec = nvr::CodecType::AAC;
+            a_pkt->media_type = nvr::MediaType::AUDIO;
+            a_pkt->pts_us = static_cast<int64_t>(i) * 23220LL; // ~1024 samples at 44.1kHz
+            a_pkt->data = MakeAacAdtsPacket44kMono();
+            writer.WritePacket(a_pkt);
+
+            auto v_pkt = std::make_shared<nvr::MediaPacket>();
+            v_pkt->channel_id = 14;
+            v_pkt->codec = nvr::CodecType::H264;
+            v_pkt->is_keyframe = false;
+            v_pkt->pts_us = static_cast<int64_t>(i) * 40000LL;
+            v_pkt->data = MakeNonIdrFrame();
+            writer.WritePacket(v_pkt);
+        }
+
+        nvr::SegmentMetadata meta;
+        assert(writer.FinalizeSegment(meta));
+        assert(meta.has_audio);
+        assert(meta.audio_codec == nvr::CodecType::AAC);
+        assert(meta.audio_sample_rate == 44100);
+        assert(meta.audio_channels == 1);
+        assert(nvr::AtomicWriter::ValidateMp4File(meta.file_path));
+
+        std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
+        assert(std::system(probe_cmd.c_str()) == 0);
+    }
+
+    // Sub-test 2: G.711 PCMA with Non-Standard Packetization (80B, 160B, 320B)
+    {
+        nvr::AtomicWriter writer(11, test_dir);
+        assert(writer.StartSegment(1700000010000LL));
+
+        auto idr = std::make_shared<nvr::MediaPacket>();
+        idr->channel_id = 11;
+        idr->codec = nvr::CodecType::H264;
+        idr->is_keyframe = true;
+        idr->pts_us = 0;
+        idr->data = MakeIdrFrame();
+        writer.WritePacket(idr);
+
+        // Send 10ms (80B), 20ms (160B), and 40ms (320B) packets
+        int64_t audio_pts = 0;
+        for (int i = 0; i < 30; ++i) {
+            size_t pkt_len = (i % 3 == 0) ? 80 : ((i % 3 == 1) ? 160 : 320);
+            int64_t dur_us = (static_cast<int64_t>(pkt_len) * 1000000LL) / 8000LL;
+
+            auto a_pkt = std::make_shared<nvr::MediaPacket>();
+            a_pkt->channel_id = 11;
+            a_pkt->codec = nvr::CodecType::PCMA;
+            a_pkt->media_type = nvr::MediaType::AUDIO;
+            a_pkt->pts_us = audio_pts;
+            a_pkt->data = MakeG711Packet(pkt_len);
+            writer.WritePacket(a_pkt);
+            audio_pts += dur_us;
+
+            auto v_pkt = std::make_shared<nvr::MediaPacket>();
+            v_pkt->channel_id = 11;
+            v_pkt->codec = nvr::CodecType::H264;
+            v_pkt->is_keyframe = false;
+            v_pkt->pts_us = static_cast<int64_t>(i + 1) * 40000LL;
+            v_pkt->data = MakeNonIdrFrame();
+            writer.WritePacket(v_pkt);
+        }
+
+        nvr::SegmentMetadata meta;
+        assert(writer.FinalizeSegment(meta));
+        assert(meta.has_audio);
+        assert(meta.audio_codec == nvr::CodecType::PCMA);
+        assert(meta.audio_sample_rate == 8000);
+        assert(meta.audio_channels == 1);
+        assert(nvr::AtomicWriter::ValidateMp4File(meta.file_path));
+
+        std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
+        assert(std::system(probe_cmd.c_str()) == 0);
+    }
+
+    // Sub-test 3: Audio-First Ingress (Audio Active Before Video) & Audio-Last (Audio Outlives Video)
+    {
+        nvr::AtomicWriter writer(12, test_dir);
+        assert(writer.StartSegment(1700000020000LL));
+
+        // 1. Audio active before video: 5 audio packets starting at PTS = 1,000,000 us (0 to 100 ms)
+        for (int i = 0; i < 5; ++i) {
+            auto a_pkt = std::make_shared<nvr::MediaPacket>();
+            a_pkt->channel_id = 12;
+            a_pkt->codec = nvr::CodecType::AAC;
+            a_pkt->media_type = nvr::MediaType::AUDIO;
+            a_pkt->pts_us = 1000000LL + i * 21333LL;
+            a_pkt->data = MakeAacAdtsPacket48kStereo();
+            writer.WritePacket(a_pkt);
+        }
+
+        // 2. Video begins 100ms later at PTS = 1,100,000 us
+        auto idr = std::make_shared<nvr::MediaPacket>();
+        idr->channel_id = 12;
+        idr->codec = nvr::CodecType::H264;
+        idr->is_keyframe = true;
+        idr->pts_us = 1100000LL;
+        idr->data = MakeIdrFrame();
+        writer.WritePacket(idr);
+
+        // 3. Interleaved video & audio for ~500ms
+        for (int i = 1; i <= 20; ++i) {
+            auto v_pkt = std::make_shared<nvr::MediaPacket>();
+            v_pkt->channel_id = 12;
+            v_pkt->codec = nvr::CodecType::H264;
+            v_pkt->is_keyframe = false;
+            v_pkt->pts_us = 1100000LL + i * 40000LL;
+            v_pkt->data = MakeNonIdrFrame();
+            writer.WritePacket(v_pkt);
+
+            auto a_pkt = std::make_shared<nvr::MediaPacket>();
+            a_pkt->channel_id = 12;
+            a_pkt->codec = nvr::CodecType::AAC;
+            a_pkt->media_type = nvr::MediaType::AUDIO;
+            a_pkt->pts_us = 1100000LL + i * 21333LL;
+            a_pkt->data = MakeAacAdtsPacket48kStereo();
+            writer.WritePacket(a_pkt);
+        }
+
+        // 4. Video stops at PTS = 1,900,000 us; Audio continues for another 300ms up to 2,200,000 us
+        for (int i = 0; i < 15; ++i) {
+            auto a_pkt = std::make_shared<nvr::MediaPacket>();
+            a_pkt->channel_id = 12;
+            a_pkt->codec = nvr::CodecType::AAC;
+            a_pkt->media_type = nvr::MediaType::AUDIO;
+            a_pkt->pts_us = 1900000LL + i * 21333LL;
+            a_pkt->data = MakeAacAdtsPacket48kStereo();
+            writer.WritePacket(a_pkt);
+        }
+
+        nvr::SegmentMetadata meta;
+        assert(writer.FinalizeSegment(meta));
+        assert(meta.has_audio);
+        // Duration should cover the audio end timestamp (~1200 ms from 1.0s to 2.2s)
+        assert(meta.duration_ms >= 1100 && meta.duration_ms <= 1300);
+        assert(nvr::AtomicWriter::ValidateMp4File(meta.file_path));
+
+        std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
+        assert(std::system(probe_cmd.c_str()) == 0);
+    }
+
+    // Sub-test 4: Network Stall (2.0s Gap) & Timestamp Discontinuity Recovery
+    {
+        nvr::AtomicWriter writer(13, test_dir);
+        assert(writer.StartSegment(1700000030000LL));
+
+        // Initial 25 frames
+        auto idr = std::make_shared<nvr::MediaPacket>();
+        idr->channel_id = 13;
+        idr->codec = nvr::CodecType::H264;
+        idr->is_keyframe = true;
+        idr->pts_us = 0;
+        idr->data = MakeIdrFrame();
+        writer.WritePacket(idr);
+
+        for (int i = 1; i <= 25; ++i) {
+            auto v_pkt = std::make_shared<nvr::MediaPacket>();
+            v_pkt->channel_id = 13;
+            v_pkt->codec = nvr::CodecType::H264;
+            v_pkt->is_keyframe = false;
+            v_pkt->pts_us = i * 40000LL;
+            v_pkt->data = MakeNonIdrFrame();
+            writer.WritePacket(v_pkt);
+
+            auto a_pkt = std::make_shared<nvr::MediaPacket>();
+            a_pkt->channel_id = 13;
+            a_pkt->codec = nvr::CodecType::PCMU;
+            a_pkt->media_type = nvr::MediaType::AUDIO;
+            a_pkt->pts_us = i * 40000LL;
+            a_pkt->data = MakeG711Packet(320); // 40ms at 8kHz
+            writer.WritePacket(a_pkt);
+        }
+
+        // Network stall: 2.0-second silence / gap! PTS jumps from 1,000,000 to 3,000,000 us
+        int64_t resume_pts = 3000000LL;
+        auto idr_resume = std::make_shared<nvr::MediaPacket>();
+        idr_resume->channel_id = 13;
+        idr_resume->codec = nvr::CodecType::H264;
+        idr_resume->is_keyframe = true;
+        idr_resume->pts_us = resume_pts;
+        idr_resume->data = MakeIdrFrame();
+        writer.WritePacket(idr_resume);
+
+        auto a_resume = std::make_shared<nvr::MediaPacket>();
+        a_resume->channel_id = 13;
+        a_resume->codec = nvr::CodecType::PCMU;
+        a_resume->media_type = nvr::MediaType::AUDIO;
+        a_resume->pts_us = resume_pts;
+        a_resume->data = MakeG711Packet(320);
+        writer.WritePacket(a_resume);
+
+        // Inject timestamp jitter / backwards discontinuity
+        auto a_jitter = std::make_shared<nvr::MediaPacket>();
+        a_jitter->channel_id = 13;
+        a_jitter->codec = nvr::CodecType::PCMU;
+        a_jitter->media_type = nvr::MediaType::AUDIO;
+        a_jitter->pts_us = resume_pts - 10000LL; // 10ms backward jitter
+        a_jitter->data = MakeG711Packet(320);
+        writer.WritePacket(a_jitter);
+
+        // Send remaining frames
+        for (int i = 1; i <= 25; ++i) {
+            auto v_pkt = std::make_shared<nvr::MediaPacket>();
+            v_pkt->channel_id = 13;
+            v_pkt->codec = nvr::CodecType::H264;
+            v_pkt->is_keyframe = false;
+            v_pkt->pts_us = resume_pts + i * 40000LL;
+            v_pkt->data = MakeNonIdrFrame();
+            writer.WritePacket(v_pkt);
+
+            auto a_pkt = std::make_shared<nvr::MediaPacket>();
+            a_pkt->channel_id = 13;
+            a_pkt->codec = nvr::CodecType::PCMU;
+            a_pkt->media_type = nvr::MediaType::AUDIO;
+            a_pkt->pts_us = resume_pts + i * 40000LL;
+            a_pkt->data = MakeG711Packet(320);
+            writer.WritePacket(a_pkt);
+        }
+
+        nvr::SegmentMetadata meta;
+        assert(writer.FinalizeSegment(meta));
+        assert(meta.has_audio);
+        assert(meta.audio_codec == nvr::CodecType::PCMU);
+        assert(nvr::AtomicWriter::ValidateMp4File(meta.file_path));
+
+        std::string probe_cmd = "ffprobe -v error -show_format -show_streams " + meta.file_path + " > /dev/null 2>&1";
+        assert(std::system(probe_cmd.c_str()) == 0);
+    }
+
+    std::cout << "  -> PASSED: Real-stream AV sync, dynamic AAC/G.711, stall & discontinuity recovery verified." << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -849,6 +1173,7 @@ int main() {
         RunDigestAuthAndIPv6Test();
         RunMotionAndScheduleTest();
         RunQueueOverflowGopRecoveryTest();
+        RunAudioVideoSyncAndFormatTest();
 
         std::filesystem::remove_all("./test_recordings");
 
