@@ -39,17 +39,30 @@ void TestBufferAllocator() {
     assert(total_sub_8_q2 < 6 * 1024 * 1024); // Must remain <= 5.3 MB
 
     // 2. Validate memory buffer pooling and recycling (zero memory drift)
+    // and validate strict 64-byte memory pointer alignment for both fresh and pooled buffers
     auto buf1 = allocator.Allocate(surface_sub);
     assert(buf1.size() == surface_sub);
+    assert(buf1.data() != nullptr);
+    assert(reinterpret_cast<uintptr_t>(buf1.data()) % 64 == 0);
     allocator.Release(std::move(buf1));
     assert(allocator.GetPoolCount() == 1);
 
     auto buf2 = allocator.Allocate(surface_sub);
     assert(buf2.size() == surface_sub);
+    assert(buf2.data() != nullptr);
+    assert(reinterpret_cast<uintptr_t>(buf2.data()) % 64 == 0);
     assert(allocator.GetPoolCount() == 0); // Reused from pool!
     allocator.Release(std::move(buf2));
 
-    std::cout << "  -> PASSED: BufferAllocator pooling & 64-byte stride mathematics verified." << std::endl;
+    // Verify 64-byte pointer alignment across various surface sizes
+    for (size_t test_sz : {137, 1024, 1920 * 1080 * 3 / 2, 640 * 360 * 4}) {
+        auto b = allocator.Allocate(test_sz);
+        assert(b.data() != nullptr);
+        assert(reinterpret_cast<uintptr_t>(b.data()) % 64 == 0);
+        allocator.Release(std::move(b));
+    }
+
+    std::cout << "  -> PASSED: BufferAllocator pooling & 64-byte stride & pointer alignment verified." << std::endl;
 }
 
 void TestVideoDecoderAndScaler() {

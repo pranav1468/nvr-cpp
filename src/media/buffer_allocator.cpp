@@ -35,6 +35,7 @@ AlignedByteBuffer BufferAllocator::Allocate(size_t size) {
     }
 
     AlignedByteBuffer buf;
+    buf.reserve(aligned_size);
     buf.resize(size);
     return buf;
 }

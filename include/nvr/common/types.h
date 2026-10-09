@@ -143,6 +143,8 @@ public:
 
     T* allocate(size_t n) {
         if (n == 0) return nullptr;
+        static_assert((Alignment & (Alignment - 1)) == 0, "Alignment must be a power of 2");
+        static_assert(Alignment >= sizeof(void*), "Alignment must be at least sizeof(void*)");
         void* ptr = nullptr;
         size_t bytes = n * sizeof(T);
         if (posix_memalign(&ptr, Alignment, bytes) != 0) {

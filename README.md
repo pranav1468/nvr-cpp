@@ -8,8 +8,8 @@ Welcome to the backend engine for the Network Video Recorder (NVR). This C++ ser
 
 The backend has four main jobs:
 1. **Connects to IP Cameras:** Pulls video streams from up to 8 cameras over the local network using RTSP.
-2. **Records Without Lag:** Saves video straight to the hard drive in compressed format (zero re-encoding), so CPU usage stays below 50%.
-3. **Hardware Decoding & AI:** Decodes low-resolution video using hardware chips to show live video on screen and runs AI detection (person/vehicle) on the hardware NPU.
+2. **Zero-Transcoding Recording:** Streams compressed H.264/H.265 bitstreams directly to disk in atomic MP4 segments without decoding or re-encoding, keeping background CPU overhead minimal.
+3. **Low-Resolution Live View & AI Offload:** Decodes low-resolution SUB streams (via V4L2 hardware VPU or libavcodec fallback) for the live surveillance grid, and schedules AI inference on the dedicated NPU.
 4. **Responds to the Frontend:** Listens for commands from the UI (like "show camera 1" or "find recordings from 2 PM") and sends back video and data.
 
 ```
@@ -107,9 +107,9 @@ Takes incoming video, splits it into multiple destinations, and decodes it witho
 | File Path | What It Does (In Plain English) | Why We Need It |
 | :--- | :--- | :--- |
 | `include/nvr/media/stream_broker.h`<br>`src/media/stream_broker.cpp` | The central video splitter in memory. | Takes a single incoming camera stream and delivers copies to recording, live display, and AI simultaneously without extra network traffic. |
-| `include/nvr/media/video_decoder.h`<br>`src/media/video_decoder.cpp` | Hardware video decoder chip driver. | Uses the board's hardware chip (V4L2) to decode compressed video into picture frames for the monitor without making the CPU hot. |
-| `include/nvr/media/video_scaler.h`<br>`src/media/video_scaler.cpp` | Hardware image resizer and format converter. | Shrinks or stretches video frames to fit different screen grid sizes ($1\times 1$, $2\times 2$, $2\times 4$). |
-| `include/nvr/media/buffer_allocator.h`<br>`src/media/buffer_allocator.cpp` | Video memory manager (DMA-BUF). | Lets the camera, decoder, screen, and AI share the exact same video memory with zero copying, saving memory bandwidth. |
+| `include/nvr/media/video_decoder.h`<br>`src/media/video_decoder.cpp` | Dual-engine video decoder (V4L2 hardware & FFmpeg fallback). | Probes Linux V4L2 M2M hardware decoder devices (`/dev/video*`) for board-level VPU offload, with automatic fallback to standard FFmpeg (`libavcodec`) on host or unsupported environments. |
+| `include/nvr/media/video_scaler.h`<br>`src/media/video_scaler.cpp` | Multi-format video scaler & color converter. | Converts and scales video frames (NV12 $\to$ RGBA32/RGB24/NV12) for surveillance grid layouts ($1\times 1$, $2\times 2$, $3\times 3$) using optimized fixed-point pixel mapping, ready for hardware 2D accelerator (PXP/G2D) hooks. |
+| `include/nvr/media/buffer_allocator.h`<br>`src/media/buffer_allocator.cpp` | 64-byte aligned surface memory manager. | Manages recycled memory pools with strict 64-byte pointer alignment and VPU stride calculation, bounded to $\le 5.3$ MB for 8 SUB streams, with DMA-BUF file descriptor support for hardware zero-copy. |
 
 ---
 
