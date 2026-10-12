@@ -5,6 +5,8 @@
 #include <sstream>
 #include <iostream>
 
+#include <functional>
+
 namespace nvr {
 
 enum class LogLevel {
@@ -14,12 +16,19 @@ enum class LogLevel {
     ERROR
 };
 
+using LogSink = std::function<void(LogLevel level, const char* file, int line, const std::string& message)>;
+
 class Logger {
 public:
     static Logger& Instance();
 
     void SetLogLevel(LogLevel level);
     LogLevel GetLogLevel() const;
+
+    void SetConsoleLogLevel(LogLevel level);
+    LogLevel GetConsoleLogLevel() const;
+
+    void SetSink(LogSink sink);
 
     void Log(LogLevel level, const char* file, int line, const std::string& message);
 
@@ -30,7 +39,9 @@ private:
     Logger& operator=(const Logger&) = delete;
 
     LogLevel current_level_{LogLevel::INFO};
-    std::mutex mutex_;
+    LogLevel console_level_{LogLevel::INFO};
+    LogSink sink_{nullptr};
+    mutable std::mutex mutex_;
 };
 
 class LogMessage {

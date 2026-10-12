@@ -8,6 +8,7 @@ bin/
 # Runtime media and database files
 recordings/
 test_recordings/
+logs/
 *.db
 *.db-wal
 *.db-shm

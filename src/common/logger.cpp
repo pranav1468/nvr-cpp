@@ -17,11 +17,37 @@ void Logger::SetLogLevel(LogLevel level) {
 }
 
 LogLevel Logger::GetLogLevel() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return current_level_;
 }
 
+void Logger::SetConsoleLogLevel(LogLevel level) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    console_level_ = level;
+}
+
+LogLevel Logger::GetConsoleLogLevel() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return console_level_;
+}
+
+void Logger::SetSink(LogSink sink) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sink_ = std::move(sink);
+}
+
 void Logger::Log(LogLevel level, const char* file, int line, const std::string& message) {
-    if (level < current_level_) {
+    LogSink sink_copy;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sink_copy = sink_;
+    }
+
+    if (sink_copy) {
+        sink_copy(level, file, line, message);
+    }
+
+    if (level < console_level_) {
         return;
     }
 

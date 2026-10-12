@@ -1,5 +1,6 @@
 #include "nvr/common/types.h"
 #include "nvr/common/logger.h"
+#include "nvr/common/deep_tracer.h"
 #include "nvr/common/time_utils.h"
 #include "nvr/storage/database_manager.h"
 #include "nvr/storage/segment_index.h"
@@ -87,6 +88,10 @@ nvr::NvrConfig LoadConfig(const std::string& config_path) {
 } // namespace
 
 int main(int argc, char* argv[]) {
+#ifdef NVR_ENABLE_DEEP_MONITORING
+    nvr::DeepTracer::Instance().Start("logs/nvr_deep_trace.log");
+#endif
+
     std::string config_path = "config/nvr_config.json";
     if (argc > 1) {
         config_path = argv[1];
@@ -100,15 +105,22 @@ int main(int argc, char* argv[]) {
     nvr::NvrConfig config = LoadConfig(config_path);
 
     // Configure logger
+    nvr::LogLevel log_lvl = nvr::LogLevel::INFO;
     if (config.system.log_level == "debug") {
-        nvr::Logger::Instance().SetLogLevel(nvr::LogLevel::DEBUG);
+        log_lvl = nvr::LogLevel::DEBUG;
     } else if (config.system.log_level == "warn") {
-        nvr::Logger::Instance().SetLogLevel(nvr::LogLevel::WARN);
+        log_lvl = nvr::LogLevel::WARN;
     } else if (config.system.log_level == "error") {
-        nvr::Logger::Instance().SetLogLevel(nvr::LogLevel::ERROR);
-    } else {
-        nvr::Logger::Instance().SetLogLevel(nvr::LogLevel::INFO);
+        log_lvl = nvr::LogLevel::ERROR;
     }
+    nvr::Logger::Instance().SetConsoleLogLevel(log_lvl);
+#ifndef NVR_ENABLE_DEEP_MONITORING
+    nvr::Logger::Instance().SetLogLevel(log_lvl);
+#endif
+
+#ifdef NVR_ENABLE_DEEP_MONITORING
+    nvr::DeepTracer::Instance().SetStoragePath(config.storage.recording_path);
+#endif
 
     LOG_INFO << "==========================================================";
     LOG_INFO << "Starting NVR Production Core: " << config.system.device_name;
@@ -206,5 +218,10 @@ int main(int argc, char* argv[]) {
     nvr::DatabaseManager::Instance().Close();
 
     LOG_INFO << "NVR Core cleanly terminated. All segments finalized.";
+
+#ifdef NVR_ENABLE_DEEP_MONITORING
+    nvr::DeepTracer::Instance().Stop();
+#endif
+
     return 0;
 }

@@ -1,6 +1,6 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread -I./include -I./include/3rdparty -MMD -MP
-LDFLAGS ?= -pthread -ldl
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread -I./include -I./include/3rdparty -MMD -MP -DNVR_ENABLE_DEEP_MONITORING
+LDFLAGS ?= -pthread -ldl -rdynamic
 
 SQLITE_LIB ?= $(shell if $(CXX) -shared -x c /dev/null -o /dev/null -lsqlite3 >/dev/null 2>&1; then echo "-lsqlite3"; \
                       elif [ -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 ]; then echo "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0"; \
@@ -8,6 +8,7 @@ SQLITE_LIB ?= $(shell if $(CXX) -shared -x c /dev/null -o /dev/null -lsqlite3 >/
                       else echo "-lsqlite3"; fi)
 
 SRCS = src/common/logger.cpp \
+       src/common/deep_tracer.cpp \
        src/common/time_utils.cpp \
        src/common/thread_pool.cpp \
        src/storage/database_manager.cpp \

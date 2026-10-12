@@ -1,5 +1,6 @@
 #include "nvr/common/types.h"
 #include "nvr/common/logger.h"
+#include "nvr/common/deep_tracer.h"
 #include "nvr/media/buffer_allocator.h"
 #include "nvr/media/video_decoder.h"
 #include "nvr/media/video_scaler.h"
@@ -1101,6 +1102,73 @@ void TestLifecycleConcurrencyUnification() {
     std::cout << "  -> PASSED: Lifecycle concurrency unification under layout_mutex_ verified with zero deadlocks." << std::endl;
 }
 
+void TestDeepDiagnosticsAndForensicTracing() {
+    std::cout << "[TEST 13] Testing Deep Diagnostics Sentinel, Flight Recorder & Forensic Tracing..." << std::endl;
+
+    std::string test_log = "logs/test_deep_trace.log";
+    std::filesystem::remove(test_log);
+
+    auto& tracer = nvr::DeepTracer::Instance();
+    bool started = tracer.Start(test_log, "test_recordings", 150);
+    assert(started);
+    assert(tracer.IsRunning());
+
+    // 1. Validate Scope and Macro Event Tracing
+    {
+        TRACE_SCOPE("DiagnosticValidationScope");
+        TRACE_EVENT("TEST_PIPELINE", "Simulated packet dispatch for channel 1");
+    }
+
+    // 2. Validate standard Logger forwarding to DeepTracer
+    LOG_DEBUG << "[TestDecoder] Processing synthetic NAL unit type 7 (SPS)";
+    LOG_INFO << "[TestIngress] RTSP session established for channel 1";
+    LOG_WARN << "[TestQueue] Live queue reached 80% watermark";
+    LOG_ERROR << "[TestMedia] Simulated decoding error on corrupted packet";
+
+    // Allow background telemetry loop to run at least once
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    // 3. Verify flight recorder ring buffer
+    auto breadcrumbs = tracer.GetRecentBreadcrumbs(100);
+    assert(!breadcrumbs.empty());
+    bool found_error = false;
+    bool found_scope = false;
+    for (const auto& b : breadcrumbs) {
+        if (b.level == nvr::LogLevel::ERROR && b.message.find("Simulated decoding error") != std::string::npos) {
+            found_error = true;
+        }
+        if (b.message.find("DiagnosticValidationScope") != std::string::npos) {
+            found_scope = true;
+        }
+    }
+    assert(found_error);
+    assert(found_scope);
+
+    // 4. Verify flight recorder dump output
+    std::ostringstream ss;
+    tracer.DumpFlightRecorder(ss, 20);
+    std::string dump_str = ss.str();
+    assert(dump_str.find("RECENT FLIGHT RECORDER HISTORY") != std::string::npos);
+
+    // 5. Clean termination
+    tracer.Stop();
+    assert(!tracer.IsRunning());
+
+    // 6. Verify log file contents on disk
+    std::ifstream f(test_log);
+    assert(f.is_open());
+    std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    assert(content.find("[DeepTracer] Deep Diagnostics & Telemetry Sentinel Started") != std::string::npos);
+    assert(content.find("[TestMedia] Simulated decoding error") != std::string::npos);
+    assert(content.find(">>> FORENSIC EXECUTION TRAIL") != std::string::npos);
+    assert(content.find("[PIPELINE HEALTH SNAPSHOT]") != std::string::npos);
+    assert(content.find("[DeepTracer] Deep Diagnostics Sentinel Terminated Cleanly") != std::string::npos);
+    f.close();
+    std::filesystem::remove(test_log);
+
+    std::cout << "  -> PASSED: Deep diagnostics, flight recorder, telemetry & forensic trail verified." << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -1120,6 +1188,7 @@ int main() {
     TestConcurrentRebuildAndDeadlockSafety();
     TestV4l2HardwareFatalAndRecoveryGating();
     TestLifecycleConcurrencyUnification();
+    TestDeepDiagnosticsAndForensicTracing();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "ALL LIVE VIEW PIPELINE TESTS PASSED WITH 100% SUCCESS!" << std::endl;
