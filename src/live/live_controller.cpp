@@ -717,7 +717,6 @@ void LiveController::SetupGridPipelines() {
 }
 
 void LiveController::StartChannelPipeline(int channel_id, int tile_index, StreamType stream_type, uint32_t target_w, uint32_t target_h) {
-    std::lock_guard<std::mutex> start_lock(pipeline_start_mutex_);
     std::shared_ptr<ChannelPipeline> old_pipe;
     {
         std::lock_guard<std::mutex> lock(mutex_);

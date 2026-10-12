@@ -470,6 +470,7 @@ public:
                      << " (" << CodecToString(codec_) << ")";
         }
 
+        software_awaiting_keyframe_ = false;
         initialized_ = true;
         return true;
     }
@@ -531,10 +532,31 @@ public:
                 out_frame.reset();
                 return false;
             }
+            if (res == V4l2DecodeResult::HARDWARE_FATAL) {
+                out_frame.reset();
+                HandleHardwareFatal();
+                // Never software-decode this packet: hardware already accepted it
+                return false;
+            }
+            // res == V4l2DecodeResult::INPUT_REJECTED:
+            // Hardware did not accept this packet. Fall through to software decoder.
         }
 
         // 2. Dynamic software decoding path
         if (sw_decoder_.IsAvailable()) {
+            if (software_awaiting_keyframe_) {
+                if (!HasParameterSetsOrKeyframe(packet)) {
+                    out_frame.reset();
+                    return false;
+                }
+                if (sw_decoder_.Decode(packet->data.data(), packet->data.size(), *out_frame)) {
+                    software_awaiting_keyframe_ = false;
+                    return true;
+                }
+                out_frame.reset();
+                return false;
+            }
+
             if (sw_decoder_.Decode(packet->data.data(), packet->data.size(), *out_frame)) {
                 return true;
             }
@@ -632,6 +654,7 @@ public:
         }
         sw_decoder_.Close();
         is_hardware_ = false;
+        software_awaiting_keyframe_ = false;
         initialized_ = false;
     }
 
@@ -652,7 +675,8 @@ private:
     enum class V4l2DecodeResult {
         FRAME_READY,
         FRAME_PENDING,
-        INPUT_REJECTED
+        INPUT_REJECTED,
+        HARDWARE_FATAL
     };
 
     V4l2DecodeResult DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
@@ -776,17 +800,20 @@ private:
                 req_q.m.planes = rq_planes;
                 req_q.length = 1;
             }
-            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &req_q) == 0) {
-                capture_buffers_[cap_idx].queued = true;
+            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &req_q) < 0) {
+                LOG_ERROR << "[VpuVideoDecoder] Capture VIDIOC_QBUF requeue failed: " << strerror(errno);
+                return V4l2DecodeResult::HARDWARE_FATAL;
             }
-            return copy_ok ? V4l2DecodeResult::FRAME_READY : V4l2DecodeResult::INPUT_REJECTED;
+            capture_buffers_[cap_idx].queued = true;
+            return copy_ok ? V4l2DecodeResult::FRAME_READY : V4l2DecodeResult::HARDWARE_FATAL;
         }
 
         if (dq_ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             return V4l2DecodeResult::FRAME_PENDING;
         }
 
-        return V4l2DecodeResult::INPUT_REJECTED;
+        LOG_ERROR << "[VpuVideoDecoder] Capture VIDIOC_DQBUF unrecoverable error: " << strerror(errno);
+        return V4l2DecodeResult::HARDWARE_FATAL;
     }
 
     bool SetupV4l2Queues() {
@@ -1043,6 +1070,52 @@ private:
         }
     }
 
+    void HandleHardwareFatal() {
+        LOG_ERROR << "[VpuVideoDecoder] Hardware V4L2 decoder fatal error; tearing down hardware and falling back to software";
+        CleanupV4l2Buffers();
+        if (v4l2_fd_ >= 0) {
+            close(v4l2_fd_);
+            v4l2_fd_ = -1;
+        }
+        is_hardware_ = false;
+        software_awaiting_keyframe_ = true;
+        if (!sw_decoder_.IsAvailable() && codec_ != CodecType::UNKNOWN) {
+            sw_decoder_.Initialize(codec_);
+        }
+    }
+
+    bool HasParameterSetsOrKeyframe(const MediaPacketPtr& packet) const {
+        if (!packet || packet->data.size() < 4) return false;
+        if (packet->is_keyframe) return true;
+
+        const auto& d = packet->data;
+        size_t i = 0;
+        while (i + 4 < d.size()) {
+            if (d[i] == 0x00 && d[i+1] == 0x00 &&
+                ((d[i+2] == 0x01) || (d[i+2] == 0x00 && i + 3 < d.size() && d[i+3] == 0x01))) {
+                size_t prefix_len = (d[i+2] == 0x01) ? 3 : 4;
+                size_t nal_start = i + prefix_len;
+                if (nal_start >= d.size()) break;
+
+                if (packet->codec == CodecType::H264) {
+                    uint8_t nal_type = d[nal_start] & 0x1F;
+                    if (nal_type == 5 || nal_type == 7 || nal_type == 8) {
+                        return true;
+                    }
+                } else if (packet->codec == CodecType::H265) {
+                    uint8_t nal_type = (d[nal_start] >> 1) & 0x3F;
+                    if ((nal_type >= 16 && nal_type <= 21) || nal_type == 32 || nal_type == 33 || nal_type == 34) {
+                        return true;
+                    }
+                }
+                i = nal_start;
+            } else {
+                i++;
+            }
+        }
+        return false;
+    }
+
     CodecType codec_{CodecType::H264};
     uint32_t width_{0};
     uint32_t height_{0};
@@ -1051,6 +1124,7 @@ private:
     uint32_t negotiated_stride_{0};
     bool prefer_vpu_{true};
     bool is_hardware_{false};
+    bool software_awaiting_keyframe_{false};
     bool initialized_{false};
     std::string v4l2_device_path_;
     int v4l2_fd_{-1};

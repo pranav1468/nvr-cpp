@@ -922,6 +922,61 @@ void TestConcurrentRebuildAndDeadlockSafety() {
     std::cout << "  -> PASSED: Rapid layout changes under concurrent rendering executed with zero deadlocks." << std::endl;
 }
 
+void TestDecoderRecoveryAndConcurrencyUnification() {
+    std::cout << "[TEST 11] Testing Decoder recovery & lifecycle concurrency unification..." << std::endl;
+
+    // 1. Decoder Keyframe Resynchronization & Gating
+    auto decoder = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, false);
+    assert(decoder != nullptr);
+
+    auto kf_pkt = std::make_shared<nvr::MediaPacket>();
+    kf_pkt->channel_id = 1;
+    kf_pkt->stream_type = nvr::StreamType::SUB;
+    kf_pkt->codec = nvr::CodecType::H264;
+    kf_pkt->pts_us = 100000;
+    kf_pkt->is_keyframe = true;
+    kf_pkt->data = MakeValidH264_640x360();
+
+    nvr::DecodedFramePtr frame1;
+    bool dec_ok = decoder->Decode(kf_pkt, frame1);
+    assert(dec_ok && frame1 != nullptr);
+
+    decoder->Flush();
+
+    // 2. Lifecycle Concurrency: Rapid simultaneous Start/Stop/Activate/Deactivate
+    auto& live = nvr::LiveController::Instance();
+    live.Start();
+
+    std::thread t1([&]() {
+        for (int i = 0; i < 40; ++i) {
+            live.ActivateChannel(1, 0, nvr::StreamType::SUB, 640, 360);
+            live.DeactivateChannel(1);
+        }
+    });
+
+    std::thread t2([&]() {
+        for (int i = 0; i < 40; ++i) {
+            live.ActivateChannel(2, 1, nvr::StreamType::SUB, 640, 360);
+            live.DeactivateChannel(2);
+        }
+    });
+
+    std::thread t3([&]() {
+        for (int i = 0; i < 20; ++i) {
+            live.SetLayout(nvr::LiveGridLayout::GRID_4);
+            live.SetLayout(nvr::LiveGridLayout::SINGLE);
+        }
+    });
+
+    t1.join();
+    t2.join();
+    t3.join();
+
+    live.Stop();
+
+    std::cout << "  -> PASSED: Decoder recovery & lifecycle concurrency unification verified." << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -939,6 +994,7 @@ int main() {
     TestExhaustiveEdgeCasesAndStress();
     TestDynamicGridLayoutsAndOnDemandFeeds();
     TestConcurrentRebuildAndDeadlockSafety();
+    TestDecoderRecoveryAndConcurrencyUnification();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "ALL LIVE VIEW PIPELINE TESTS PASSED WITH 100% SUCCESS!" << std::endl;

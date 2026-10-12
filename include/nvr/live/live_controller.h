@@ -108,14 +108,15 @@ private:
     void SetupGridPipelines();
     void TeardownPipeline(std::shared_ptr<ChannelPipeline> pipe);
     void TeardownPipelines(std::vector<std::shared_ptr<ChannelPipeline>>& pipes);
+    // Precondition: Caller must hold layout_mutex_
     void StartChannelPipeline(int channel_id, int tile_index, StreamType stream_type, uint32_t target_w, uint32_t target_h);
+    // Precondition: Caller must hold layout_mutex_
     void StopChannelPipeline(int channel_id);
     void ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline, uint32_t target_w, uint32_t target_h);
 
     mutable std::mutex mutex_;
     mutable std::mutex backend_mutex_;
     std::mutex layout_mutex_;
-    std::mutex pipeline_start_mutex_;
     LiveConfig config_;
     DisplayBackendPtr display_backend_;
 
