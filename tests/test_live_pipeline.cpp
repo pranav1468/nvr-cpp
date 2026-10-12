@@ -19,6 +19,7 @@
 #include <thread>
 #include <chrono>
 #include <filesystem>
+#include <linux/videodev2.h>
 
 using json = nlohmann::json;
 
@@ -922,28 +923,151 @@ void TestConcurrentRebuildAndDeadlockSafety() {
     std::cout << "  -> PASSED: Rapid layout changes under concurrent rendering executed with zero deadlocks." << std::endl;
 }
 
-void TestDecoderRecoveryAndConcurrencyUnification() {
-    std::cout << "[TEST 11] Testing Decoder recovery & lifecycle concurrency unification..." << std::endl;
+static int MockIoctlCaptureDqFail(int fd, unsigned long request, void* arg) {
+    (void)fd;
+    (void)arg;
+    if (request == VIDIOC_QBUF) {
+        return 0; // Output VIDIOC_QBUF accepted
+    }
+    if (request == VIDIOC_DQBUF) {
+        errno = EIO; // Fatal capture dequeue failure
+        return -1;
+    }
+    return 0;
+}
 
-    // 1. Decoder Keyframe Resynchronization & Gating
-    auto decoder = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, false);
-    assert(decoder != nullptr);
+static int MockIoctlCaptureRequeueFail(int fd, unsigned long request, void* arg) {
+    (void)fd;
+    if (request == VIDIOC_QBUF) {
+        struct v4l2_buffer* b = static_cast<struct v4l2_buffer*>(arg);
+        if (b && b->type == V4L2_BUF_TYPE_VIDEO_CAPTURE) {
+            errno = EINVAL; // Capture requeue failure
+            return -1;
+        }
+        return 0; // Output QBUF succeeds
+    }
+    if (request == VIDIOC_DQBUF) {
+        struct v4l2_buffer* b = static_cast<struct v4l2_buffer*>(arg);
+        if (b) b->index = 0;
+        return 0;
+    }
+    return 0;
+}
 
-    auto kf_pkt = std::make_shared<nvr::MediaPacket>();
-    kf_pkt->channel_id = 1;
-    kf_pkt->stream_type = nvr::StreamType::SUB;
-    kf_pkt->codec = nvr::CodecType::H264;
-    kf_pkt->pts_us = 100000;
-    kf_pkt->is_keyframe = true;
-    kf_pkt->data = MakeValidH264_640x360();
+void TestV4l2HardwareFatalAndRecoveryGating() {
+    std::cout << "[TEST 11] Testing V4L2 HARDWARE_FATAL failure injection & recovery gating..." << std::endl;
 
-    nvr::DecodedFramePtr frame1;
-    bool dec_ok = decoder->Decode(kf_pkt, frame1);
-    assert(dec_ok && frame1 != nullptr);
+    auto valid_stream = MakeValidH264_640x360();
+    // SPS is bytes 0 to 28 (size 29)
+    std::vector<uint8_t> sps_data(valid_stream.begin(), valid_stream.begin() + 29);
+    // PPS is bytes 29 to 37 (size 9)
+    std::vector<uint8_t> pps_data(valid_stream.begin() + 29, valid_stream.begin() + 38);
+    // IDR slice without SPS/PPS
+    std::vector<uint8_t> idr_data(valid_stream.begin() + 38, valid_stream.end());
+    // Non-IDR delta slice (nal_type 1)
+    std::vector<uint8_t> delta_data = {
+        0x00, 0x00, 0x00, 0x01, 0x61, 0xe0, 0x00, 0x00
+    };
 
-    decoder->Flush();
+    // Case 1: Capture dequeue fails after output buffer acceptance
+    {
+        auto dec = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, true);
+        assert(dec != nullptr);
+        dec->SetIoctlHook(MockIoctlCaptureDqFail, true);
+        assert(dec->IsHardwareAccelerated());
 
-    // 2. Lifecycle Concurrency: Rapid simultaneous Start/Stop/Activate/Deactivate
+        auto pkt = std::make_shared<nvr::MediaPacket>();
+        pkt->channel_id = 1;
+        pkt->codec = nvr::CodecType::H264;
+        pkt->pts_us = 1000;
+        pkt->data = idr_data;
+
+        nvr::DecodedFramePtr frame;
+        bool res = dec->Decode(pkt, frame);
+        // Accepted packet is dropped on HARDWARE_FATAL; NOT decoded in software
+        assert(!res);
+        assert(frame == nullptr);
+        // Hardware was disabled and queues torn down
+        assert(!dec->IsHardwareAccelerated());
+
+        // Case 3a: Delta frame is rejected while awaiting keyframe recovery
+        auto delta_pkt = std::make_shared<nvr::MediaPacket>();
+        delta_pkt->channel_id = 1;
+        delta_pkt->codec = nvr::CodecType::H264;
+        delta_pkt->is_keyframe = false;
+        delta_pkt->data = delta_data;
+        assert(!dec->Decode(delta_pkt, frame));
+        assert(frame == nullptr);
+
+        // Case 3b: IDR arrives without required parameter sets -> blocked
+        auto idr_pkt = std::make_shared<nvr::MediaPacket>();
+        idr_pkt->channel_id = 1;
+        idr_pkt->codec = nvr::CodecType::H264;
+        idr_pkt->is_keyframe = true;
+        idr_pkt->data = idr_data;
+        assert(!dec->Decode(idr_pkt, frame));
+        assert(frame == nullptr);
+
+        // Case 3c: SPS arrives alone -> cached, but recovery remains blocked
+        auto sps_pkt = std::make_shared<nvr::MediaPacket>();
+        sps_pkt->channel_id = 1;
+        sps_pkt->codec = nvr::CodecType::H264;
+        sps_pkt->data = sps_data;
+        assert(!dec->Decode(sps_pkt, frame));
+        assert(frame == nullptr);
+
+        // Case 3d: PPS arrives alone -> cached, but recovery remains blocked
+        auto pps_pkt = std::make_shared<nvr::MediaPacket>();
+        pps_pkt->channel_id = 1;
+        pps_pkt->codec = nvr::CodecType::H264;
+        pps_pkt->data = pps_data;
+        assert(!dec->Decode(pps_pkt, frame));
+        assert(frame == nullptr);
+
+        // Case 3e: IDR arrives separately after SPS/PPS were cached -> recovers!
+        assert(dec->Decode(idr_pkt, frame));
+        assert(frame != nullptr);
+        assert(frame->width == 640 && frame->height == 360);
+        assert(frame->format == nvr::PixelFormat::NV12);
+
+        // Case 3f: Recovery cleared; subsequent frames decode normally
+        nvr::DecodedFramePtr frame2;
+        auto full_pkt = std::make_shared<nvr::MediaPacket>();
+        full_pkt->channel_id = 1;
+        full_pkt->codec = nvr::CodecType::H264;
+        full_pkt->is_keyframe = true;
+        full_pkt->data = valid_stream;
+        assert(dec->Decode(full_pkt, frame2));
+        assert(frame2 != nullptr);
+    }
+
+    // Case 2: Capture requeue failure triggers fatal recovery
+    {
+        auto dec = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, true);
+        assert(dec != nullptr);
+        dec->SetIoctlHook(MockIoctlCaptureRequeueFail, true);
+        assert(dec->IsHardwareAccelerated());
+
+        auto pkt = std::make_shared<nvr::MediaPacket>();
+        pkt->channel_id = 1;
+        pkt->codec = nvr::CodecType::H264;
+        pkt->pts_us = 2000;
+        pkt->data = valid_stream;
+
+        nvr::DecodedFramePtr frame;
+        bool res = dec->Decode(pkt, frame);
+        // Failed capture requeue returned HARDWARE_FATAL and entered recovery
+        assert(!res);
+        assert(frame == nullptr);
+        assert(!dec->IsHardwareAccelerated());
+    }
+
+    std::cout << "  -> PASSED: V4L2 fatal dequeue/requeue failure injection & parameter-gated recovery verified." << std::endl;
+}
+
+void TestLifecycleConcurrencyUnification() {
+    std::cout << "[TEST 12] Testing LiveController lifecycle concurrency unification under layout_mutex_..." << std::endl;
+
     auto& live = nvr::LiveController::Instance();
     live.Start();
 
@@ -974,7 +1098,7 @@ void TestDecoderRecoveryAndConcurrencyUnification() {
 
     live.Stop();
 
-    std::cout << "  -> PASSED: Decoder recovery & lifecycle concurrency unification verified." << std::endl;
+    std::cout << "  -> PASSED: Lifecycle concurrency unification under layout_mutex_ verified with zero deadlocks." << std::endl;
 }
 
 } // namespace
@@ -994,7 +1118,8 @@ int main() {
     TestExhaustiveEdgeCasesAndStress();
     TestDynamicGridLayoutsAndOnDemandFeeds();
     TestConcurrentRebuildAndDeadlockSafety();
-    TestDecoderRecoveryAndConcurrencyUnification();
+    TestV4l2HardwareFatalAndRecoveryGating();
+    TestLifecycleConcurrencyUnification();
 
     std::cout << "==========================================================" << std::endl;
     std::cout << "ALL LIVE VIEW PIPELINE TESTS PASSED WITH 100% SUCCESS!" << std::endl;

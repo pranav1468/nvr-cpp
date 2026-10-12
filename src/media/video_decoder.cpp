@@ -6,6 +6,7 @@
 #include <cstring>
 #include <algorithm>
 #include <vector>
+#include <unordered_map>
 #include <dlfcn.h>
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
@@ -522,6 +523,8 @@ public:
         out_frame->frame_index = frame_counter_++;
         out_frame->format = PixelFormat::NV12;
 
+        CacheParameterSets(packet);
+
         // 1. Hardware V4L2 M2M decoding path
         if (is_hardware_ && v4l2_fd_ >= 0) {
             V4l2DecodeResult res = DecodeHardware(packet, out_frame);
@@ -545,14 +548,21 @@ public:
         // 2. Dynamic software decoding path
         if (sw_decoder_.IsAvailable()) {
             if (software_awaiting_keyframe_) {
-                if (!HasParameterSetsOrKeyframe(packet)) {
+                std::vector<uint8_t> recovery_data;
+
+                if (!PrepareSoftwareRecoveryPacket(packet, recovery_data)) {
                     out_frame.reset();
                     return false;
                 }
-                if (sw_decoder_.Decode(packet->data.data(), packet->data.size(), *out_frame)) {
+
+                if (sw_decoder_.Decode(
+                        recovery_data.data(),
+                        recovery_data.size(),
+                        *out_frame)) {
                     software_awaiting_keyframe_ = false;
                     return true;
                 }
+
                 out_frame.reset();
                 return false;
             }
@@ -606,17 +616,19 @@ public:
     void CleanupV4l2Buffers() {
         if (v4l2_fd_ >= 0) {
             if (output_streaming_) {
-                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
+                Ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &output_buf_type_);
                 output_streaming_ = false;
             }
             if (capture_streaming_) {
-                ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+                Ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
                 capture_streaming_ = false;
             }
         }
         for (auto& b : output_buffers_) {
             if (b.start && b.start != MAP_FAILED) {
-                munmap(b.start, b.length);
+                if (v4l2_fd_ != 999) {
+                    munmap(b.start, b.length);
+                }
                 b.start = nullptr;
             }
         }
@@ -627,7 +639,9 @@ public:
                 b.dmabuf_fd = -1;
             }
             if (b.start && b.start != MAP_FAILED) {
-                munmap(b.start, b.length);
+                if (v4l2_fd_ != 999) {
+                    munmap(b.start, b.length);
+                }
                 b.start = nullptr;
             }
         }
@@ -639,20 +653,23 @@ public:
             req_zero.count = 0;
             req_zero.memory = V4L2_MEMORY_MMAP;
             req_zero.type = output_buf_type_;
-            ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_zero);
+            Ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_zero);
 
             req_zero.type = capture_buf_type_;
-            ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_zero);
+            Ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_zero);
         }
     }
 
     void Close() override {
         CleanupV4l2Buffers();
         if (v4l2_fd_ >= 0) {
-            close(v4l2_fd_);
+            if (v4l2_fd_ != 999) {
+                close(v4l2_fd_);
+            }
             v4l2_fd_ = -1;
         }
         sw_decoder_.Close();
+        software_parameter_sets_.clear();
         is_hardware_ = false;
         software_awaiting_keyframe_ = false;
         initialized_ = false;
@@ -704,7 +721,7 @@ private:
                 dq.m.planes = dq_planes;
                 dq.length = 1;
             }
-            if (ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq) == 0 && dq.index < output_buffers_.size()) {
+            if (Ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq) == 0 && dq.index < output_buffers_.size()) {
                 output_buffers_[dq.index].queued = false;
                 out_idx = dq.index;
             }
@@ -739,7 +756,7 @@ private:
             q.m.planes = q_planes;
             q.length = 1;
         }
-        if (ioctl(v4l2_fd_, VIDIOC_QBUF, &q) < 0) {
+        if (Ioctl(v4l2_fd_, VIDIOC_QBUF, &q) < 0) {
             LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_QBUF failed: " << strerror(errno);
             return V4l2DecodeResult::INPUT_REJECTED;
         }
@@ -754,7 +771,7 @@ private:
             dq_cap.length = 1;
         }
 
-        int dq_ret = ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq_cap);
+        int dq_ret = Ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq_cap);
         if (dq_ret == 0 && dq_cap.index < capture_buffers_.size()) {
             uint32_t cap_idx = dq_cap.index;
             capture_buffers_[cap_idx].queued = false;
@@ -800,7 +817,7 @@ private:
                 req_q.m.planes = rq_planes;
                 req_q.length = 1;
             }
-            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &req_q) < 0) {
+            if (Ioctl(v4l2_fd_, VIDIOC_QBUF, &req_q) < 0) {
                 LOG_ERROR << "[VpuVideoDecoder] Capture VIDIOC_QBUF requeue failed: " << strerror(errno);
                 return V4l2DecodeResult::HARDWARE_FATAL;
             }
@@ -1074,7 +1091,9 @@ private:
         LOG_ERROR << "[VpuVideoDecoder] Hardware V4L2 decoder fatal error; tearing down hardware and falling back to software";
         CleanupV4l2Buffers();
         if (v4l2_fd_ >= 0) {
-            close(v4l2_fd_);
+            if (v4l2_fd_ != 999) {
+                close(v4l2_fd_);
+            }
             v4l2_fd_ = -1;
         }
         is_hardware_ = false;
@@ -1084,36 +1103,185 @@ private:
         }
     }
 
-    bool HasParameterSetsOrKeyframe(const MediaPacketPtr& packet) const {
-        if (!packet || packet->data.size() < 4) return false;
-        if (packet->is_keyframe) return true;
+    struct AnnexBNal {
+        size_t start;
+        size_t end;
+        size_t payload;
+    };
 
-        const auto& d = packet->data;
-        size_t i = 0;
-        while (i + 4 < d.size()) {
-            if (d[i] == 0x00 && d[i+1] == 0x00 &&
-                ((d[i+2] == 0x01) || (d[i+2] == 0x00 && i + 3 < d.size() && d[i+3] == 0x01))) {
-                size_t prefix_len = (d[i+2] == 0x01) ? 3 : 4;
-                size_t nal_start = i + prefix_len;
-                if (nal_start >= d.size()) break;
+    static std::vector<AnnexBNal> FindAnnexBNals(
+        const std::vector<uint8_t>& data) {
+        std::vector<AnnexBNal> nals;
 
-                if (packet->codec == CodecType::H264) {
-                    uint8_t nal_type = d[nal_start] & 0x1F;
-                    if (nal_type == 5 || nal_type == 7 || nal_type == 8) {
-                        return true;
-                    }
-                } else if (packet->codec == CodecType::H265) {
-                    uint8_t nal_type = (d[nal_start] >> 1) & 0x3F;
-                    if ((nal_type >= 16 && nal_type <= 21) || nal_type == 32 || nal_type == 33 || nal_type == 34) {
-                        return true;
-                    }
-                }
-                i = nal_start;
-            } else {
-                i++;
+        auto start_code_size = [&](size_t i) -> size_t {
+            if (i + 4 <= data.size() &&
+                data[i] == 0 && data[i + 1] == 0 &&
+                data[i + 2] == 0 && data[i + 3] == 1) {
+                return 4;
             }
+            if (i + 3 <= data.size() &&
+                data[i] == 0 && data[i + 1] == 0 &&
+                data[i + 2] == 1) {
+                return 3;
+            }
+            return 0;
+        };
+
+        size_t pos = 0;
+        while (pos < data.size()) {
+            size_t prefix = start_code_size(pos);
+            if (prefix == 0) {
+                ++pos;
+                continue;
+            }
+
+            const size_t start = pos;
+            const size_t payload = pos + prefix;
+            size_t next = payload;
+
+            while (next < data.size() && start_code_size(next) == 0) {
+                ++next;
+            }
+
+            if (payload < next) {
+                nals.push_back({start, next, payload});
+            }
+            pos = next;
+        }
+
+        return nals;
+    }
+
+    bool IsParameterSet(CodecType codec, uint8_t nal_type) const {
+        if (codec == CodecType::H264) {
+            return nal_type == 7 || nal_type == 8; // SPS, PPS
+        }
+        if (codec == CodecType::H265) {
+            return nal_type == 32 || nal_type == 33 ||
+                   nal_type == 34; // VPS, SPS, PPS
         }
         return false;
+    }
+
+    bool IsRandomAccessNal(CodecType codec, uint8_t nal_type) const {
+        if (codec == CodecType::H264) {
+            return nal_type == 5; // IDR
+        }
+        if (codec == CodecType::H265) {
+            return nal_type >= 16 && nal_type <= 21; // IRAP
+        }
+        return false;
+    }
+
+    uint8_t GetNalType(CodecType codec, uint8_t header) const {
+        return codec == CodecType::H265
+            ? static_cast<uint8_t>((header >> 1) & 0x3F)
+            : static_cast<uint8_t>(header & 0x1F);
+    }
+
+    void CacheParameterSets(const MediaPacketPtr& packet) {
+        if (!packet) return;
+
+        const auto nals = FindAnnexBNals(packet->data);
+        for (const auto& nal : nals) {
+            const uint8_t type =
+                GetNalType(packet->codec, packet->data[nal.payload]);
+
+            if (!IsParameterSet(packet->codec, type)) {
+                continue;
+            }
+
+            // Keep the latest copy of each parameter-set type.
+            auto& cached = software_parameter_sets_[type];
+            cached.assign(packet->data.begin() + nal.start,
+                          packet->data.begin() + nal.end);
+        }
+    }
+
+    bool PrepareSoftwareRecoveryPacket(
+        const MediaPacketPtr& packet,
+        std::vector<uint8_t>& prepared) {
+        if (!packet) return false;
+
+        CacheParameterSets(packet);
+
+        bool has_random_access = false;
+        for (const auto& nal : FindAnnexBNals(packet->data)) {
+            const uint8_t type =
+                GetNalType(packet->codec, packet->data[nal.payload]);
+            if (IsRandomAccessNal(packet->codec, type)) {
+                has_random_access = true;
+                break;
+            }
+        }
+
+        if (!has_random_access) {
+            return false;
+        }
+
+        const int required_types[] =
+            {32, 33, 34}; // H.265 VPS/SPS/PPS
+        const int h264_types[] =
+            {7, 8};       // H.264 SPS/PPS
+
+        const int* types = packet->codec == CodecType::H264
+            ? h264_types : required_types;
+        const size_t count = packet->codec == CodecType::H264
+            ? 2 : 3;
+
+        for (size_t i = 0; i < count; ++i) {
+            if (software_parameter_sets_.find(types[i]) ==
+                software_parameter_sets_.end()) {
+                return false;
+            }
+        }
+
+        prepared.clear();
+
+        // Supply cached parameter sets before the random-access packet.
+        for (size_t i = 0; i < count; ++i) {
+            const auto& nal = software_parameter_sets_.at(types[i]);
+            prepared.insert(prepared.end(), nal.begin(), nal.end());
+        }
+
+        prepared.insert(prepared.end(),
+                        packet->data.begin(), packet->data.end());
+        return true;
+    }
+
+    void SetIoctlHook(IoctlFn hook, bool simulate_hardware = false) override {
+        ioctl_hook_ = hook;
+        if (simulate_hardware) {
+            v4l2_fd_ = 999;
+            is_hardware_ = true;
+            output_buf_type_ = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+            capture_buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+            output_streaming_ = true;
+            capture_streaming_ = true;
+
+            output_buffers_.resize(2);
+            static uint8_t mock_out[2][65536];
+            for (size_t i = 0; i < 2; ++i) {
+                output_buffers_[i].start = mock_out[i];
+                output_buffers_[i].length = sizeof(mock_out[i]);
+                output_buffers_[i].queued = false;
+            }
+
+            capture_buffers_.resize(2);
+            static uint8_t mock_cap[2][65536];
+            for (size_t i = 0; i < 2; ++i) {
+                capture_buffers_[i].start = mock_cap[i];
+                capture_buffers_[i].length = sizeof(mock_cap[i]);
+                capture_buffers_[i].queued = false;
+            }
+        }
+    }
+
+    int Ioctl(int fd, unsigned long request, void* arg) {
+        if (ioctl_hook_) {
+            return ioctl_hook_(fd, request, arg);
+        }
+        return ::ioctl(fd, request, arg);
     }
 
     CodecType codec_{CodecType::H264};
@@ -1125,6 +1293,8 @@ private:
     bool prefer_vpu_{true};
     bool is_hardware_{false};
     bool software_awaiting_keyframe_{false};
+    std::unordered_map<int, std::vector<uint8_t>> software_parameter_sets_;
+    IoctlFn ioctl_hook_{nullptr};
     bool initialized_{false};
     std::string v4l2_device_path_;
     int v4l2_fd_{-1};

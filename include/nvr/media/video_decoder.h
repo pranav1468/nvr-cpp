@@ -20,6 +20,12 @@ public:
     virtual const char* GetName() const = 0;
     virtual uint32_t GetWidth() const = 0;
     virtual uint32_t GetHeight() const = 0;
+
+    using IoctlFn = int(*)(int fd, unsigned long request, void* arg);
+    virtual void SetIoctlHook(IoctlFn hook, bool simulate_hardware = false) {
+        (void)hook;
+        (void)simulate_hardware;
+    }
 };
 
 using VideoDecoderPtr = std::unique_ptr<IVideoDecoder>;
