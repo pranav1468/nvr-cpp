@@ -21,6 +21,7 @@
 #include <chrono>
 #include <filesystem>
 #include <linux/videodev2.h>
+#include <cerrno>
 
 using json = nlohmann::json;
 
@@ -1067,7 +1068,15 @@ void TestV4l2HardwareFatalAndRecoveryGating() {
     {
         auto dec = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, false);
         assert(dec != nullptr);
-        dec->SetIoctlHook([](int, unsigned long, void*) -> int { return 0; }, true);
+        dec->SetIoctlHook(
+            [](int, unsigned long request, void*) -> int {
+                if (request == VIDIOC_ENUM_FMT) {
+                    errno = EINVAL;
+                    return -1;
+                }
+                return 0;
+            },
+            true);
         assert(dec->IsHardwareAccelerated());
 
         // Stream starts as H.264, then packet arrives with H.265.

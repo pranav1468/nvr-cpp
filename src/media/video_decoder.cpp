@@ -869,7 +869,7 @@ private:
         bool has_codec_fmt = false;
         struct v4l2_fmtdesc fdesc{};
         fdesc.type = output_buf_type_;
-        while (ioctl(v4l2_fd_, VIDIOC_ENUM_FMT, &fdesc) == 0) {
+        while (Ioctl(v4l2_fd_, VIDIOC_ENUM_FMT, &fdesc) == 0) {
             if (fdesc.pixelformat == pix_fmt) {
                 has_codec_fmt = true;
                 break;
@@ -886,7 +886,7 @@ private:
         bool has_nv12 = false;
         struct v4l2_fmtdesc fdesc_cap{};
         fdesc_cap.type = capture_buf_type_;
-        while (ioctl(v4l2_fd_, VIDIOC_ENUM_FMT, &fdesc_cap) == 0) {
+        while (Ioctl(v4l2_fd_, VIDIOC_ENUM_FMT, &fdesc_cap) == 0) {
             if (fdesc_cap.pixelformat == V4L2_PIX_FMT_NV12) {
                 has_nv12 = true;
                 break;
