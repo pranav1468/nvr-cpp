@@ -972,7 +972,7 @@ void TestV4l2HardwareFatalAndRecoveryGating() {
 
     // Case 1: Capture dequeue fails after output buffer acceptance
     {
-        auto dec = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, true);
+        auto dec = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, false);
         assert(dec != nullptr);
         dec->SetIoctlHook(MockIoctlCaptureDqFail, true);
         assert(dec->IsHardwareAccelerated());
@@ -1044,7 +1044,7 @@ void TestV4l2HardwareFatalAndRecoveryGating() {
 
     // Case 2: Capture requeue failure triggers fatal recovery
     {
-        auto dec = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, true);
+        auto dec = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, false);
         assert(dec != nullptr);
         dec->SetIoctlHook(MockIoctlCaptureRequeueFail, true);
         assert(dec->IsHardwareAccelerated());

@@ -484,6 +484,10 @@ public:
         // Dynamically adopt packet's codec if unconfigured or changed
         if (packet->codec != CodecType::UNKNOWN && packet->codec != codec_) {
             codec_ = packet->codec;
+
+            // Cached parameter sets belong to the previous codec.
+            software_parameter_sets_.clear();
+
             if (is_hardware_) {
                 SetupV4l2Queues();
             } else {
