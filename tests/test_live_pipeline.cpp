@@ -1063,6 +1063,29 @@ void TestV4l2HardwareFatalAndRecoveryGating() {
         assert(!dec->IsHardwareAccelerated());
     }
 
+    // Case 4: Codec-change reconfiguration failure activates software fallback
+    {
+        auto dec = nvr::VideoDecoderFactory::Create(nvr::CodecType::H264, 640, 360, false);
+        assert(dec != nullptr);
+        dec->SetIoctlHook([](int, unsigned long, void*) -> int { return 0; }, true);
+        assert(dec->IsHardwareAccelerated());
+
+        // Stream starts as H.264, then packet arrives with H.265.
+        // SetupV4l2Queues fails on driver format check -> falls back cleanly to software.
+        auto h265_pkt = std::make_shared<nvr::MediaPacket>();
+        h265_pkt->channel_id = 1;
+        h265_pkt->codec = nvr::CodecType::H265;
+        h265_pkt->pts_us = 3000;
+        h265_pkt->data = { 0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01 }; // VPS NAL
+
+        nvr::DecodedFramePtr frame;
+        bool res = dec->Decode(h265_pkt, frame);
+        assert(!res);
+        assert(frame == nullptr);
+        // Hardware disabled after reconfiguration failure
+        assert(!dec->IsHardwareAccelerated());
+    }
+
     std::cout << "  -> PASSED: V4L2 fatal dequeue/requeue failure injection & parameter-gated recovery verified." << std::endl;
 }
 

@@ -485,14 +485,26 @@ public:
         if (packet->codec != CodecType::UNKNOWN && packet->codec != codec_) {
             codec_ = packet->codec;
 
-            // Cached parameter sets belong to the previous codec.
+            // Parameter sets from the previous codec are no longer valid.
             software_parameter_sets_.clear();
 
             if (is_hardware_) {
-                SetupV4l2Queues();
+                if (!SetupV4l2Queues()) {
+                    LOG_ERROR << "[PIPELINE][DECODER][RECONFIGURE_FAILED] Codec-change reconfiguration failed; "
+                              << "switching to software fallback. codec=" << CodecToString(codec_)
+                              << " device=" << v4l2_device_path_
+                              << " errno=" << errno << " reason=" << std::strerror(errno);
+                    HandleHardwareFatal();
+                    // Do not send this packet to software here. The existing
+                    // recovery path waits for parameter sets and a keyframe.
+                    return false;
+                }
             } else {
                 sw_decoder_.Close();
-                sw_decoder_.Initialize(codec_);
+                if (!sw_decoder_.Initialize(codec_)) {
+                    LOG_ERROR << "[PIPELINE][DECODER][SW_INIT_FAILED] Software decoder initialization "
+                              << "failed after codec change. codec=" << CodecToString(codec_);
+                }
             }
         }
 
@@ -822,7 +834,10 @@ private:
                 req_q.length = 1;
             }
             if (Ioctl(v4l2_fd_, VIDIOC_QBUF, &req_q) < 0) {
-                LOG_ERROR << "[VpuVideoDecoder] Capture VIDIOC_QBUF requeue failed: " << strerror(errno);
+                LOG_ERROR << "[PIPELINE][DECODER][HARDWARE_FATAL] Capture VIDIOC_QBUF requeue failed"
+                          << " buffer_idx=" << cap_idx
+                          << " device=" << v4l2_device_path_
+                          << " errno=" << errno << " reason=" << std::strerror(errno);
                 return V4l2DecodeResult::HARDWARE_FATAL;
             }
             capture_buffers_[cap_idx].queued = true;
@@ -833,7 +848,9 @@ private:
             return V4l2DecodeResult::FRAME_PENDING;
         }
 
-        LOG_ERROR << "[VpuVideoDecoder] Capture VIDIOC_DQBUF unrecoverable error: " << strerror(errno);
+        LOG_ERROR << "[PIPELINE][DECODER][HARDWARE_FATAL] Capture VIDIOC_DQBUF unrecoverable error"
+                  << " device=" << v4l2_device_path_
+                  << " errno=" << errno << " reason=" << std::strerror(errno);
         return V4l2DecodeResult::HARDWARE_FATAL;
     }
 
@@ -896,7 +913,10 @@ private:
         }
 
         if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt_out) < 0) {
-            LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_S_FMT failed";
+            LOG_ERROR << "[PIPELINE][DECODER][SETUP_FAILED] Output VIDIOC_S_FMT failed"
+                      << " codec=" << CodecToString(codec_)
+                      << " device=" << v4l2_device_path_
+                      << " errno=" << errno << " reason=" << std::strerror(errno);
             CleanupV4l2Buffers();
             return false;
         }
@@ -916,7 +936,10 @@ private:
         }
 
         if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt_cap) < 0) {
-            LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_S_FMT failed";
+            LOG_ERROR << "[PIPELINE][DECODER][SETUP_FAILED] Capture VIDIOC_S_FMT failed"
+                      << " codec=" << CodecToString(codec_)
+                      << " device=" << v4l2_device_path_
+                      << " errno=" << errno << " reason=" << std::strerror(errno);
             CleanupV4l2Buffers();
             return false;
         }
@@ -1092,7 +1115,9 @@ private:
     }
 
     void HandleHardwareFatal() {
-        LOG_ERROR << "[VpuVideoDecoder] Hardware V4L2 decoder fatal error; tearing down hardware and falling back to software";
+        LOG_ERROR << "[PIPELINE][DECODER][RECOVERY] Hardware V4L2 decoder fatal error; tearing down hardware and falling back to software"
+                  << " codec=" << CodecToString(codec_)
+                  << " device=" << v4l2_device_path_;
         CleanupV4l2Buffers();
         if (v4l2_fd_ >= 0) {
             if (v4l2_fd_ != 999) {

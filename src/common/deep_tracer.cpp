@@ -11,6 +11,7 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <sstream>
@@ -288,94 +289,41 @@ void DeepTracer::CollectPipelineDiagnostics() {
 }
 
 void DeepTracer::InstallCrashHandlers() {
-    std::signal(SIGSEGV, HandleCrashSignal);
-    std::signal(SIGABRT, HandleCrashSignal);
-    std::signal(SIGFPE,  HandleCrashSignal);
-    std::signal(SIGBUS,  HandleCrashSignal);
-    std::signal(SIGILL,  HandleCrashSignal);
+    struct sigaction sa{};
+    sa.sa_handler = HandleCrashSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESETHAND;
+
+    sigaction(SIGSEGV, &sa, &old_sa_segv_);
+    sigaction(SIGABRT, &sa, &old_sa_abrt_);
+    sigaction(SIGFPE,  &sa, &old_sa_fpe_);
+    sigaction(SIGBUS,  &sa, &old_sa_bus_);
+    sigaction(SIGILL,  &sa, &old_sa_ill_);
 }
 
 void DeepTracer::UninstallCrashHandlers() {
-    std::signal(SIGSEGV, SIG_DFL);
-    std::signal(SIGABRT, SIG_DFL);
-    std::signal(SIGFPE,  SIG_DFL);
-    std::signal(SIGBUS,  SIG_DFL);
-    std::signal(SIGILL,  SIG_DFL);
+    sigaction(SIGSEGV, &old_sa_segv_, nullptr);
+    sigaction(SIGABRT, &old_sa_abrt_, nullptr);
+    sigaction(SIGFPE,  &old_sa_fpe_,  nullptr);
+    sigaction(SIGBUS,  &old_sa_bus_,  nullptr);
+    sigaction(SIGILL,  &old_sa_ill_,  nullptr);
 }
 
 void DeepTracer::HandleCrashSignal(int signum) {
-    const char* sig_name = "UNKNOWN";
-    if (signum == SIGSEGV) sig_name = "SIGSEGV (Segmentation Fault)";
-    else if (signum == SIGABRT) sig_name = "SIGABRT (Abort)";
-    else if (signum == SIGFPE) sig_name = "SIGFPE (Arithmetic Exception)";
-    else if (signum == SIGBUS) sig_name = "SIGBUS (Bus Error)";
-    else if (signum == SIGILL) sig_name = "SIGILL (Illegal Instruction)";
-
-    char header[512];
-    std::snprintf(header, sizeof(header),
-                  "\n================================================================================\n"
-                  "FATAL CRASH INTERCEPTED: Signal %d (%s)\n"
-                  "Timestamp: %s\n"
-                  "================================================================================\n"
-                  "STACK BACKTRACE:\n",
-                  signum, sig_name, time_utils::FormatIso8601(time_utils::WallTimeMs()).c_str());
-
-    std::fprintf(stderr, "%s", header);
-
-    FILE* crash_f = std::fopen("logs/nvr_crash_trace.log", "a");
-    if (crash_f) {
-        std::fprintf(crash_f, "%s", header);
-    }
-
-    void* callstack[64];
-    int frames = backtrace(callstack, 64);
-    char** symbols = backtrace_symbols(callstack, frames);
-
-    if (symbols) {
-        for (int i = 0; i < frames; ++i) {
-            char* mangled_name = nullptr;
-            char* offset_begin = nullptr;
-            char* offset_end = nullptr;
-
-            for (char* p = symbols[i]; *p; ++p) {
-                if (*p == '(') mangled_name = p;
-                else if (*p == '+') offset_begin = p;
-                else if (*p == ')' && offset_begin) {
-                    offset_end = p;
-                    break;
-                }
-            }
-
-            char line_buf[1024];
-            if (mangled_name && offset_begin && offset_end && mangled_name < offset_begin) {
-                *mangled_name++ = '\0';
-                *offset_begin++ = '\0';
-                *offset_end++ = '\0';
-
-                int status = 0;
-                char* demangled = abi::__cxa_demangle(mangled_name, nullptr, nullptr, &status);
-                std::snprintf(line_buf, sizeof(line_buf), "  #%-2d %s: %s +%s %s\n",
-                              i, symbols[i], (status == 0 && demangled ? demangled : mangled_name),
-                              offset_begin, offset_end);
-                if (demangled) free(demangled);
-            } else {
-                std::snprintf(line_buf, sizeof(line_buf), "  #%-2d %s\n", i, symbols[i]);
-            }
-
-            std::fprintf(stderr, "%s", line_buf);
-            if (crash_f) std::fprintf(crash_f, "%s", line_buf);
-        }
-        free(symbols);
-    }
-
-    if (crash_f) {
-        std::fprintf(crash_f, "================================================================================\n\n");
-        std::fflush(crash_f);
-        std::fclose(crash_f);
-    }
-
-    std::signal(signum, SIG_DFL);
-    std::raise(signum);
+    const char prefix[] = "[FATAL] Process received signal ";
+    ssize_t w1 = ::write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+    (void)w1;
+    // Keep signal-context work minimal. The numeric signal is
+    // available from the process's exit/core-dump information.
+    (void)signum;
+    const char suffix[] = "; terminating.\n";
+    ssize_t w2 = ::write(STDERR_FILENO, suffix, sizeof(suffix) - 1);
+    (void)w2;
+    // Restore the default disposition and re-raise the signal.
+    // Do not call C++ logging, allocate memory, or open files here.
+    ::signal(signum, SIG_DFL);
+    ::raise(signum);
+    _exit(128 + signum);
 }
 
 DeepScopeTracer::DeepScopeTracer(const std::string& scope_name, const char* file, int line)

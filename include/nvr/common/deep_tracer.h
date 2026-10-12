@@ -10,6 +10,7 @@
 #include <atomic>
 #include <fstream>
 #include <chrono>
+#include <csignal>
 
 namespace nvr {
 
@@ -81,6 +82,11 @@ private:
     std::deque<TraceBreadcrumb> breadcrumbs_;
 
     LogLevel saved_console_level_{LogLevel::INFO};
+    struct sigaction old_sa_segv_{};
+    struct sigaction old_sa_abrt_{};
+    struct sigaction old_sa_fpe_{};
+    struct sigaction old_sa_bus_{};
+    struct sigaction old_sa_ill_{};
 };
 
 // RAII helper for tracking execution time of critical code scopes
