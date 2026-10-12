@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread -I./include -I./include/3rdparty
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread -I./include -I./include/3rdparty -MMD -MP
 LDFLAGS ?= -pthread -ldl
 
 SQLITE_LIB ?= $(shell if $(CXX) -shared -x c /dev/null -o /dev/null -lsqlite3 >/dev/null 2>&1; then echo "-lsqlite3"; \
@@ -28,6 +28,7 @@ SRCS = src/common/logger.cpp \
        src/live/qml_video_bridge.cpp
 
 OBJS = $(patsubst src/%.cpp, build/obj/%.o, $(SRCS))
+DEPS = $(OBJS:.o=.d) build/obj/main.d build/obj/tests/test_recording_pipeline.d build/obj/tests/test_live_pipeline.d
 
 TARGET = bin/nvr_server
 TEST_TARGET = bin/test_recording_pipeline
@@ -56,6 +57,8 @@ bin build/obj build/obj/tests:
 	mkdir -p $@
 
 clean:
-	rm -rf build bin recordings nvr_metadata.db*
+	rm -rf build bin recordings test_recordings nvr_metadata.db*
+
+-include $(wildcard build/obj/*.d build/obj/*/*.d build/obj/tests/*.d)
 
 .PHONY: all clean

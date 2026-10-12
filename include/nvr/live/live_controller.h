@@ -115,6 +115,7 @@ private:
     mutable std::mutex mutex_;
     mutable std::mutex backend_mutex_;
     std::mutex layout_mutex_;
+    std::mutex pipeline_start_mutex_;
     LiveConfig config_;
     DisplayBackendPtr display_backend_;
 

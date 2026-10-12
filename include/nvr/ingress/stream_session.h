@@ -47,6 +47,7 @@ private:
     bool ParseRtspUrl(const std::string& url, std::string& host, int& port, std::string& path, std::string& auth_header);
     bool ReadRtspResponse(std::string& response, int timeout_ms = 4000);
     bool ReadExact(uint8_t* buffer, size_t length, int timeout_ms = 4000);
+    int GetSocketFd() const;
 
     void ParseSdp(const std::string& sdp, std::string& track_control, CodecType& codec, int& payload_type);
     bool BuildDigestAuthHeader(const std::string& method, const std::string& uri, std::string& out_header);
@@ -68,6 +69,7 @@ private:
     std::thread worker_thread_;
     std::mutex stop_mutex_;
     std::condition_variable stop_cv_;
+    mutable std::mutex socket_mutex_;
 
     int sock_fd_{-1};
     int cseq_{1};

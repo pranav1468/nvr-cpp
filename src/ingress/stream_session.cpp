@@ -95,22 +95,24 @@ void StreamSession::Start() {
 }
 
 void StreamSession::Stop() {
-    if (!running_.exchange(false)) {
-        return;
-    }
+    running_.store(false);
+    stop_cv_.notify_all();
+
+    // Interrupt socket I/O without closing the descriptor.
     {
-        std::lock_guard<std::mutex> lock(stop_mutex_);
-        stop_cv_.notify_all();
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        if (sock_fd_ >= 0) {
+            shutdown(sock_fd_, SHUT_RDWR);
+        }
     }
-    // Shut down the socket cleanly so any active poll/recv in worker_thread_ unblocks immediately
-    int fd = sock_fd_;
-    if (fd >= 0) {
-        shutdown(fd, SHUT_RDWR);
-    }
+
     if (worker_thread_.joinable()) {
         worker_thread_.join();
     }
+
+    // The worker has exited, so it can no longer be using the socket.
     DisconnectSocket();
+
     LOG_INFO << "[Channel " << channel_id_ << "] Stopped RTSP session";
 }
 
@@ -295,6 +297,11 @@ bool StreamSession::BuildDigestAuthHeader(const std::string& method, const std::
                                  method, uri, digest_qop_, digest_opaque_, out_header);
 }
 
+int StreamSession::GetSocketFd() const {
+    std::lock_guard<std::mutex> lock(socket_mutex_);
+    return sock_fd_;
+}
+
 bool StreamSession::ConnectSocket() {
     DisconnectSocket();
 
@@ -315,27 +322,27 @@ bool StreamSession::ConnectSocket() {
         return false;
     }
 
-    sock_fd_ = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock_fd_ < 0) {
+    int local_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (local_fd < 0) {
         freeaddrinfo(res);
         return false;
     }
 
     // Set non-blocking for connection timeout
-    int flags = fcntl(sock_fd_, F_GETFL, 0);
-    fcntl(sock_fd_, F_SETFL, flags | O_NONBLOCK);
+    int flags = fcntl(local_fd, F_GETFL, 0);
+    fcntl(local_fd, F_SETFL, flags | O_NONBLOCK);
 
-    int ret = connect(sock_fd_, res->ai_addr, res->ai_addrlen);
+    int ret = connect(local_fd, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
 
     if (ret < 0 && errno != EINPROGRESS) {
-        DisconnectSocket();
+        close(local_fd);
         return false;
     }
 
     if (ret < 0) {
         struct pollfd pfd{};
-        pfd.fd = sock_fd_;
+        pfd.fd = local_fd;
         pfd.events = POLLOUT;
         int poll_ret = 0;
         int waited = 0;
@@ -345,26 +352,35 @@ bool StreamSession::ConnectSocket() {
             waited += 100;
         }
         if (!running_ || poll_ret <= 0) {
-            DisconnectSocket();
+            close(local_fd);
             return false;
         }
 
         int sock_err = 0;
         socklen_t len = sizeof(sock_err);
-        getsockopt(sock_fd_, SOL_SOCKET, SO_ERROR, &sock_err, &len);
+        getsockopt(local_fd, SOL_SOCKET, SO_ERROR, &sock_err, &len);
         if (sock_err != 0) {
-            DisconnectSocket();
+            close(local_fd);
             return false;
         }
     }
 
     // Restore blocking with receive timeout
-    fcntl(sock_fd_, F_SETFL, flags);
+    fcntl(local_fd, F_SETFL, flags);
     struct timeval tv{};
     tv.tv_sec = 4;
     tv.tv_usec = 0;
-    setsockopt(sock_fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(sock_fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(local_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(local_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        if (!running_) {
+            close(local_fd);
+            return false;
+        }
+        sock_fd_ = local_fd;
+    }
 
     cseq_ = 1;
     session_id_.clear();
@@ -373,8 +389,13 @@ bool StreamSession::ConnectSocket() {
 }
 
 void StreamSession::DisconnectSocket() {
-    int fd = sock_fd_;
-    sock_fd_ = -1;
+    int fd = -1;
+    {
+        std::lock_guard<std::mutex> lock(socket_mutex_);
+        fd = sock_fd_;
+        sock_fd_ = -1;
+    }
+
     if (fd >= 0) {
         shutdown(fd, SHUT_RDWR);
         close(fd);
@@ -392,7 +413,7 @@ bool StreamSession::ReadExact(uint8_t* buffer, size_t length, int timeout_ms) {
     size_t total = 0;
     auto start = std::chrono::steady_clock::now();
     while (total < length && running_) {
-        int fd = sock_fd_;
+        int fd = GetSocketFd();
         if (fd < 0) return false;
 
         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -472,7 +493,8 @@ bool StreamSession::SendRtspOptions() {
         << "\r\n";
 
     std::string req = oss.str();
-    if (send(sock_fd_, req.c_str(), req.size(), 0) <= 0) return false;
+    int fd = GetSocketFd();
+    if (fd < 0 || send(fd, req.c_str(), req.size(), 0) <= 0) return false;
 
     std::string resp;
     if (!ReadRtspResponse(resp) || resp.find("200 OK") == std::string::npos) {
@@ -611,7 +633,8 @@ bool StreamSession::SendRtspDescribe() {
         << "\r\n";
 
     std::string req = oss.str();
-    if (send(sock_fd_, req.c_str(), req.size(), 0) <= 0) return false;
+    int fd = GetSocketFd();
+    if (fd < 0 || send(fd, req.c_str(), req.size(), 0) <= 0) return false;
 
     std::string resp;
     if (!ReadRtspResponse(resp)) return false;
@@ -629,7 +652,8 @@ bool StreamSession::SendRtspDescribe() {
                       << auth_header_
                       << "\r\n";
             std::string retry_req = retry_oss.str();
-            if (send(sock_fd_, retry_req.c_str(), retry_req.size(), 0) <= 0) return false;
+            fd = GetSocketFd();
+            if (fd < 0 || send(fd, retry_req.c_str(), retry_req.size(), 0) <= 0) return false;
             if (!ReadRtspResponse(resp)) return false;
         }
     }
@@ -705,7 +729,8 @@ bool StreamSession::SendRtspSetup(const std::string& track_control, int rtp_chan
         << "\r\n";
 
     std::string req = oss.str();
-    if (send(sock_fd_, req.c_str(), req.size(), 0) <= 0) return false;
+    int fd = GetSocketFd();
+    if (fd < 0 || send(fd, req.c_str(), req.size(), 0) <= 0) return false;
 
     std::string resp;
     if (!ReadRtspResponse(resp) || resp.find("200 OK") == std::string::npos) {
@@ -742,7 +767,8 @@ bool StreamSession::SendRtspPlay() {
         << "\r\n";
 
     std::string req = oss.str();
-    if (send(sock_fd_, req.c_str(), req.size(), 0) <= 0) return false;
+    int fd = GetSocketFd();
+    if (fd < 0 || send(fd, req.c_str(), req.size(), 0) <= 0) return false;
 
     std::string resp;
     if (!ReadRtspResponse(resp) || resp.find("200 OK") == std::string::npos) {
@@ -756,7 +782,8 @@ bool StreamSession::SendRtspPlay() {
 }
 
 bool StreamSession::SendRtspKeepAlive() {
-    if (sock_fd_ < 0 || session_id_.empty()) return false;
+    int fd = GetSocketFd();
+    if (fd < 0 || session_id_.empty()) return false;
     std::ostringstream oss;
     oss << "GET_PARAMETER " << rtsp_url_ << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
@@ -766,7 +793,7 @@ bool StreamSession::SendRtspKeepAlive() {
         << "\r\n";
 
     std::string req = oss.str();
-    return (send(sock_fd_, req.c_str(), req.size(), 0) > 0);
+    return (send(fd, req.c_str(), req.size(), 0) > 0);
 }
 
 void StreamSession::WorkerLoop() {

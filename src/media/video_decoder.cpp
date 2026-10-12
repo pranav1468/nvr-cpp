@@ -523,8 +523,13 @@ public:
 
         // 1. Hardware V4L2 M2M decoding path
         if (is_hardware_ && v4l2_fd_ >= 0) {
-            if (DecodeHardware(packet, out_frame)) {
+            V4l2DecodeResult res = DecodeHardware(packet, out_frame);
+            if (res == V4l2DecodeResult::FRAME_READY) {
                 return true;
+            }
+            if (res == V4l2DecodeResult::FRAME_PENDING) {
+                out_frame.reset();
+                return false;
             }
         }
 
@@ -536,6 +541,7 @@ public:
         }
 
         // Decode failed on both hardware and software engines; do not report fake success
+        out_frame.reset();
         return false;
     }
 
@@ -643,7 +649,13 @@ public:
     uint32_t GetHeight() const override { return height_; }
 
 private:
-    bool DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
+    enum class V4l2DecodeResult {
+        FRAME_READY,
+        FRAME_PENDING,
+        INPUT_REJECTED
+    };
+
+    V4l2DecodeResult DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
         uint32_t frame_w = (width_ > 0) ? width_ : (negotiated_width_ > 0 ? negotiated_width_ : 1920);
         uint32_t frame_h = (height_ > 0) ? height_ : (negotiated_height_ > 0 ? negotiated_height_ : 1080);
         frame_w = (frame_w & ~1U);
@@ -674,36 +686,40 @@ private:
             }
         }
 
-        if (out_idx >= 0 && output_buffers_[out_idx].start) {
-            // Reject oversized compressed packets; never silently truncate encoded video
-            if (packet->data.size() > output_buffers_[out_idx].length) {
-                LOG_WARN << "[VpuVideoDecoder] Rejecting oversized compressed packet (" 
-                         << packet->data.size() << " bytes > buffer limit " 
-                         << output_buffers_[out_idx].length << " bytes)";
-                return false;
-            }
-            size_t copy_bytes = packet->data.size();
-            std::memcpy(output_buffers_[out_idx].start, packet->data.data(), copy_bytes);
-
-            struct v4l2_buffer q{};
-            q.type = output_buf_type_;
-            q.memory = V4L2_MEMORY_MMAP;
-            q.index = out_idx;
-            q.bytesused = copy_bytes;
-            // Associate packet PTS with output buffer so driver preserves timestamp
-            q.timestamp.tv_sec = packet->pts_us / 1000000;
-            q.timestamp.tv_usec = packet->pts_us % 1000000;
-            struct v4l2_plane q_planes[1]{};
-            if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
-                q_planes[0].bytesused = copy_bytes;
-                q_planes[0].length = output_buffers_[out_idx].length;
-                q.m.planes = q_planes;
-                q.length = 1;
-            }
-            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &q) == 0) {
-                output_buffers_[out_idx].queued = true;
-            }
+        if (out_idx < 0 || !output_buffers_[out_idx].start) {
+            return V4l2DecodeResult::INPUT_REJECTED;
         }
+
+        // Reject oversized compressed packets; never silently truncate encoded video
+        if (packet->data.size() > output_buffers_[out_idx].length) {
+            LOG_WARN << "[VpuVideoDecoder] Rejecting oversized compressed packet (" 
+                     << packet->data.size() << " bytes > buffer limit " 
+                     << output_buffers_[out_idx].length << " bytes)";
+            return V4l2DecodeResult::INPUT_REJECTED;
+        }
+        size_t copy_bytes = packet->data.size();
+        std::memcpy(output_buffers_[out_idx].start, packet->data.data(), copy_bytes);
+
+        struct v4l2_buffer q{};
+        q.type = output_buf_type_;
+        q.memory = V4L2_MEMORY_MMAP;
+        q.index = out_idx;
+        q.bytesused = copy_bytes;
+        // Associate packet PTS with output buffer so driver preserves timestamp
+        q.timestamp.tv_sec = packet->pts_us / 1000000;
+        q.timestamp.tv_usec = packet->pts_us % 1000000;
+        struct v4l2_plane q_planes[1]{};
+        if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+            q_planes[0].bytesused = copy_bytes;
+            q_planes[0].length = output_buffers_[out_idx].length;
+            q.m.planes = q_planes;
+            q.length = 1;
+        }
+        if (ioctl(v4l2_fd_, VIDIOC_QBUF, &q) < 0) {
+            LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_QBUF failed: " << strerror(errno);
+            return V4l2DecodeResult::INPUT_REJECTED;
+        }
+        output_buffers_[out_idx].queued = true;
 
         struct v4l2_buffer dq_cap{};
         dq_cap.type = capture_buf_type_;
@@ -763,14 +779,14 @@ private:
             if (ioctl(v4l2_fd_, VIDIOC_QBUF, &req_q) == 0) {
                 capture_buffers_[cap_idx].queued = true;
             }
-            return copy_ok;
+            return copy_ok ? V4l2DecodeResult::FRAME_READY : V4l2DecodeResult::INPUT_REJECTED;
         }
 
         if (dq_ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return false;
+            return V4l2DecodeResult::FRAME_PENDING;
         }
 
-        return false;
+        return V4l2DecodeResult::INPUT_REJECTED;
     }
 
     bool SetupV4l2Queues() {
@@ -966,9 +982,12 @@ private:
                 qbuf.m.planes = qplanes;
                 qbuf.length = 1;
             }
-            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &qbuf) == 0) {
-                capture_buffers_[i].queued = true;
+            if (ioctl(v4l2_fd_, VIDIOC_QBUF, &qbuf) < 0) {
+                LOG_WARN << "[VpuVideoDecoder] Initial capture VIDIOC_QBUF failed for index " << i;
+                CleanupV4l2Buffers();
+                return false;
             }
+            capture_buffers_[i].queued = true;
         }
 
         // 5. Start streaming on both queues independently
