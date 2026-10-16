@@ -164,6 +164,7 @@ int main(int argc, char* argv[]) {
         if (cam.enabled) {
             nvr::RecordingScheduler::Instance().StartChannelRecording(cam.id, cam.record_mode);
             nvr::CameraManager::Instance().StartCamera(cam.id);
+            nvr::CameraManager::Instance().StartSubStream(cam.id);
         }
     }
 

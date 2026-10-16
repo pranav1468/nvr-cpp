@@ -30,33 +30,33 @@
     {
       "id": 1,
       "name": "Live_Cam_1",
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.211:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.211:554/substream",
       "enabled": true,
       "record_mode": 1
     },
     {
       "id": 2,
       "name": "Live_Cam_2",
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
-      "enabled": true,
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.211:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.211:554/substream",
+      "enabled": false,
       "record_mode": 1
     },
     {
       "id": 3,
       "name": "Live_Cam_3",
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
-      "enabled": true,
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.211:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.211:554/substream",
+      "enabled": false,
       "record_mode": 1
     },
     {
       "id": 4,
       "name": "Live_Cam_4",
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
-      "enabled": true,
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.211:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.211:554/substream",
+      "enabled": false,
       "record_mode": 1
     }
   ]
