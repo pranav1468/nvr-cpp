@@ -555,15 +555,29 @@
                 return;
             }
 
+            video.muted = true;
+            video.autoplay = true;
+            video.playsInline = true;
+
             const ms = new MediaSource();
             video.src = URL.createObjectURL(ms);
 
             ms.addEventListener('sourceopen', () => {
                 let sb;
+                const candidateCodecs = [
+                    'video/mp4; codecs="avc1.64001f"', // High Profile Level 3.1 (Camera Substream)
+                    'video/mp4; codecs="avc1.640028"', // High Profile Level 4.0 (Camera Mainstream)
+                    'video/mp4; codecs="avc1.4d401f"', // Main Profile Level 3.1
+                    'video/mp4; codecs="avc1.42e01e"', // Baseline Profile Level 3.0
+                    'video/mp4; codecs="avc1.42001e"',
+                    'video/mp4'
+                ];
+
+                let chosenMime = candidateCodecs.find(m => MediaSource.isTypeSupported(m)) || 'video/mp4; codecs="avc1.42e01e"';
                 try {
-                    sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+                    sb = ms.addSourceBuffer(chosenMime);
                 } catch (e) {
-                    console.warn('SourceBuffer error: ', e);
+                    console.warn('SourceBuffer creation failed for Cam ' + camId, e);
                     snap.style.display = 'block';
                     return;
                 }
@@ -574,16 +588,30 @@
                         try {
                             sb.appendBuffer(queue.shift());
                         } catch (e) {
-                            console.warn('appendBuffer error:', e);
+                            console.warn('appendBuffer error on Cam ' + camId, e);
                         }
                     }
                 }
 
-                sb.addEventListener('updateend', appendNext);
+                sb.addEventListener('updateend', () => {
+                    appendNext();
+                    if (video.paused) {
+                        video.play().catch(e => console.warn('Autoplay error on Cam ' + camId, e));
+                    }
+                    // Keep playhead close to live edge (< 1.5s delay)
+                    if (video.buffered.length > 0) {
+                        const liveEdge = video.buffered.end(video.buffered.length - 1);
+                        if (liveEdge - video.currentTime > 1.5) {
+                            video.currentTime = liveEdge - 0.1;
+                        }
+                    }
+                });
 
                 fetch('/api/v1/stream?channel=' + camId + '&stream=sub')
                     .then(res => {
                         if (!res.ok) throw new Error('Stream status ' + res.status);
+                        snap.style.display = 'none';
+                        video.style.display = 'block';
                         const reader = res.body.getReader();
                         function readChunk() {
                             reader.read().then(({done, value}) => {
@@ -591,13 +619,15 @@
                                 queue.push(value);
                                 appendNext();
                                 readChunk();
-                            }).catch(() => {
+                            }).catch(err => {
+                                console.warn('Stream read ended for Cam ' + camId, err);
                                 snap.style.display = 'block';
                             });
                         }
                         readChunk();
                     })
-                    .catch(() => {
+                    .catch(err => {
+                        console.warn('Stream connection failed for Cam ' + camId, err);
                         snap.style.display = 'block';
                     });
             });

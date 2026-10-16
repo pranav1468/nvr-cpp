@@ -595,6 +595,8 @@ void RestServer::HandleStreamClient(int client_fd, int channel_id, StreamType st
     uint32_t height = (stream_type == StreamType::MAIN ? 1080 : 360);
     uint32_t seq = 1;
     uint64_t last_pts = 0;
+    uint64_t base_pts = 0;
+    bool has_base_pts = false;
 
     LOG_INFO << "[RestServer] Client connected to live fMP4 stream (Cam: " 
              << channel_id << ", " << (stream_type == StreamType::MAIN ? "MAIN" : "SUB") << ")";
@@ -614,21 +616,23 @@ void RestServer::HandleStreamClient(int client_fd, int channel_id, StreamType st
 
         if (!pkt || pkt->data.empty()) continue;
 
-        // Proactively detect socket disconnect / EOF
-        struct pollfd pfd;
-        pfd.fd = client_fd;
-        pfd.events = POLLIN | POLLHUP | POLLERR;
-        if (poll(&pfd, 1, 0) > 0) {
-            if (pfd.revents & (POLLHUP | POLLERR)) break;
-            if (pfd.revents & POLLIN) {
-                char dummy[1];
-                ssize_t peek = recv(client_fd, dummy, 1, MSG_PEEK | MSG_DONTWAIT);
-                if (peek == 0) break; // Client sent EOF (closed)
+        // 1. Accumulate SPS (type 7) and PPS (type 8) from packet NAL units
+        auto nals = Fmp4Muxer::ParseAnnexBNals(pkt->data.data(), pkt->data.size());
+        for (const auto& nal : nals) {
+            if (nal.type == 7 && sps.empty()) {
+                sps.assign(nal.data, nal.data + nal.size);
+            } else if (nal.type == 8 && pps.empty()) {
+                pps.assign(nal.data, nal.data + nal.size);
             }
         }
 
         if (!init_sent) {
-            if (Fmp4Muxer::ExtractParameterSets(pkt->data.data(), pkt->data.size(), sps, pps)) {
+            // Check if we also have parameter sets via direct extractor
+            if (sps.empty() || pps.empty()) {
+                Fmp4Muxer::ExtractParameterSets(pkt->data.data(), pkt->data.size(), sps, pps);
+            }
+
+            if (!sps.empty() && !pps.empty()) {
                 uint32_t pw = 0, ph = 0;
                 if (Fmp4Muxer::ParseSpsDimensions(sps.data(), sps.size(), pw, ph)) {
                     width = pw;
@@ -638,20 +642,32 @@ void RestServer::HandleStreamClient(int client_fd, int channel_id, StreamType st
                 ssize_t n = send(client_fd, init_seg.data(), init_seg.size(), MSG_NOSIGNAL);
                 if (n <= 0) break;
                 init_sent = true;
-                last_pts = (pkt->pts_us > 0) ? ((pkt->pts_us * 90) / 1000) : 0;
             } else {
-                continue; // Wait for keyframe containing SPS/PPS before starting stream
+                continue; // Wait until both SPS and PPS are captured
             }
+        }
+
+        // Ensure playback starts on an IDR keyframe
+        if (!has_base_pts && !pkt->is_keyframe) {
+            continue;
         }
 
         auto avcc = Fmp4Muxer::AnnexBToAvcc(pkt->data.data(), pkt->data.size());
         if (avcc.empty()) continue;
 
-        uint64_t cur_pts = (pkt->pts_us > 0) ? ((pkt->pts_us * 90) / 1000) : (last_pts + 3600);
-        uint32_t dur = static_cast<uint32_t>((cur_pts > last_pts) ? (cur_pts - last_pts) : 3600);
-        last_pts = cur_pts;
+        if (!has_base_pts) {
+            base_pts = (pkt->pts_us > 0) ? ((pkt->pts_us * 90) / 1000) : 0;
+            has_base_pts = true;
+            last_pts = 0;
+        }
 
-        auto seg = Fmp4Muxer::BuildMediaSegment(seq++, cur_pts, dur, pkt->is_keyframe, avcc.data(), avcc.size());
+        uint64_t raw_pts = (pkt->pts_us > 0) ? ((pkt->pts_us * 90) / 1000) : (base_pts + last_pts + 3600);
+        uint64_t norm_pts = (raw_pts >= base_pts) ? (raw_pts - base_pts) : 0;
+        uint32_t dur = static_cast<uint32_t>((norm_pts > last_pts) ? (norm_pts - last_pts) : 3600);
+        if (dur > 90000 || dur == 0) dur = 3600; // Clamp jump anomalies
+        last_pts = norm_pts;
+
+        auto seg = Fmp4Muxer::BuildMediaSegment(seq++, norm_pts, dur, pkt->is_keyframe, avcc.data(), avcc.size());
         ssize_t n = send(client_fd, seg.data(), seg.size(), MSG_NOSIGNAL);
         if (n <= 0) {
             // Client closed stream connection

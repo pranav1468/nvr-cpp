@@ -114,6 +114,11 @@ bool CameraManager::StartSubStream(int channel_id) {
         return false;
     }
 
+    if (!it->second.config.enabled) {
+        LOG_WARN << "[Channel " << channel_id << "] Camera disabled; ignoring StartSubStream";
+        return false;
+    }
+
     std::string sub_url = it->second.config.sub_rtsp_url;
     if (sub_url.empty()) {
         sub_url = it->second.config.rtsp_url;
