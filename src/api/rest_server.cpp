@@ -216,7 +216,8 @@ bool RestServer::Start() {
     }
 
     is_running_.store(true);
-    worker_pool_ = std::make_unique<ThreadPool>(4);
+    worker_pool_ = std::make_unique<ThreadPool>(8);
+    media_pool_ = std::make_unique<ThreadPool>(16);
     listener_thread_ = std::thread(&RestServer::ListenerLoop, this);
 
     LOG_INFO << "[RestServer] HTTP REST Control Plane listening on port " << config_.port
@@ -237,6 +238,11 @@ void RestServer::Stop() {
 
     if (listener_thread_.joinable()) {
         listener_thread_.join();
+    }
+
+    if (media_pool_) {
+        media_pool_->Shutdown();
+        media_pool_.reset();
     }
 
     if (worker_pool_) {
@@ -446,7 +452,13 @@ void RestServer::HandleClient(int client_fd) {
         int channel_id = query_params.value("channel", 1);
         std::string stream_str = query_params.value("stream", "sub");
         StreamType stream_type = (stream_str == "main") ? StreamType::MAIN : StreamType::SUB;
-        HandleStreamClient(client_fd, channel_id, stream_type);
+        if (media_pool_) {
+            media_pool_->Enqueue([this, client_fd, channel_id, stream_type]() {
+                HandleStreamClient(client_fd, channel_id, stream_type);
+            });
+        } else {
+            close(client_fd);
+        }
         return;
     }
 

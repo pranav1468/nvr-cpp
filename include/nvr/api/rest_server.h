@@ -36,6 +36,7 @@ private:
     int server_fd_{-1};
     std::thread listener_thread_;
     std::unique_ptr<ThreadPool> worker_pool_;
+    std::unique_ptr<ThreadPool> media_pool_;
 };
 
 } // namespace nvr
