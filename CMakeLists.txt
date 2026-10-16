@@ -28,6 +28,7 @@ endif()
 # Core backend source files
 set(CORE_SOURCES
     src/common/logger.cpp
+    src/common/deep_tracer.cpp
     src/common/time_utils.cpp
     src/common/thread_pool.cpp
     src/storage/database_manager.cpp
@@ -46,6 +47,7 @@ set(CORE_SOURCES
     src/live/live_queue.cpp
     src/live/live_controller.cpp
     src/live/qml_video_bridge.cpp
+    src/api/rest_server.cpp
 )
 
 # Core static library

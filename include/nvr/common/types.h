@@ -335,11 +335,18 @@ struct AiConfig {
     double motion_threshold{0.05};
 };
 
+struct ApiConfig {
+    int http_port{8080};
+    std::string web_root{"./web"};
+    bool enabled{true};
+};
+
 struct NvrConfig {
     SystemConfig system;
     StorageConfig storage;
     LiveConfig live;
     AiConfig ai;
+    ApiConfig api;
     std::vector<CameraConfig> cameras;
 };
 

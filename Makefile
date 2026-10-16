@@ -26,7 +26,8 @@ SRCS = src/common/logger.cpp \
        src/ingress/camera_manager.cpp \
        src/live/live_queue.cpp \
        src/live/live_controller.cpp \
-       src/live/qml_video_bridge.cpp
+       src/live/qml_video_bridge.cpp \
+       src/api/rest_server.cpp
 
 OBJS = $(patsubst src/%.cpp, build/obj/%.o, $(SRCS))
 DEPS = $(OBJS:.o=.d) build/obj/main.d build/obj/tests/test_recording_pipeline.d build/obj/tests/test_live_pipeline.d

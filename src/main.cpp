@@ -10,6 +10,8 @@
 #include "nvr/recording/recording_scheduler.h"
 #include "nvr/ingress/camera_manager.h"
 #include "nvr/live/live_controller.h"
+#include "nvr/live/qml_video_bridge.h"
+#include "nvr/api/rest_server.h"
 #include "3rdparty/nlohmann/json.hpp"
 
 #include <csignal>
@@ -64,6 +66,13 @@ nvr::NvrConfig LoadConfig(const std::string& config_path) {
             if (lv.contains("grid_layout")) config.live.grid_layout = lv["grid_layout"];
             if (lv.contains("max_queue_depth")) config.live.max_queue_depth = lv["max_queue_depth"];
             if (lv.contains("drop_stale_frames")) config.live.drop_stale_frames = lv["drop_stale_frames"];
+        }
+
+        if (j.contains("api")) {
+            auto& a = j["api"];
+            if (a.contains("http_port")) config.api.http_port = a["http_port"];
+            if (a.contains("web_root")) config.api.web_root = a["web_root"];
+            if (a.contains("enabled")) config.api.enabled = a["enabled"];
         }
 
         if (j.contains("cameras") && j["cameras"].is_array()) {
@@ -158,6 +167,9 @@ int main(int argc, char* argv[]) {
 
     // Initialize Live View Pipeline
     nvr::LiveController::Instance().Configure(config.live);
+    nvr::LiveController::Instance().SetDisplayBackend(
+        std::shared_ptr<nvr::QmlVideoBridge>(&nvr::QmlVideoBridge::Instance(), [](nvr::QmlVideoBridge*){})
+    );
     if (config.live.grid_layout == 1) {
         nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::SINGLE);
     } else if (config.live.grid_layout == 6) {
@@ -170,6 +182,11 @@ int main(int argc, char* argv[]) {
     nvr::LiveController::Instance().Start();
 
     LOG_INFO << "NVR Recording and Live View Pipelines initialized and operational.";
+
+    // Initialize & Start Embedded Web & REST Server
+    if (config.api.enabled) {
+        nvr::RestServer::Instance().Start(config.api.http_port, config.api.web_root);
+    }
 
     // Supervisor Telemetry Loop
     int loop_counter = 0;
@@ -201,6 +218,9 @@ int main(int argc, char* argv[]) {
     }
 
     LOG_INFO << "Shutting down NVR subsystems gracefully...";
+
+    // 0. Stop Web & REST Server
+    nvr::RestServer::Instance().Stop();
 
     // 1. Stop Live View Pipeline
     nvr::LiveController::Instance().Stop();
