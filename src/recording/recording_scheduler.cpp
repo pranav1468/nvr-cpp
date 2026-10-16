@@ -344,6 +344,8 @@ void RecordingScheduler::FlushChannel(int channel_id) {
 }
 
 void RecordingScheduler::ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> state) {
+    auto last_packet_time = std::chrono::steady_clock::now();
+
     while (state->running) {
         MediaPacketPtr packet;
         {
@@ -363,9 +365,22 @@ void RecordingScheduler::ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> s
         }
 
         if (!packet) {
-            // Periodic check for motion post-roll expiration
-            if (state->mode == RecordMode::MOTION_ONLY && state->is_in_motion_recording) {
-                auto now = std::chrono::steady_clock::now();
+            auto now = std::chrono::steady_clock::now();
+            auto stall_elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_packet_time).count();
+
+            // Check if active recording has stalled (> 5000ms without packets)
+            if (state->segmenter && state->segmenter->IsRecording() && stall_elapsed_ms >= 5000) {
+                LOG_WARN << "[Channel " << state->channel_id
+                         << "] Recording packet stall detected (" << stall_elapsed_ms
+                         << " ms without packets). Finalizing active segment.";
+                state->segmenter->FlushAndStop();
+                state->needs_keyframe_resync = true;
+                if (state->mode == RecordMode::MOTION_ONLY) {
+                    state->is_in_motion_recording = false;
+                    state->has_motion_occurred = false;
+                }
+            } else if (state->mode == RecordMode::MOTION_ONLY && state->is_in_motion_recording) {
+                // Periodic check for motion post-roll expiration
                 auto elapsed_sec = std::chrono::duration_cast<std::chrono::seconds>(now - state->last_motion_time).count();
                 if (!state->motion_active && elapsed_sec >= state->post_roll_seconds) {
                     state->is_in_motion_recording = false;
@@ -376,6 +391,8 @@ void RecordingScheduler::ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> s
             }
             continue;
         }
+
+        last_packet_time = std::chrono::steady_clock::now();
 
         // Realignment check: if recovery active, skip orphaned non-keyframes until IDR keyframe
         if (state->needs_keyframe_resync && packet->IsVideo()) {

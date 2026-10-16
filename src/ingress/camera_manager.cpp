@@ -1,5 +1,7 @@
 #include "nvr/ingress/camera_manager.h"
 #include "nvr/common/logger.h"
+#include "nvr/media/stream_broker.h"
+#include "nvr/recording/recording_scheduler.h"
 
 namespace nvr {
 
@@ -65,6 +67,10 @@ bool CameraManager::StartCamera(int channel_id) {
         return false;
     }
 
+    if (it->second.main_session && it->second.main_session->IsConnected()) {
+        return true;
+    }
+
     if (!it->second.main_session) {
         it->second.main_session = std::make_unique<StreamSession>(
             channel_id,
@@ -77,12 +83,28 @@ bool CameraManager::StartCamera(int channel_id) {
     return true;
 }
 
-void CameraManager::StopCamera(int channel_id) {
+void CameraManager::StopCamera(int channel_id, bool force) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cameras_.find(channel_id);
-    if (it != cameras_.end() && it->second.main_session) {
-        it->second.main_session->Stop();
+    if (it == cameras_.end() || !it->second.main_session) {
+        return;
     }
+
+    if (!force) {
+        if (RecordingScheduler::Instance().IsChannelActive(channel_id)) {
+            LOG_INFO << "[CameraManager] Channel " << channel_id
+                     << " MAIN stream active in recording; retaining RTSP session";
+            return;
+        }
+        size_t main_count = StreamBroker::Instance().GetSubscriberCount(channel_id, StreamType::MAIN);
+        if (main_count > 0) {
+            LOG_INFO << "[CameraManager] Channel " << channel_id
+                     << " MAIN stream has " << main_count << " active subscribers; retaining RTSP session";
+            return;
+        }
+    }
+
+    it->second.main_session->Stop();
 }
 
 bool CameraManager::StartSubStream(int channel_id) {
@@ -101,6 +123,10 @@ bool CameraManager::StartSubStream(int channel_id) {
         return false;
     }
 
+    if (it->second.sub_session && it->second.sub_session->IsConnected()) {
+        return true;
+    }
+
     if (!it->second.sub_session) {
         it->second.sub_session = std::make_unique<StreamSession>(
             channel_id,
@@ -113,36 +139,27 @@ bool CameraManager::StartSubStream(int channel_id) {
     return true;
 }
 
-void CameraManager::StopSubStream(int channel_id) {
+void CameraManager::StopSubStream(int channel_id, bool force) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cameras_.find(channel_id);
-    if (it != cameras_.end() && it->second.sub_session) {
-        it->second.sub_session->Stop();
+    if (it == cameras_.end() || !it->second.sub_session) {
+        return;
     }
+
+    if (!force) {
+        size_t sub_count = StreamBroker::Instance().GetSubscriberCount(channel_id, StreamType::SUB);
+        if (sub_count > 0) {
+            LOG_INFO << "[CameraManager] Channel " << channel_id
+                     << " SUB stream has " << sub_count << " active subscribers (e.g. AI/Grid); retaining RTSP session";
+            return;
+        }
+    }
+
+    it->second.sub_session->Stop();
 }
 
 bool CameraManager::EnsureMainStream(int channel_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = cameras_.find(channel_id);
-    if (it == cameras_.end()) {
-        return false;
-    }
-    if (it->second.main_session && it->second.main_session->IsConnected()) {
-        // Reused existing active MAIN session without duplicating connections
-        return true;
-    }
-    if (!it->second.main_session) {
-        if (it->second.config.rtsp_url.empty()) {
-            return false;
-        }
-        it->second.main_session = std::make_unique<StreamSession>(
-            channel_id,
-            StreamType::MAIN,
-            it->second.config.rtsp_url
-        );
-    }
-    it->second.main_session->Start();
-    return true;
+    return StartCamera(channel_id);
 }
 
 void CameraManager::StartAll() {

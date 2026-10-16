@@ -23,6 +23,16 @@ public:
     // Drain all stale frames and immediately return the freshest tail frame
     bool PopLatest(DecodedFramePtr& out_frame);
 
+    // Direct dispatch telemetry tracking (lock-free path for single-stage workers)
+    void RecordDirect(bool dropped = false) {
+        total_enqueued_.fetch_add(1, std::memory_order_relaxed);
+        if (dropped) {
+            total_dropped_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            total_popped_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     // Stop queue and unblock any waiting pop calls
     void Stop();
 

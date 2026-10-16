@@ -6,6 +6,12 @@
 
 namespace nvr {
 
+struct ReconciliationReport {
+    size_t ghost_records_pruned{0};
+    size_t unindexed_files_recovered{0};
+    size_t corrupt_files_removed{0};
+};
+
 class SegmentIndex {
 public:
     static SegmentIndex& Instance();
@@ -23,6 +29,8 @@ public:
     uint64_t GetTotalRecordingSizeBytes();
 
     int GetTotalSegmentCount();
+
+    ReconciliationReport ReconcileStorage(const std::string& recording_path);
 
 private:
     SegmentIndex() = default;

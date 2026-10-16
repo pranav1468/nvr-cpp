@@ -58,6 +58,26 @@ inline bool WriteAll(int fd, const void* data, size_t size) {
     return true;
 }
 
+inline void SyncParentDirectory(const std::string& file_path) {
+    std::string parent_dir = std::filesystem::path(file_path).parent_path().string();
+    if (parent_dir.empty()) {
+        parent_dir = ".";
+    }
+    int dir_fd = open(parent_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd >= 0) {
+        if (fsync(dir_fd) != 0) {
+            int err = errno;
+            if (err != EINVAL && err != ENOTSUP && err != EACCES) {
+                LOG_WARN << "Parent directory fsync failed for " << parent_dir << ": " << strerror(err);
+            }
+        }
+        close(dir_fd);
+    } else {
+        LOG_WARN << "Failed to open parent directory for fsync: " << parent_dir << ": " << strerror(errno);
+    }
+}
+
+
 // Deep ISOBMFF Box Parsing Structures and Helpers
 struct BoxHeader {
     uint64_t size{0};
@@ -1819,6 +1839,9 @@ bool AtomicWriter::FinalizeSegment(SegmentMetadata& out_meta) {
         AbortSegment();
         return false;
     }
+
+    // Flush directory entry mutation to physical non-volatile storage
+    SyncParentDirectory(final_file_path_);
 
     int64_t duration_ms = 0;
     int64_t max_last_pts_us = std::max(last_pts_us_, last_audio_pts_us_);

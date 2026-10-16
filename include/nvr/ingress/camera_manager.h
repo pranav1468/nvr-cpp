@@ -19,10 +19,10 @@ public:
     bool RemoveCamera(int channel_id);
 
     bool StartCamera(int channel_id);
-    void StopCamera(int channel_id);
+    void StopCamera(int channel_id, bool force = false);
 
     bool StartSubStream(int channel_id);
-    void StopSubStream(int channel_id);
+    void StopSubStream(int channel_id, bool force = false);
 
     bool EnsureMainStream(int channel_id);
 

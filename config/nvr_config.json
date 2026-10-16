@@ -21,13 +21,42 @@
     "max_concurrent_models": 2,
     "motion_threshold": 0.05
   },
+  "api": {
+    "enabled": true,
+    "port": 8080,
+    "web_root": "./web"
+  },
   "cameras": [
     {
       "id": 1,
-      "name": "Entrance_Cam1",
-      "rtsp_url": "rtsp://127.0.0.1:8554/live/cam1",
-      "sub_rtsp_url": "rtsp://127.0.0.1:8554/live/cam1_sub",
-      "enabled": false,
+      "name": "Live_Cam_1",
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
+      "enabled": true,
+      "record_mode": 1
+    },
+    {
+      "id": 2,
+      "name": "Live_Cam_2",
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
+      "enabled": true,
+      "record_mode": 1
+    },
+    {
+      "id": 3,
+      "name": "Live_Cam_3",
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
+      "enabled": true,
+      "record_mode": 1
+    },
+    {
+      "id": 4,
+      "name": "Live_Cam_4",
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
+      "enabled": true,
       "record_mode": 1
     }
   ]

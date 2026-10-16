@@ -221,7 +221,17 @@ std::string QmlVideoBridge::GetGridStateJson() const {
         tile_obj["rendered"] = m.rendered_frames;
         tile_obj["fps"] = m.estimated_fps;
         tile_obj["is_recording"] = RecordingScheduler::Instance().IsChannelRecording(m.channel_id);
-        tile_obj["is_online"] = CameraManager::Instance().IsCameraOnline(m.channel_id);
+
+        std::string status_str = "OFFLINE";
+        switch (m.state) {
+            case TileConnectionState::CONNECTING: status_str = "CONNECTING"; break;
+            case TileConnectionState::STREAMING:  status_str = "STREAMING";  break;
+            case TileConnectionState::STALLED:    status_str = "STALLED";    break;
+            case TileConnectionState::OFFLINE:
+            default:                              status_str = "OFFLINE";    break;
+        }
+        tile_obj["status"] = status_str;
+        tile_obj["is_online"] = (m.state != TileConnectionState::OFFLINE);
         tiles_arr.push_back(tile_obj);
     }
 

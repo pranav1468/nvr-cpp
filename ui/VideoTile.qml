@@ -15,7 +15,8 @@ Rectangle {
     property double fps: 25.0
     property int droppedFrames: 0
     property bool isRecording: false
-    property bool isOnline: true
+    property string status: "STREAMING" // "STREAMING", "CONNECTING", "STALLED", "OFFLINE"
+    property bool isOnline: status !== "OFFLINE"
     property bool isFullscreen: false
     property int frameRevision: 0
 
@@ -41,23 +42,23 @@ Rectangle {
             fillMode: Image.PreserveAspectFit
             cache: false
             asynchronous: true
-            source: root.isOnline ? "image://live/" + root.tileIndex + "/" + root.frameRevision : ""
-            visible: root.isOnline
+            source: (root.isOnline || root.frameRevision > 0) ? "image://live/" + root.tileIndex + "/" + root.frameRevision : ""
+            visible: root.isOnline || (root.status !== "OFFLINE" && root.frameRevision > 0)
         }
 
         // Offline / Connecting Placeholder
         Rectangle {
             anchors.fill: parent
             color: "#070b14"
-            visible: !root.isOnline
+            visible: root.status === "OFFLINE" || (!root.isOnline && root.frameRevision === 0) || (root.status === "CONNECTING" && root.frameRevision === 0)
 
             ColumnLayout {
                 anchors.centerIn: parent
                 spacing: 8
 
                 Text {
-                    text: "SIGNAL LOST"
-                    color: "#ef4444"
+                    text: root.status === "CONNECTING" ? "CONNECTING..." : "SIGNAL LOST"
+                    color: root.status === "CONNECTING" ? "#38bdf8" : "#ef4444"
                     font.pixelSize: 13
                     font.bold: true
                     font.family: "Monospace"
@@ -65,9 +66,43 @@ Rectangle {
                 }
 
                 Text {
-                    text: "Reconnecting Channel " + root.channelId + "..."
+                    text: root.status === "CONNECTING" ? ("Connecting Channel " + root.channelId + "...") : ("Reconnecting Channel " + root.channelId + "...")
                     color: "#64748b"
                     font.pixelSize: 11
+                    Layout.alignment: Qt.AlignHCenter
+                }
+            }
+        }
+
+        // Subtle Stalled Overlay Badge (last rendered frame remains visible underneath)
+        Rectangle {
+            anchors.centerIn: parent
+            width: stalledCol.implicitWidth + 24
+            height: stalledCol.implicitHeight + 16
+            color: Qt.rgba(0.04, 0.07, 0.13, 0.88)
+            border.color: "#eab308"
+            border.width: 1
+            radius: 6
+            visible: root.status === "STALLED" && root.frameRevision > 0
+
+            ColumnLayout {
+                id: stalledCol
+                anchors.centerIn: parent
+                spacing: 4
+
+                Text {
+                    text: "STREAM STALLED"
+                    color: "#eab308"
+                    font.pixelSize: 12
+                    font.bold: true
+                    font.family: "Monospace"
+                    Layout.alignment: Qt.AlignHCenter
+                }
+
+                Text {
+                    text: "Awaiting video packets..."
+                    color: "#94a3b8"
+                    font.pixelSize: 10
                     Layout.alignment: Qt.AlignHCenter
                 }
             }

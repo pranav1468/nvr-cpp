@@ -14,6 +14,7 @@
 #include <sstream>
 #include <cstring>
 #include <chrono>
+#include <random>
 
 namespace nvr {
 
@@ -97,6 +98,9 @@ void StreamSession::Start() {
 void StreamSession::Stop() {
     running_.store(false);
     stop_cv_.notify_all();
+
+    // Send TEARDOWN to the server to free camera resources before shutting down socket
+    SendRtspTeardown();
 
     // Interrupt socket I/O without closing the descriptor.
     {
@@ -389,6 +393,8 @@ bool StreamSession::ConnectSocket() {
 }
 
 void StreamSession::DisconnectSocket() {
+    SendRtspTeardown();
+
     int fd = -1;
     {
         std::lock_guard<std::mutex> lock(socket_mutex_);
@@ -400,6 +406,7 @@ void StreamSession::DisconnectSocket() {
         shutdown(fd, SHUT_RDWR);
         close(fd);
     }
+    session_id_.clear();
     state_ = SessionState::DISCONNECTED;
     if (depacketizer_) {
         depacketizer_->Reset();
@@ -485,11 +492,16 @@ bool StreamSession::ReadRtspResponse(std::string& response, int timeout_ms) {
 }
 
 bool StreamSession::SendRtspOptions() {
+    std::string opt_auth = auth_header_;
+    if (!digest_nonce_.empty() && !username_.empty()) {
+        BuildDigestAuthHeader("OPTIONS", rtsp_url_, opt_auth);
+    }
+
     std::ostringstream oss;
     oss << "OPTIONS " << rtsp_url_ << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
         << "User-Agent: NVR_Core/1.0\r\n"
-        << auth_header_
+        << opt_auth
         << "\r\n";
 
     std::string req = oss.str();
@@ -497,7 +509,27 @@ bool StreamSession::SendRtspOptions() {
     if (fd < 0 || send(fd, req.c_str(), req.size(), 0) <= 0) return false;
 
     std::string resp;
-    if (!ReadRtspResponse(resp) || resp.find("200 OK") == std::string::npos) {
+    if (!ReadRtspResponse(resp)) return false;
+
+    if (resp.find("401") != std::string::npos) {
+        LOG_INFO << "[Channel " << channel_id_ << "] RTSP OPTIONS received 401 Unauthorized, testing Digest auth challenge";
+        ParseDigestChallenge(resp);
+        if (!digest_nonce_.empty() && !username_.empty()) {
+            BuildDigestAuthHeader("OPTIONS", rtsp_url_, opt_auth);
+            std::ostringstream retry_oss;
+            retry_oss << "OPTIONS " << rtsp_url_ << " RTSP/1.0\r\n"
+                      << "CSeq: " << cseq_++ << "\r\n"
+                      << "User-Agent: NVR_Core/1.0\r\n"
+                      << opt_auth
+                      << "\r\n";
+            std::string retry_req = retry_oss.str();
+            fd = GetSocketFd();
+            if (fd < 0 || send(fd, retry_req.c_str(), retry_req.size(), 0) <= 0) return false;
+            if (!ReadRtspResponse(resp)) return false;
+        }
+    }
+
+    if (resp.find("200 OK") == std::string::npos) {
         LOG_WARN << "[Channel " << channel_id_ << "] RTSP OPTIONS failed: " << resp;
         return false;
     }
@@ -624,6 +656,10 @@ void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control,
 }
 
 bool StreamSession::SendRtspDescribe() {
+    if (!digest_nonce_.empty() && !username_.empty()) {
+        BuildDigestAuthHeader("DESCRIBE", rtsp_url_, auth_header_);
+    }
+
     std::ostringstream oss;
     oss << "DESCRIBE " << rtsp_url_ << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
@@ -784,40 +820,95 @@ bool StreamSession::SendRtspPlay() {
 bool StreamSession::SendRtspKeepAlive() {
     int fd = GetSocketFd();
     if (fd < 0 || session_id_.empty()) return false;
+
+    std::string keepalive_auth = auth_header_;
+    if (!digest_nonce_.empty() && !username_.empty()) {
+        BuildDigestAuthHeader("GET_PARAMETER", rtsp_url_, keepalive_auth);
+    }
+
     std::ostringstream oss;
     oss << "GET_PARAMETER " << rtsp_url_ << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
         << "Session: " << session_id_ << "\r\n"
         << "User-Agent: NVR_Core/1.0\r\n"
-        << auth_header_
+        << keepalive_auth
         << "\r\n";
 
     std::string req = oss.str();
-    return (send(fd, req.c_str(), req.size(), 0) > 0);
+    return (send(fd, req.c_str(), req.size(), MSG_NOSIGNAL) > 0);
+}
+
+bool StreamSession::SendRtspTeardown() {
+    int fd = GetSocketFd();
+    if (fd < 0 || session_id_.empty()) return false;
+
+    std::string teardown_auth = auth_header_;
+    if (!digest_nonce_.empty() && !username_.empty()) {
+        BuildDigestAuthHeader("TEARDOWN", rtsp_url_, teardown_auth);
+    }
+
+    std::ostringstream oss;
+    oss << "TEARDOWN " << rtsp_url_ << " RTSP/1.0\r\n"
+        << "CSeq: " << cseq_++ << "\r\n"
+        << "Session: " << session_id_ << "\r\n"
+        << "User-Agent: NVR_Core/1.0\r\n"
+        << teardown_auth
+        << "\r\n";
+
+    std::string req = oss.str();
+    session_id_.clear();
+    return (send(fd, req.c_str(), req.size(), MSG_NOSIGNAL) > 0);
 }
 
 void StreamSession::WorkerLoop() {
-    int backoff_sec = 1;
+    uint32_t seed = static_cast<uint32_t>(channel_id_) * 10007 +
+                    static_cast<uint32_t>(stream_type_) * 101 +
+                    static_cast<uint32_t>(time_utils::MonotonicUs() & 0xFFFFFFFF);
+    std::mt19937 rng(seed);
+
+    int reconnect_attempt = 0;
     auto last_keepalive = time_utils::MonotonicSec();
 
+    auto compute_backoff_delay_ms = [&](int attempt) -> int {
+        // RFC 8961 / AWS Full Jitter Exponential Backoff
+        // Base delay 1000ms, max cap 30000ms
+        int backoff_ms = std::min(30000, 1000 * (1 << std::min(attempt, 5)));
+        int min_delay = std::max(500, static_cast<int>(backoff_ms * 0.5));
+        int max_delay = std::min(30000, static_cast<int>(backoff_ms * 1.25));
+        std::uniform_int_distribution<int> dist(min_delay, max_delay);
+        return dist(rng);
+    };
+
     while (running_) {
+        // Ensure pristine depacketizer state before initiating any connection attempt
+        if (depacketizer_) {
+            depacketizer_->Reset();
+        }
+        if (audio_depacketizer_) {
+            audio_depacketizer_->Reset();
+        }
+
         if (!ConnectSocket() || !SendRtspOptions() || !SendRtspDescribe()) {
-            LOG_WARN << "[Channel " << channel_id_ << "] RTSP handshake failed. Retrying in " 
-                     << backoff_sec << "s...";
-            state_ = SessionState::ERROR_BACKOFF;
+            int delay_ms = compute_backoff_delay_ms(reconnect_attempt);
+            LOG_WARN << "[Channel " << channel_id_ << "] RTSP handshake failed (attempt "
+                     << reconnect_attempt + 1 << "). Retrying in " << delay_ms << "ms...";
+
             DisconnectSocket();
+            state_ = SessionState::ERROR_BACKOFF;
+            reconnect_attempt++;
+
             {
                 std::unique_lock<std::mutex> lock(stop_mutex_);
-                stop_cv_.wait_for(lock, std::chrono::seconds(backoff_sec), [this] {
+                stop_cv_.wait_for(lock, std::chrono::milliseconds(delay_ms), [this] {
                     return !running_.load();
                 });
             }
-            backoff_sec = std::min(backoff_sec * 2, 30);
             continue;
         }
 
-        backoff_sec = 1; // Reset backoff on successful connect
+        // Handshake succeeded
         last_keepalive = time_utils::MonotonicSec();
+        int64_t stream_start_time = time_utils::MonotonicSec();
 
         // Streaming reception loop for interleaved framing: '$' <channel> <length_hi> <length_lo> <data...>
         std::vector<uint8_t> rtp_buf(65536);
@@ -896,7 +987,33 @@ void StreamSession::WorkerLoop() {
             }
         }
 
+        // Streaming ended or was interrupted
+        int64_t stream_duration = time_utils::MonotonicSec() - stream_start_time;
         DisconnectSocket();
+
+        if (!running_) {
+            break;
+        }
+
+        // Flapping guard: only reset backoff if stream was stable for >= 10s
+        if (stream_duration >= 10) {
+            reconnect_attempt = 0;
+        } else {
+            reconnect_attempt++;
+        }
+
+        int delay_ms = compute_backoff_delay_ms(reconnect_attempt);
+        LOG_WARN << "[Channel " << channel_id_ << "] RTSP stream interrupted after "
+                 << stream_duration << "s (attempt " << reconnect_attempt
+                 << "). Reconnecting in " << delay_ms << "ms...";
+
+        state_ = SessionState::ERROR_BACKOFF;
+        {
+            std::unique_lock<std::mutex> lock(stop_mutex_);
+            stop_cv_.wait_for(lock, std::chrono::milliseconds(delay_ms), [this] {
+                return !running_.load();
+            });
+        }
     }
 }
 

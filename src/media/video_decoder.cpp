@@ -207,12 +207,25 @@ public:
     bool Initialize(CodecType codec) {
         if (initialized_) return true;
 
-        const char* codec_libs[] = {"libavcodec.so.58", "libavcodec.so"};
+        const char* codec_libs[] = {
+            "libavcodec.so.61", // FFmpeg 7.x
+            "libavcodec.so.60", // FFmpeg 6.x (Ubuntu 24.04 LTS / Yocto Scarthgap)
+            "libavcodec.so.59", // FFmpeg 5.x (Ubuntu 22.04 LTS)
+            "libavcodec.so.58", // FFmpeg 4.x (Ubuntu 20.04)
+            "libavcodec.so"     // Generic development symlink
+        };
         for (const char* name : codec_libs) {
             avcodec_lib_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
             if (avcodec_lib_) break;
         }
-        const char* util_libs[] = {"libavutil.so.56", "libavutil.so"};
+
+        const char* util_libs[] = {
+            "libavutil.so.59",  // FFmpeg 7.x
+            "libavutil.so.58",  // FFmpeg 6.x
+            "libavutil.so.57",  // FFmpeg 5.x
+            "libavutil.so.56",  // FFmpeg 4.x
+            "libavutil.so"      // Generic development symlink
+        };
         for (const char* name : util_libs) {
             avutil_lib_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
             if (avutil_lib_) break;
@@ -233,9 +246,12 @@ public:
 
         const unsigned int codec_major = avcodec_version_() >> 16;
         const unsigned int util_major = avutil_version_() >> 16;
-        if (codec_major != 58 || util_major != 56) {
-            LOG_WARN << "[SoftwareDecoder] Unsupported FFmpeg ABI: requires libavcodec 58 and libavutil 56 (found "
-                     << codec_major << " / " << util_major << ")";
+
+        // Verify supported modern ABI window (FFmpeg 4.x through 7.x) and matched release pairing
+        if (codec_major < 58 || codec_major > 61 || util_major < 56 || util_major > 59 ||
+            (codec_major - util_major != 2)) {
+            LOG_WARN << "[SoftwareDecoder] Unsupported or mismatched FFmpeg ABI: requires matched libavcodec (58..61) and libavutil (56..59), found "
+                     << codec_major << " / " << util_major;
             Close();
             return false;
         }

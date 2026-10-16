@@ -10,6 +10,7 @@
 #include "nvr/recording/recording_scheduler.h"
 #include "nvr/ingress/camera_manager.h"
 #include "nvr/live/live_controller.h"
+#include "nvr/api/rest_server.h"
 #include "3rdparty/nlohmann/json.hpp"
 
 #include <csignal>
@@ -64,6 +65,13 @@ nvr::NvrConfig LoadConfig(const std::string& config_path) {
             if (lv.contains("grid_layout")) config.live.grid_layout = lv["grid_layout"];
             if (lv.contains("max_queue_depth")) config.live.max_queue_depth = lv["max_queue_depth"];
             if (lv.contains("drop_stale_frames")) config.live.drop_stale_frames = lv["drop_stale_frames"];
+        }
+
+        if (j.contains("api")) {
+            auto& a = j["api"];
+            if (a.contains("enabled")) config.api.enabled = a["enabled"];
+            if (a.contains("port")) config.api.port = a["port"];
+            if (a.contains("web_root")) config.api.web_root = a["web_root"];
         }
 
         if (j.contains("cameras") && j["cameras"].is_array()) {
@@ -138,6 +146,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Reconcile database against physical disk storage
+    nvr::SegmentIndex::Instance().ReconcileStorage(config.storage.recording_path);
+
     // Initialize Retention Manager
     nvr::RetentionManager::Instance().Configure(config.storage);
     nvr::RetentionManager::Instance().Start();
@@ -169,7 +180,13 @@ int main(int argc, char* argv[]) {
     }
     nvr::LiveController::Instance().Start();
 
-    LOG_INFO << "NVR Recording and Live View Pipelines initialized and operational.";
+    // Start HTTP REST Control Plane
+    if (config.api.enabled) {
+        nvr::RestServer::Instance().Configure(config.api);
+        nvr::RestServer::Instance().Start();
+    }
+
+    LOG_INFO << "NVR Recording, Live View, and Control API initialized and operational.";
 
     // Supervisor Telemetry Loop
     int loop_counter = 0;
@@ -201,6 +218,9 @@ int main(int argc, char* argv[]) {
     }
 
     LOG_INFO << "Shutting down NVR subsystems gracefully...";
+
+    // 0. Stop HTTP REST Control Plane
+    nvr::RestServer::Instance().Stop();
 
     // 1. Stop Live View Pipeline
     nvr::LiveController::Instance().Stop();

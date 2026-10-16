@@ -6,6 +6,8 @@
 #include <memory>
 #include <mutex>
 
+#include <vector>
+
 namespace nvr {
 
 class Segmenter {
@@ -25,6 +27,8 @@ public:
 
 private:
     void RotateSegment(const MediaPacketPtr& next_keyframe_packet);
+    void ExtractAndCacheParameterSets(const MediaPacketPtr& packet);
+    void InjectCachedParameterSets();
 
     int channel_id_{0};
     std::string output_dir_;
@@ -33,6 +37,12 @@ private:
     mutable std::mutex mutex_;
     bool is_recording_{false};
     bool waiting_for_first_keyframe_{true};
+
+    // Cached parameter sets for H.264 / H.265
+    std::vector<uint8_t> cached_sps_;
+    std::vector<uint8_t> cached_pps_;
+    std::vector<uint8_t> cached_vps_;
+    CodecType cached_codec_{CodecType::UNKNOWN};
 };
 
 } // namespace nvr

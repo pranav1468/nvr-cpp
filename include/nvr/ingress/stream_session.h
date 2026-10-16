@@ -43,6 +43,7 @@ private:
     bool SendRtspSetup(const std::string& track_control, int rtp_channel = 0, int rtcp_channel = 1);
     bool SendRtspPlay();
     bool SendRtspKeepAlive();
+    bool SendRtspTeardown();
 
     bool ParseRtspUrl(const std::string& url, std::string& host, int& port, std::string& path, std::string& auth_header);
     bool ReadRtspResponse(std::string& response, int timeout_ms = 4000);

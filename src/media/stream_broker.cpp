@@ -8,15 +8,45 @@ StreamBroker& StreamBroker::Instance() {
 }
 
 StreamBroker::SubscriptionId StreamBroker::Subscribe(int channel_id, StreamType stream_type, PacketCallback callback) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::shared_mutex> w_lock(rw_mutex_);
     SubscriptionId id = next_sub_id_++;
-    subscriptions_[id] = Subscription{id, channel_id, stream_type, std::move(callback)};
+    uint32_t topic_key = MakeTopicKey(channel_id, stream_type);
+
+    auto it = topic_subscribers_.find(topic_key);
+    auto new_list = std::make_shared<SubscriberList>(
+        (it != topic_subscribers_.end() && it->second) ? *it->second : SubscriberList{}
+    );
+    new_list->push_back(SubEntry{id, std::move(callback)});
+
+    topic_subscribers_[topic_key] = std::move(new_list);
+    sub_to_topic_[id] = topic_key;
     return id;
 }
 
 void StreamBroker::Unsubscribe(SubscriptionId sub_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    subscriptions_.erase(sub_id);
+    std::unique_lock<std::shared_mutex> w_lock(rw_mutex_);
+    auto it_topic = sub_to_topic_.find(sub_id);
+    if (it_topic == sub_to_topic_.end()) {
+        return;
+    }
+    uint32_t topic_key = it_topic->second;
+    sub_to_topic_.erase(it_topic);
+
+    auto it = topic_subscribers_.find(topic_key);
+    if (it != topic_subscribers_.end() && it->second) {
+        auto new_list = std::make_shared<SubscriberList>();
+        new_list->reserve(it->second->size() > 0 ? it->second->size() - 1 : 0);
+        for (const auto& entry : *it->second) {
+            if (entry.id != sub_id) {
+                new_list->push_back(entry);
+            }
+        }
+        if (new_list->empty()) {
+            topic_subscribers_.erase(it);
+        } else {
+            it->second = std::move(new_list);
+        }
+    }
 }
 
 void StreamBroker::Publish(const MediaPacketPtr& packet) {
@@ -24,30 +54,31 @@ void StreamBroker::Publish(const MediaPacketPtr& packet) {
         return;
     }
 
-    std::vector<PacketCallback> callbacks;
+    uint32_t topic_key = MakeTopicKey(packet->channel_id, packet->stream_type);
+    SubscriberListPtr subs;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& [id, sub] : subscriptions_) {
-            if (sub.channel_id == packet->channel_id && sub.stream_type == packet->stream_type) {
-                callbacks.push_back(sub.callback);
-            }
+        std::shared_lock<std::shared_mutex> r_lock(rw_mutex_);
+        auto it = topic_subscribers_.find(topic_key);
+        if (it != topic_subscribers_.end()) {
+            subs = it->second;
         }
     }
 
-    for (const auto& cb : callbacks) {
-        cb(packet);
+    if (subs) {
+        for (const auto& entry : *subs) {
+            entry.callback(packet);
+        }
     }
 }
 
 size_t StreamBroker::GetSubscriberCount(int channel_id, StreamType stream_type) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    size_t count = 0;
-    for (const auto& [id, sub] : subscriptions_) {
-        if (sub.channel_id == channel_id && sub.stream_type == stream_type) {
-            count++;
-        }
+    uint32_t topic_key = MakeTopicKey(channel_id, stream_type);
+    std::shared_lock<std::shared_mutex> r_lock(rw_mutex_);
+    auto it = topic_subscribers_.find(topic_key);
+    if (it != topic_subscribers_.end() && it->second) {
+        return it->second->size();
     }
-    return count;
+    return 0;
 }
 
 } // namespace nvr

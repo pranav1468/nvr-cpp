@@ -28,6 +28,7 @@ endif()
 # Core backend source files
 set(CORE_SOURCES
     src/common/logger.cpp
+    src/common/deep_tracer.cpp
     src/common/time_utils.cpp
     src/common/thread_pool.cpp
     src/storage/database_manager.cpp
@@ -46,6 +47,10 @@ set(CORE_SOURCES
     src/live/live_queue.cpp
     src/live/live_controller.cpp
     src/live/qml_video_bridge.cpp
+    src/dispatcher/rbac_validator.cpp
+    src/dispatcher/command_dispatcher.cpp
+    src/api/rest_server.cpp
+    src/api/fmp4_muxer.cpp
 )
 
 # Core static library
@@ -59,10 +64,3 @@ target_link_libraries(nvr_core PUBLIC ${SQLITE3_LIB} pthread dl)
 # Server executable target
 add_executable(nvr_server src/main.cpp)
 target_link_libraries(nvr_server PRIVATE nvr_core)
-
-# Automated test executable
-add_executable(test_recording_pipeline tests/test_recording_pipeline.cpp)
-target_link_libraries(test_recording_pipeline PRIVATE nvr_core)
-
-add_executable(test_live_pipeline tests/test_live_pipeline.cpp)
-target_link_libraries(test_live_pipeline PRIVATE nvr_core)

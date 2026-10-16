@@ -4,7 +4,6 @@
 #include "nvr/live/live_queue.h"
 #include "nvr/live/display_backend.h"
 #include "nvr/media/video_decoder.h"
-#include "nvr/media/video_scaler.h"
 #include "nvr/media/stream_broker.h"
 #include <memory>
 #include <vector>
@@ -18,6 +17,13 @@
 
 namespace nvr {
 
+enum class TileConnectionState {
+    OFFLINE = 0,
+    CONNECTING = 1,
+    STREAMING = 2,
+    STALLED = 3
+};
+
 struct LiveTileMetrics {
     int channel_id{0};
     int tile_index{0};
@@ -29,6 +35,7 @@ struct LiveTileMetrics {
     uint64_t rendered_frames{0};
     double estimated_fps{0.0};
     bool is_fullscreen{false};
+    TileConnectionState state{TileConnectionState::OFFLINE};
 };
 
 struct TileConfig {
@@ -85,12 +92,16 @@ private:
     LiveController(const LiveController&) = delete;
     LiveController& operator=(const LiveController&) = delete;
 
+    struct TileTarget {
+        int tile_index{0};
+    };
+
     struct ChannelPipeline {
         int channel_id{0};
-        int tile_index{0};
         StreamType stream_type{StreamType::SUB};
         VideoDecoderPtr decoder;
-        VideoScalerPtr scaler;
+        mutable std::mutex targets_mutex;
+        std::vector<TileTarget> targets;
         std::unique_ptr<LiveQueue> queue;
         StreamBroker::SubscriptionId sub_id{0};
         std::atomic<bool> active{false};
@@ -98,21 +109,31 @@ private:
         std::mutex packet_mutex;
         std::condition_variable packet_cv;
         std::deque<MediaPacketPtr> packet_queue;
-        const size_t max_packet_depth{4};
+        const size_t max_packet_depth{12};
         std::thread worker_thread;
         std::atomic<uint64_t> rendered_count{0};
-        std::chrono::steady_clock::time_point last_frame_time;
+        std::atomic<int64_t> last_frame_time_ms{0};
         double current_fps{0.0};
+        std::atomic<bool> first_frame_rendered{false};
+        std::mutex callback_mutex;
+        std::function<void()> on_first_frame;
+        std::atomic<uint32_t> stream_width{0};
+        std::atomic<uint32_t> stream_height{0};
+        std::atomic<bool> awaiting_keyframe{true};
+        mutable std::mutex frame_mutex;
+        DecodedFramePtr last_rendered_frame;
     };
 
     void SetupGridPipelines();
+    void ReconcilePipelines(const std::vector<TileConfig>& desired_tiles);
     void TeardownPipeline(std::shared_ptr<ChannelPipeline> pipe);
     void TeardownPipelines(std::vector<std::shared_ptr<ChannelPipeline>>& pipes);
     // Precondition: Caller must hold layout_mutex_
     void StartChannelPipeline(int channel_id, int tile_index, StreamType stream_type, uint32_t target_w, uint32_t target_h);
+    void StartChannelPipelineMulti(int channel_id, StreamType stream_type, const std::vector<TileConfig>& targets);
     // Precondition: Caller must hold layout_mutex_
     void StopChannelPipeline(int channel_id);
-    void ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline, uint32_t target_w, uint32_t target_h);
+    void ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline);
 
     mutable std::mutex mutex_;
     mutable std::mutex backend_mutex_;
@@ -123,7 +144,6 @@ private:
     LiveGridLayout current_layout_{LiveGridLayout::GRID_4};
     LiveGridLayout previous_layout_{LiveGridLayout::GRID_4};
     int fullscreen_channel_id_{-1};
-    bool was_main_created_for_fullscreen_{false};
 
     std::vector<int> assigned_channels_;
     int custom_cols_{0};

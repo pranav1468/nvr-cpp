@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NVR v2.0 Production Surveillance Hub</title>
+    <style>
+        :root {
+            --bg-primary: #0a0e14;
+            --bg-secondary: #131920;
+            --bg-card: rgba(22, 30, 41, 0.7);
+            --border: rgba(255, 255, 255, 0.08);
+            --text-primary: #f1f2f6;
+            --text-secondary: #a4b0be;
+            --accent: #1e90ff;
+            --accent-hover: #3742fa;
+            --success: #2ed573;
+            --danger: #ff4757;
+            --warning: #ffa502;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow-x: hidden;
+        }
+
+        /* Top Header */
+        header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .brand-badge {
+            background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+            color: white;
+            font-weight: bold;
+            font-size: 13px;
+            padding: 4px 10px;
+            border-radius: 6px;
+            letter-spacing: 0.5px;
+        }
+
+        .brand h1 {
+            font-size: 18px;
+            font-weight: 600;
+            letter-spacing: -0.2px;
+        }
+
+        .telemetry-bar {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            font-size: 13px;
+            color: var(--text-secondary);
+        }
+
+        .telemetry-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .telemetry-item strong {
+            color: var(--text-primary);
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--success);
+            border-radius: 50%;
+            box-shadow: 0 0 8px var(--success);
+        }
+
+        /* Toolbar Controls */
+        .controls-bar {
+            padding: 12px 24px;
+            background: rgba(19, 25, 32, 0.4);
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .btn-group {
+            display: flex;
+            gap: 8px;
+        }
+
+        button {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        button:hover {
+            background: rgba(255, 255, 255, 0.1);
+            border-color: rgba(255, 255, 255, 0.2);
+        }
+
+        button.active {
+            background: var(--accent);
+            border-color: var(--accent);
+            color: white;
+        }
+
+        /* Video Grid Layout */
+        main {
+            flex: 1;
+            padding: 20px 24px;
+        }
+
+        .video-grid {
+            display: grid;
+            gap: 16px;
+            height: calc(100vh - 160px);
+            width: 100%;
+        }
+
+        .grid-4 {
+            grid-template-columns: repeat(2, 1fr);
+            grid-template-rows: repeat(2, 1fr);
+        }
+
+        .grid-1 {
+            grid-template-columns: 1fr;
+            grid-template-rows: 1fr;
+        }
+
+        .video-tile {
+            background: #000;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+        }
+
+        .video-tile video, .video-tile img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+
+        .tile-header {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            right: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        .tile-title {
+            background: rgba(10, 14, 20, 0.75);
+            backdrop-filter: blur(8px);
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .badge-rec {
+            background: rgba(255, 71, 87, 0.85);
+            color: white;
+            font-size: 11px;
+            font-weight: bold;
+            padding: 2px 6px;
+            border-radius: 4px;
+            letter-spacing: 0.5px;
+        }
+
+        .badge-stream {
+            background: rgba(30, 144, 255, 0.7);
+            color: white;
+            font-size: 11px;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        .tile-footer {
+            position: absolute;
+            bottom: 10px;
+            left: 10px;
+            right: 10px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            color: var(--text-secondary);
+            background: rgba(10, 14, 20, 0.65);
+            padding: 4px 8px;
+            border-radius: 4px;
+            pointer-events: none;
+        }
+
+        /* Login Modal */
+        .modal-overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0, 0, 0, 0.8);
+            backdrop-filter: blur(10px);
+            display: none;
+            align-items: center;
+            justify-content: center;
+            z-index: 1000;
+        }
+
+        .modal-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 32px;
+            width: 360px;
+            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+        }
+
+        .modal-card h2 {
+            font-size: 20px;
+            margin-bottom: 20px;
+            text-align: center;
+        }
+
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            color: var(--text-secondary);
+            margin-bottom: 6px;
+        }
+
+        .form-group input {
+            width: 100%;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            padding: 10px 12px;
+            border-radius: 6px;
+            color: white;
+            font-size: 14px;
+            outline: none;
+        }
+
+        .form-group input:focus {
+            border-color: var(--accent);
+        }
+
+        .btn-primary {
+            width: 100%;
+            background: var(--accent);
+            border: none;
+            padding: 10px;
+            color: white;
+            font-weight: 600;
+            border-radius: 6px;
+            margin-top: 8px;
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-hover);
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="brand">
+            <span class="brand-badge">v2.0</span>
+            <h1>NVR Production Surveillance Hub</h1>
+        </div>
+        <div class="telemetry-bar">
+            <div class="telemetry-item">
+                <span class="status-dot"></span>
+                <span>Core: <strong id="val-status">ONLINE</strong></span>
+            </div>
+            <div class="telemetry-item">
+                <span>CPU Load: <strong id="val-cpu">--</strong></span>
+            </div>
+            <div class="telemetry-item">
+                <span>RAM Free: <strong id="val-ram">--</strong></span>
+            </div>
+            <div class="telemetry-item">
+                <span>Storage Free: <strong id="val-storage">--</strong></span>
+            </div>
+            <div class="telemetry-item">
+                <span>User: <strong id="val-user">Guest</strong></span>
+            </div>
+            <button id="btn-auth" onclick="toggleAuthModal()">Login</button>
+        </div>
+    </header>
+
+    <div class="controls-bar">
+        <div class="btn-group">
+            <button class="active" onclick="switchLayout(4)">Grid (2x2)</button>
+            <button onclick="switchLayout(1)">Single View</button>
+        </div>
+        <div class="btn-group">
+            <button onclick="refreshAllSnapshots()">Refresh Snapshots</button>
+            <button onclick="queryRecordings()">Query Recordings</button>
+        </div>
+    </div>
+
+    <main>
+        <div id="videoGrid" class="video-grid grid-4">
+            <!-- Cam 1 -->
+            <div class="video-tile" id="tile-1">
+                <div class="tile-header">
+                    <span class="tile-title">Cam 1: Front Entrance</span>
+                    <div style="display:flex; gap:6px;">
+                        <span class="badge-stream">fMP4 / H.264</span>
+                        <span class="badge-rec">REC</span>
+                    </div>
+                </div>
+                <video id="video-1" autoplay muted playsinline></video>
+                <img id="snap-1" src="/api/v1/cameras/1/snapshot" style="display:none;" alt="Live Snapshot">
+                <div class="tile-footer">
+                    <span>Engine: Hardware Pass-through</span>
+                    <span id="fps-1">0.0% CPU Transcode</span>
+                </div>
+            </div>
+
+            <!-- Cam 2 -->
+            <div class="video-tile" id="tile-2">
+                <div class="tile-header">
+                    <span class="tile-title">Cam 2: Parking Lot</span>
+                    <div style="display:flex; gap:6px;">
+                        <span class="badge-stream">fMP4 / H.264</span>
+                        <span class="badge-rec">REC</span>
+                    </div>
+                </div>
+                <video id="video-2" autoplay muted playsinline></video>
+                <img id="snap-2" src="/api/v1/cameras/2/snapshot" style="display:none;" alt="Live Snapshot">
+                <div class="tile-footer">
+                    <span>Engine: Hardware Pass-through</span>
+                    <span id="fps-2">0.0% CPU Transcode</span>
+                </div>
+            </div>
+
+            <!-- Cam 3 -->
+            <div class="video-tile" id="tile-3">
+                <div class="tile-header">
+                    <span class="tile-title">Cam 3: Server Room</span>
+                    <div style="display:flex; gap:6px;">
+                        <span class="badge-stream">fMP4 / H.264</span>
+                        <span class="badge-rec">REC</span>
+                    </div>
+                </div>
+                <video id="video-3" autoplay muted playsinline></video>
+                <img id="snap-3" src="/api/v1/cameras/3/snapshot" style="display:none;" alt="Live Snapshot">
+                <div class="tile-footer">
+                    <span>Engine: Hardware Pass-through</span>
+                    <span id="fps-3">0.0% CPU Transcode</span>
+                </div>
+            </div>
+
+            <!-- Cam 4 -->
+            <div class="video-tile" id="tile-4">
+                <div class="tile-header">
+                    <span class="tile-title">Cam 4: Loading Dock</span>
+                    <div style="display:flex; gap:6px;">
+                        <span class="badge-stream">fMP4 / H.264</span>
+                        <span class="badge-rec">REC</span>
+                    </div>
+                </div>
+                <video id="video-4" autoplay muted playsinline></video>
+                <img id="snap-4" src="/api/v1/cameras/4/snapshot" style="display:none;" alt="Live Snapshot">
+                <div class="tile-footer">
+                    <span>Engine: Hardware Pass-through</span>
+                    <span id="fps-4">0.0% CPU Transcode</span>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Login Modal -->
+    <div id="authModal" class="modal-overlay">
+        <div class="modal-card">
+            <h2>NVR Security Login</h2>
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="username" value="admin">
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="password" value="Admin@123">
+            </div>
+            <button class="btn-primary" onclick="performLogin()">Authenticate Session</button>
+            <button style="width:100%; margin-top:8px;" onclick="toggleAuthModal()">Cancel</button>
+        </div>
+    </div>
+
+    <script>
+        let authToken = localStorage.getItem('nvr_token') || '';
+        let currentUser = localStorage.getItem('nvr_user') || 'Guest';
+
+        function updateAuthUI() {
+            const btn = document.getElementById('btn-auth');
+            const userLabel = document.getElementById('val-user');
+            if (authToken) {
+                btn.innerText = 'Logout';
+                userLabel.innerText = currentUser;
+            } else {
+                btn.innerText = 'Login';
+                userLabel.innerText = 'Guest';
+            }
+        }
+
+        function toggleAuthModal() {
+            if (authToken) {
+                // Logout
+                fetch('/api/v1/auth/logout', {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + authToken }
+                }).finally(() => {
+                    authToken = '';
+                    currentUser = 'Guest';
+                    localStorage.removeItem('nvr_token');
+                    localStorage.removeItem('nvr_user');
+                    updateAuthUI();
+                });
+                return;
+            }
+            const modal = document.getElementById('authModal');
+            modal.style.display = (modal.style.display === 'flex') ? 'none' : 'flex';
+        }
+
+        function performLogin() {
+            const u = document.getElementById('username').value;
+            const p = document.getElementById('password').value;
+
+            fetch('/api/v1/auth/login', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: u, password: p })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.success && data.data.token) {
+                    authToken = data.data.token;
+                    currentUser = data.data.username + ' (' + data.data.role + ')';
+                    localStorage.setItem('nvr_token', authToken);
+                    localStorage.setItem('nvr_user', currentUser);
+                    updateAuthUI();
+                    document.getElementById('authModal').style.display = 'none';
+                    updateTelemetry();
+                } else {
+                    alert('Login failed: ' + (data.message || 'Invalid credentials'));
+                }
+            })
+            .catch(err => alert('Network error: ' + err));
+        }
+
+        function updateTelemetry() {
+            if (!authToken) return;
+            fetch('/api/v1/system/status', {
+                headers: { 'Authorization': 'Bearer ' + authToken }
+            })
+            .then(res => res.json())
+            .then(res => {
+                if (res.success && res.data) {
+                    const d = res.data;
+                    document.getElementById('val-status').innerText = d.status || 'ONLINE';
+                    document.getElementById('val-cpu').innerText = (d.cpu_load_1m ? d.cpu_load_1m.toFixed(2) : '--');
+                    document.getElementById('val-ram').innerText = d.ram_free_bytes ? Math.round(d.ram_free_bytes / (1024*1024)) + ' MB' : '--';
+                    document.getElementById('val-storage').innerText = d.free_storage_bytes ? Math.round(d.free_storage_bytes / (1024*1024*1024)) + ' GB' : '--';
+                }
+            })
+            .catch(() => {});
+        }
+
+        function switchLayout(cols) {
+            const grid = document.getElementById('videoGrid');
+            if (cols === 1) {
+                grid.className = 'video-grid grid-1';
+                document.getElementById('tile-2').style.display = 'none';
+                document.getElementById('tile-3').style.display = 'none';
+                document.getElementById('tile-4').style.display = 'none';
+            } else {
+                grid.className = 'video-grid grid-4';
+                document.getElementById('tile-2').style.display = 'flex';
+                document.getElementById('tile-3').style.display = 'flex';
+                document.getElementById('tile-4').style.display = 'flex';
+            }
+        }
+
+        function refreshAllSnapshots() {
+            for (let i = 1; i <= 4; i++) {
+                const snap = document.getElementById('snap-' + i);
+                snap.src = '/api/v1/cameras/' + i + '/snapshot?t=' + Date.now();
+                snap.style.display = 'block';
+            }
+        }
+
+        function queryRecordings() {
+            if (!authToken) {
+                alert('Please login to query recorded footage.');
+                return;
+            }
+            fetch('/api/v1/recordings?channel_id=1', {
+                headers: { 'Authorization': 'Bearer ' + authToken }
+            })
+            .then(res => res.json())
+            .then(res => {
+                alert('Found ' + (res.data ? res.data.length : 0) + ' recorded segments for Camera 1.');
+            })
+            .catch(err => alert('Query error: ' + err));
+        }
+
+        // Initialize Live Stream Players (fMP4 Media Source Extensions)
+        function startLivePlayer(camId) {
+            const video = document.getElementById('video-' + camId);
+            const snap = document.getElementById('snap-' + camId);
+
+            if (!window.MediaSource) {
+                console.warn('MediaSource not supported, using static snapshots');
+                snap.style.display = 'block';
+                return;
+            }
+
+            const ms = new MediaSource();
+            video.src = URL.createObjectURL(ms);
+
+            ms.addEventListener('sourceopen', () => {
+                let sb;
+                try {
+                    sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42E01E"');
+                } catch (e) {
+                    console.warn('SourceBuffer error: ', e);
+                    snap.style.display = 'block';
+                    return;
+                }
+
+                const queue = [];
+                function appendNext() {
+                    if (queue.length > 0 && !sb.updating) {
+                        try {
+                            sb.appendBuffer(queue.shift());
+                        } catch (e) {
+                            console.warn('appendBuffer error:', e);
+                        }
+                    }
+                }
+
+                sb.addEventListener('updateend', appendNext);
+
+                fetch('/api/v1/stream?channel=' + camId + '&stream=sub')
+                    .then(res => {
+                        if (!res.ok) throw new Error('Stream status ' + res.status);
+                        const reader = res.body.getReader();
+                        function readChunk() {
+                            reader.read().then(({done, value}) => {
+                                if (done) return;
+                                queue.push(value);
+                                appendNext();
+                                readChunk();
+                            }).catch(() => {
+                                snap.style.display = 'block';
+                            });
+                        }
+                        readChunk();
+                    })
+                    .catch(() => {
+                        snap.style.display = 'block';
+                    });
+            });
+        }
+
+        // Init on page load
+        window.addEventListener('load', () => {
+            updateAuthUI();
+            updateTelemetry();
+            setInterval(updateTelemetry, 3000);
+
+            for (let i = 1; i <= 4; ++i) {
+                startLivePlayer(i);
+            }
+        });
+    </script>
+</body>
+</html>

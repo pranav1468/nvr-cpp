@@ -4,6 +4,13 @@
 #include "nvr/common/time_utils.h"
 #include "3rdparty/sqlite3.h"
 
+#include <filesystem>
+#include <unordered_set>
+#include <fstream>
+#include <ctime>
+#include <cstdio>
+
+
 namespace nvr {
 
 SegmentIndex& SegmentIndex::Instance() {
@@ -245,6 +252,184 @@ int SegmentIndex::GetTotalSegmentCount() {
     }
     sqlite3_finalize(stmt);
     return count;
+}
+
+ReconciliationReport SegmentIndex::ReconcileStorage(const std::string& recording_path) {
+    ReconciliationReport report;
+    sqlite3* db = DatabaseManager::Instance().GetHandle();
+    if (!db) {
+        LOG_ERROR << "SegmentIndex::ReconcileStorage: Database not open";
+        return report;
+    }
+
+    // Safety guardrail: ensure recording_path exists and is accessible before touching DB
+    std::error_code ec;
+    if (!std::filesystem::exists(recording_path, ec) || !std::filesystem::is_directory(recording_path, ec)) {
+        LOG_WARN << "Reconciliation skipped: storage path is not accessible or not a directory: " << recording_path;
+        return report;
+    }
+
+    // Phase 1: DB -> Disk (Purge ghost records whose physical files are missing)
+    std::unordered_set<std::string> known_paths;
+    std::vector<int64_t> ghost_ids;
+
+    {
+        std::lock_guard<std::mutex> lock(DatabaseManager::Instance().GetMutex());
+        const char* select_sql = "SELECT id, file_path FROM recordings;";
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db, select_sql, -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                int64_t id = sqlite3_column_int64(stmt, 0);
+                const char* path_txt = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                if (path_txt) {
+                    std::string path_str(path_txt);
+                    if (!std::filesystem::exists(path_str, ec)) {
+                        ghost_ids.push_back(id);
+                    } else {
+                        known_paths.insert(path_str);
+                    }
+                }
+            }
+            sqlite3_finalize(stmt);
+        }
+
+        // Purge ghost IDs
+        if (!ghost_ids.empty()) {
+            sqlite3_stmt* del_stmt = nullptr;
+            if (sqlite3_prepare_v2(db, "DELETE FROM recordings WHERE id = ?;", -1, &del_stmt, nullptr) == SQLITE_OK) {
+                for (int64_t gid : ghost_ids) {
+                    sqlite3_bind_int64(del_stmt, 1, gid);
+                    if (sqlite3_step(del_stmt) == SQLITE_DONE) {
+                        report.ghost_records_pruned++;
+                    }
+                    sqlite3_reset(del_stmt);
+                }
+                sqlite3_finalize(del_stmt);
+            }
+        }
+    }
+
+    if (report.ghost_records_pruned > 0) {
+        LOG_INFO << "Reconciliation: Pruned " << report.ghost_records_pruned
+                 << " ghost database records (file missing on storage)";
+    }
+
+    // Phase 2: Disk -> DB (Scan for unindexed .mp4 files on disk)
+    try {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(
+                 recording_path, std::filesystem::directory_options::skip_permission_denied, ec)) {
+            if (ec) break;
+            if (!entry.is_regular_file(ec)) continue;
+
+            const auto& p = entry.path();
+            if (p.extension() != ".mp4") continue;
+
+            std::string file_path_str = p.string();
+            if (known_paths.find(file_path_str) != known_paths.end()) {
+                continue; // Already indexed
+            }
+
+            // Unindexed .mp4 discovered
+            uintmax_t file_size = entry.file_size(ec);
+            if (ec || file_size == 0) {
+                std::filesystem::remove(p, ec);
+                report.corrupt_files_removed++;
+                continue;
+            }
+
+            // Validate MP4 header (must be at least 16 bytes and contain 'ftyp' box)
+            bool is_valid_mp4 = false;
+            std::ifstream ifs(file_path_str, std::ios::binary);
+            if (ifs) {
+                char header[16] = {0};
+                ifs.read(header, 16);
+                if (ifs.gcount() >= 8) {
+                    if (header[4] == 'f' && header[5] == 't' && header[6] == 'y' && header[7] == 'p') {
+                        is_valid_mp4 = true;
+                    }
+                }
+                ifs.close();
+            }
+
+            if (!is_valid_mp4) {
+                LOG_WARN << "Reconciliation: Removing corrupt unindexed file (missing ftyp box): " << file_path_str;
+                std::filesystem::remove(p, ec);
+                report.corrupt_files_removed++;
+                continue;
+            }
+
+            // Parse metadata from filename: "cam<channel_id>_<YYYYMMDD_HHMMSS>_<mmm>.mp4"
+            std::string filename = p.filename().string();
+            int channel_id = 0;
+            int64_t start_time_ms = 0;
+
+            int ch = 0, year = 0, mon = 0, day = 0, hour = 0, min = 0, sec = 0, ms = 0;
+            if (std::sscanf(filename.c_str(), "cam%d_%4d%2d%2d_%2d%2d%2d_%d",
+                            &ch, &year, &mon, &day, &hour, &min, &sec, &ms) == 8) {
+                channel_id = ch;
+                std::tm tm{};
+                tm.tm_year = year - 1900;
+                tm.tm_mon = mon - 1;
+                tm.tm_mday = day;
+                tm.tm_hour = hour;
+                tm.tm_min = min;
+                tm.tm_sec = sec;
+                tm.tm_isdst = -1;
+                std::time_t t = std::mktime(&tm);
+                if (t != static_cast<std::time_t>(-1)) {
+                    start_time_ms = static_cast<int64_t>(t) * 1000 + ms;
+                }
+            } else {
+                auto cam_pos = filename.find("cam");
+                auto under_pos = filename.find('_');
+                if (cam_pos == 0 && under_pos != std::string::npos && under_pos > 3) {
+                    try {
+                        channel_id = std::stoi(filename.substr(3, under_pos - 3));
+                    } catch (...) {
+                        channel_id = 0;
+                    }
+                }
+            }
+
+            if (start_time_ms <= 0) {
+                start_time_ms = time_utils::WallTimeMs();
+            }
+
+            int64_t duration_ms = 60000;
+            int64_t end_time_ms = start_time_ms + duration_ms;
+
+            SegmentMetadata meta;
+            meta.channel_id = channel_id;
+            meta.file_path = file_path_str;
+            meta.start_time_ms = start_time_ms;
+            meta.end_time_ms = end_time_ms;
+            meta.duration_ms = duration_ms;
+            meta.file_size_bytes = file_size;
+            meta.frame_count = static_cast<uint32_t>((duration_ms * 25) / 1000);
+            meta.keyframe_count = static_cast<uint32_t>(meta.frame_count / 25);
+            meta.is_locked = false;
+            meta.codec = CodecType::H264;
+            meta.width = 1920;
+            meta.height = 1080;
+            meta.fps = 25;
+            meta.has_audio = false;
+            meta.audio_codec = CodecType::UNKNOWN;
+
+            if (InsertSegment(meta)) {
+                known_paths.insert(file_path_str);
+                report.unindexed_files_recovered++;
+                LOG_INFO << "Reconciliation: Recovered and indexed orphan segment: " << file_path_str;
+            }
+        }
+    } catch (const std::exception& e) {
+        LOG_ERROR << "Reconciliation error during directory walk: " << e.what();
+    }
+
+    LOG_INFO << "Reconciliation finished: " << report.ghost_records_pruned << " ghost records pruned, "
+             << report.unindexed_files_recovered << " orphan segments recovered, "
+             << report.corrupt_files_removed << " corrupt files removed.";
+
+    return report;
 }
 
 } // namespace nvr
