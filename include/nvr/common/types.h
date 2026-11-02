@@ -7,6 +7,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <new>
+#include <cctype>
+#include <algorithm>
 
 namespace nvr {
 
@@ -31,11 +33,19 @@ inline const char* CodecToString(CodecType codec) {
 }
 
 inline CodecType StringToCodec(const std::string& str) {
-    if (str == "H264") return CodecType::H264;
-    if (str == "H265" || str == "HEVC") return CodecType::H265;
-    if (str == "AAC") return CodecType::AAC;
-    if (str == "PCMU") return CodecType::PCMU;
-    if (str == "PCMA") return CodecType::PCMA;
+    if (str.empty()) return CodecType::UNKNOWN;
+    std::string upper;
+    upper.reserve(str.size());
+    for (char c : str) {
+        if (c != '.' && c != '-' && c != '_' && c != ' ') {
+            upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+    }
+    if (upper == "H264" || upper == "AVC" || upper == "AVC1" || upper == "AVC3") return CodecType::H264;
+    if (upper == "H265" || upper == "HEVC" || upper == "HVC1" || upper == "HEV1") return CodecType::H265;
+    if (upper == "AAC" || upper == "MP4A") return CodecType::AAC;
+    if (upper == "PCMU" || upper == "ULAW" || upper == "G711U") return CodecType::PCMU;
+    if (upper == "PCMA" || upper == "ALAW" || upper == "G711A") return CodecType::PCMA;
     return CodecType::UNKNOWN;
 }
 
@@ -44,22 +54,24 @@ enum class StreamType {
     SUB = 1
 };
 
-enum class NalType {
-    UNKNOWN = 0,
-    SLICE_NON_IDR,
-    SLICE_IDR,
-    SEI,
-    SPS,
-    PPS,
-    VPS
-};
-
 enum class RecordMode {
     DISABLED = 0,
     CONTINUOUS = 1,
     MOTION_ONLY = 2,
-    SCHEDULED = 3
+    SCHEDULED = 3,
+    EVENT_ONLY = 4
 };
+
+inline const char* RecordModeToString(RecordMode mode) {
+    switch (mode) {
+        case RecordMode::DISABLED:    return "DISABLED";
+        case RecordMode::CONTINUOUS:  return "CONTINUOUS";
+        case RecordMode::MOTION_ONLY: return "MOTION_ONLY";
+        case RecordMode::SCHEDULED:   return "SCHEDULED";
+        case RecordMode::EVENT_ONLY:  return "EVENT_ONLY";
+        default:                      return "UNKNOWN";
+    }
+}
 
 enum class SessionState {
     DISCONNECTED = 0,
@@ -77,11 +89,49 @@ enum class MediaType {
     AUDIO = 1
 };
 
+inline bool IsValidH265NalHeader(uint8_t b0, uint8_t b1) {
+    return ((b0 & 0x80) == 0) &&
+           ((b0 & 0x01) == 0) &&
+           (((b1 >> 3) & 0x1F) == 0) &&
+           ((b1 & 0x07) != 0);
+}
+
+inline CodecType DetectNalCodecFromParamSets(const uint8_t* data, size_t size) {
+    if (!data || size < 4) return CodecType::UNKNOWN;
+    size_t i = 0;
+    while (i + 3 < size) {
+        if (data[i] == 0x00 && data[i + 1] == 0x00 &&
+            (data[i + 2] == 0x01 || (data[i + 2] == 0x00 && i + 3 < size && data[i + 3] == 0x01))) {
+            size_t nal_pos = i + ((data[i + 2] == 0x01) ? 3 : 4);
+            if (nal_pos >= size) break;
+            uint8_t b0 = data[nal_pos];
+            if ((b0 & 0x80) == 0) {
+                if (nal_pos + 1 < size) {
+                    uint8_t b1 = data[nal_pos + 1];
+                    uint8_t nt265 = (b0 >> 1) & 0x3F;
+                    if (IsValidH265NalHeader(b0, b1) && (nt265 >= 32 && nt265 <= 34)) {
+                        return CodecType::H265;
+                    }
+                }
+                uint8_t nt264 = b0 & 0x1F;
+                uint8_t nal_ref_idc = (b0 >> 5) & 0x03;
+                if (nt264 == 7 && nal_ref_idc != 0) {
+                    return CodecType::H264;
+                }
+            }
+            i = nal_pos;
+        } else {
+            ++i;
+        }
+    }
+    return CodecType::UNKNOWN;
+}
+
 struct MediaPacket {
     int channel_id{0};
     StreamType stream_type{StreamType::MAIN};
     MediaType media_type{MediaType::VIDEO};
-    CodecType codec{CodecType::H264};
+    CodecType codec{CodecType::UNKNOWN};
     bool is_keyframe{false};
     uint32_t rtp_timestamp{0};
     int64_t pts_us{0};
@@ -101,6 +151,74 @@ struct MediaPacket {
     bool IsVideo() const {
         return !IsAudio();
     }
+
+    bool HasParameterSets() const {
+        if (IsAudio() || data.size() < 4) return false;
+        CodecType eff = (codec != CodecType::UNKNOWN) ? codec : DetectNalCodecFromParamSets(data.data(), data.size());
+        size_t i = 0;
+        while (i + 3 < data.size()) {
+            if (data[i] == 0x00 && data[i + 1] == 0x00 &&
+                (data[i + 2] == 0x01 || (data[i + 2] == 0x00 && i + 3 < data.size() && data[i + 3] == 0x01))) {
+                size_t nal_pos = i + ((data[i + 2] == 0x01) ? 3 : 4);
+                if (nal_pos >= data.size()) break;
+                uint8_t b0 = data[nal_pos];
+                if ((b0 & 0x80) == 0) {
+                    if (eff == CodecType::H265) {
+                        if (nal_pos + 1 < data.size()) {
+                            uint8_t b1 = data[nal_pos + 1];
+                            uint8_t nt = (b0 >> 1) & 0x3F;
+                            if (IsValidH265NalHeader(b0, b1) && (nt == 32 || nt == 33 || nt == 34)) return true;
+                        }
+                    } else if (eff == CodecType::H264) {
+                        uint8_t nt = b0 & 0x1F;
+                        uint8_t nal_ref_idc = (b0 >> 5) & 0x03;
+                        if ((nt == 7 || nt == 8) && nal_ref_idc != 0) return true;
+                    }
+                }
+                i = nal_pos;
+            } else {
+                ++i;
+            }
+        }
+        return false;
+    }
+    bool HasVclSlice() const {
+        if (IsAudio() || data.size() < 4) return false;
+        CodecType eff = (codec != CodecType::UNKNOWN) ? codec : DetectNalCodecFromParamSets(data.data(), data.size());
+        size_t i = 0;
+        while (i + 3 < data.size()) {
+            if (data[i] == 0x00 && data[i + 1] == 0x00 &&
+                (data[i + 2] == 0x01 || (data[i + 2] == 0x00 && i + 3 < data.size() && data[i + 3] == 0x01))) {
+                size_t nal_pos = i + ((data[i + 2] == 0x01) ? 3 : 4);
+                if (nal_pos >= data.size()) break;
+                uint8_t b0 = data[nal_pos];
+                if ((b0 & 0x80) == 0) {
+                    if (eff == CodecType::H265) {
+                        if (nal_pos + 1 < data.size()) {
+                            uint8_t b1 = data[nal_pos + 1];
+                            uint8_t nt = (b0 >> 1) & 0x3F;
+                            if (IsValidH265NalHeader(b0, b1) && nt <= 31) return true;
+                        }
+                    } else if (eff == CodecType::H264) {
+                        uint8_t nt = b0 & 0x1F;
+                        if (nt >= 1 && nt <= 5) return true;
+                    } else {
+                        uint8_t nt264 = b0 & 0x1F;
+                        if (nt264 >= 1 && nt264 <= 5) return true;
+                        if (nal_pos + 1 < data.size()) {
+                            uint8_t b1 = data[nal_pos + 1];
+                            uint8_t nt265 = (b0 >> 1) & 0x3F;
+                            if (IsValidH265NalHeader(b0, b1) && nt265 <= 31) return true;
+                        }
+                    }
+                }
+                i = nal_pos;
+            } else {
+                ++i;
+            }
+        }
+        return false;
+    }
 };
 
 using MediaPacketPtr = std::shared_ptr<MediaPacket>;
@@ -110,6 +228,7 @@ enum class PixelFormat {
     YUV420P,
     RGB24,
     RGBA32,
+    RGB16,
     UNKNOWN
 };
 
@@ -119,6 +238,7 @@ inline const char* PixelFormatToString(PixelFormat fmt) {
         case PixelFormat::YUV420P: return "YUV420P";
         case PixelFormat::RGB24:   return "RGB24";
         case PixelFormat::RGBA32:  return "RGBA32";
+        case PixelFormat::RGB16:   return "RGB16";
         default:                   return "UNKNOWN";
     }
 }
@@ -233,6 +353,13 @@ public:
         size_ = new_size;
     }
 
+    void assign(size_t n, uint8_t val) {
+        resize(n);
+        if (data_ && n > 0) {
+            std::memset(data_, val, n);
+        }
+    }
+
     void reset() noexcept {
         if (data_) {
             free(data_);
@@ -286,6 +413,9 @@ struct CameraConfig {
     bool enabled{true};
     RecordMode record_mode{RecordMode::CONTINUOUS};
     int reconnect_delay_sec{3};
+    std::string onvif_xaddr;
+    std::string onvif_username;
+    std::string onvif_password;
 };
 
 struct SegmentMetadata {
@@ -299,19 +429,19 @@ struct SegmentMetadata {
     uint32_t frame_count{0};
     uint32_t keyframe_count{0};
     bool is_locked{false};
-    CodecType codec{CodecType::H264};
-    uint32_t width{1920};
-    uint32_t height{1080};
+    CodecType codec{CodecType::UNKNOWN};
+    uint32_t width{0};
+    uint32_t height{0};
     uint32_t fps{25};
     bool has_audio{false};
     CodecType audio_codec{CodecType::UNKNOWN};
     uint32_t audio_sample_rate{8000};
     uint8_t audio_channels{1};
+    std::string thumbnail_path;
 };
 
 struct StorageConfig {
     std::string recording_path{"./recordings"};
-    std::string database_path{"./nvr_metadata.db"};
     int segment_duration_seconds{60};
     int min_free_space_mb{2048};
     int max_retention_days{30};
@@ -320,6 +450,7 @@ struct StorageConfig {
 struct SystemConfig {
     std::string device_name{"NVR_Core"};
     std::string log_level{"info"};
+    std::string log_dir{"logs"};
     int max_channels{8};
 };
 
@@ -339,6 +470,10 @@ struct ApiConfig {
     bool enabled{true};
     int port{8080};
     std::string web_root{"./web"};
+    std::string bind_address{"0.0.0.0"};
+    bool enforce_https{false};
+    bool enable_hsts{false};
+    std::vector<std::string> cors_allowed_origins{"*"};
 };
 
 struct NvrConfig {

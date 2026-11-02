@@ -12,7 +12,7 @@ namespace nvr {
 
 class StreamSession {
 public:
-    StreamSession(int channel_id, StreamType stream_type, const std::string& rtsp_url);
+    StreamSession(int channel_id, StreamType stream_type, const std::string& rtsp_url, uint32_t reconnect_delay_sec = 5);
     ~StreamSession();
 
     void Start();
@@ -28,7 +28,8 @@ public:
                                       const std::string& realm, const std::string& nonce,
                                       const std::string& method, const std::string& uri,
                                       const std::string& qop, const std::string& opaque,
-                                      std::string& out_header);
+                                      std::string& out_header, uint32_t nc = 1,
+                                      const std::string& cnonce = "0a4f113b");
     static void ParseDigestChallenge(const std::string& response, std::string& realm,
                                      std::string& nonce, std::string& opaque, std::string& qop);
 
@@ -57,6 +58,7 @@ private:
     int channel_id_{0};
     StreamType stream_type_{StreamType::MAIN};
     std::string rtsp_url_;
+    std::string clean_rtsp_url_;
     std::string rtsp_path_;
     std::string username_;
     std::string password_;
@@ -64,6 +66,11 @@ private:
     std::string digest_nonce_;
     std::string digest_opaque_;
     std::string digest_qop_;
+    uint32_t digest_nc_{0};
+    std::string content_base_url_;
+    int video_rtp_channel_{0};
+    int audio_rtp_channel_{2};
+    uint32_t reconnect_delay_sec_{5};
 
     std::atomic<bool> running_{false};
     std::atomic<SessionState> state_{SessionState::DISCONNECTED};

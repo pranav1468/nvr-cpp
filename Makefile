@@ -1,65 +1,126 @@
 CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread -I./include -I./include/3rdparty -MMD -MP -DNVR_ENABLE_DEEP_MONITORING
-LDFLAGS ?= -pthread -ldl -rdynamic
+AR ?= ar
 
-SQLITE_LIB ?= $(shell if $(CXX) -shared -x c /dev/null -o /dev/null -lsqlite3 >/dev/null 2>&1; then echo "-lsqlite3"; \
-                      elif [ -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 ]; then echo "/usr/lib/x86_64-linux-gnu/libsqlite3.so.0"; \
-                      elif [ -f /usr/lib/aarch64-linux-gnu/libsqlite3.so.0 ]; then echo "/usr/lib/aarch64-linux-gnu/libsqlite3.so.0"; \
-                      else echo "-lsqlite3"; fi)
+# Enable parallel builds automatically when invoked without explicit -j
+ifeq ($(filter -j%,$(MAKEFLAGS)),)
+MAKEFLAGS += -j$(shell nproc 2>/dev/null || echo 4)
+endif
+
+NVR_INCLUDES = -I./include -I./include/3rdparty
+NVR_DEFINES = -DNVR_ENABLE_DEEP_MONITORING
+
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread
+override CXXFLAGS += -std=c++17 $(NVR_INCLUDES) $(NVR_DEFINES) -MMD -MP -pthread
+
+LDFLAGS ?= -pthread -ldl -rdynamic
+override LDFLAGS += -pthread -ldl -rdynamic
 
 SRCS = src/common/logger.cpp \
        src/common/deep_tracer.cpp \
        src/common/time_utils.cpp \
        src/common/thread_pool.cpp \
-       src/storage/database_manager.cpp \
-       src/storage/segment_index.cpp \
+       src/common/config_loader.cpp \
        src/storage/retention_manager.cpp \
        src/media/stream_broker.cpp \
        src/media/buffer_allocator.cpp \
        src/media/video_decoder.cpp \
        src/media/video_scaler.cpp \
+       src/media/image_utils.cpp \
        src/recording/atomic_writer.cpp \
        src/recording/segmenter.cpp \
        src/recording/recording_scheduler.cpp \
        src/ingress/rtp_depacketizer.cpp \
        src/ingress/stream_session.cpp \
        src/ingress/camera_manager.cpp \
+       src/ingress/onvif_client.cpp \
        src/live/live_queue.cpp \
        src/live/live_controller.cpp \
        src/live/qml_video_bridge.cpp \
-       src/dispatcher/rbac_validator.cpp \
        src/dispatcher/command_dispatcher.cpp \
        src/api/rest_server.cpp \
-       src/api/fmp4_muxer.cpp
+       src/api/fmp4_muxer.cpp \
+       src/ai/motion_gate.cpp \
+       src/playback/seek_controller.cpp \
+       src/playback/clip_exporter.cpp \
+       src/playback/playback_engine.cpp
 
 OBJS = $(patsubst src/%.cpp, build/obj/%.o, $(SRCS))
+CORE_LIB = build/libnvr_core.a
 DEPS = $(OBJS:.o=.d) build/obj/main.d
 
+QT_INCLUDES ?= -I/usr/include/x86_64-linux-gnu/qt6 -I/usr/include/x86_64-linux-gnu/qt6/QtCore -I/usr/include/x86_64-linux-gnu/qt6/QtGui -I/usr/include/x86_64-linux-gnu/qt6/QtQml -I/usr/include/x86_64-linux-gnu/qt6/QtQuick -I/usr/include/x86_64-linux-gnu/qt6/QtQuickControls2
+QT_LIBS ?= -lQt6Quick -lQt6Qml -lQt6Gui -lQt6Core -lQt6QuickControls2
+
+MOC ?= $(shell which /usr/lib/qt6/libexec/moc 2>/dev/null || which moc)
+
 TARGET = bin/nvr_server
-TEST_DISPATCHER = bin/test_command_dispatcher
-TEST_REST = bin/test_rest_server
+GUI_TARGET = bin/nvr_gui
 
-all: $(TARGET) $(TEST_DISPATCHER) $(TEST_REST)
+all: $(TARGET) $(GUI_TARGET)
 
-$(TARGET): $(OBJS) build/obj/main.o | bin
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(SQLITE_LIB) $(LDFLAGS)
+$(CORE_LIB): $(OBJS) | build
+	$(AR) rcs $@ $(OBJS)
 
-$(TEST_DISPATCHER): $(OBJS) tests/test_command_dispatcher.cpp | bin
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(SQLITE_LIB) $(LDFLAGS)
+$(TARGET): build/obj/main.o $(CORE_LIB) | bin
+	$(CXX) $(CXXFLAGS) -o $@ build/obj/main.o $(CORE_LIB) $(LDFLAGS)
 
-$(TEST_REST): $(OBJS) tests/test_rest_server.cpp | bin
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(SQLITE_LIB) $(LDFLAGS)
+$(GUI_TARGET): build/obj/ui_main.o build/obj/ui/nvr_bridge.o build/obj/moc_nvr_bridge.o build/obj/moc_live_bridge_controller.o $(CORE_LIB) | bin
+	$(CXX) $(CXXFLAGS) -o $@ build/obj/ui_main.o build/obj/ui/nvr_bridge.o build/obj/moc_nvr_bridge.o build/obj/moc_live_bridge_controller.o $(CORE_LIB) $(QT_LIBS) $(LDFLAGS)
+
+build/moc_nvr_bridge.cpp: include/nvr/ui/nvr_bridge.h | build
+	$(MOC) $(NVR_INCLUDES) $(QT_INCLUDES) $< -o $@
+
+build/obj/moc_nvr_bridge.o: build/moc_nvr_bridge.cpp | build/obj
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fPIC $(QT_INCLUDES) -c $< -o $@
+
+build/obj/ui/nvr_bridge.o: src/ui/nvr_bridge.cpp | build/obj
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fPIC $(QT_INCLUDES) -c $< -o $@
+
+build/moc_live_bridge_controller.cpp: include/nvr/live/live_bridge_controller.h | build
+	$(MOC) $(NVR_INCLUDES) $(QT_INCLUDES) $< -o $@
+
+build/obj/moc_live_bridge_controller.o: build/moc_live_bridge_controller.cpp | build/obj
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fPIC $(QT_INCLUDES) -c $< -o $@
+
+build/obj/ui_main.o: src/ui_main.cpp | build/obj
+	@mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -fPIC $(QT_INCLUDES) -c $< -o $@
 
 build/obj/%.o: src/%.cpp | build/obj
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-bin build/obj:
+bin build build/obj:
 	mkdir -p $@
 
 clean:
-	rm -rf build bin recordings test_recordings nvr_metadata.db*
+	rm -rf build
+	rm -f bin/nvr_server bin/nvr_gui
 
--include $(wildcard build/obj/*.d build/obj/*/*.d)
+IMX_SDK_ENV ?= /home/mantra/Desktop/NVR_1/imx-sdk/environment-setup-armv8a-poky-linux
 
-.PHONY: all clean
+cross:
+	@if [ ! -f $(IMX_SDK_ENV) ]; then \
+		echo "Error: i.MX SDK environment script not found at $(IMX_SDK_ENV)"; \
+		exit 1; \
+	fi
+	@echo "=== Cross-compiling NVR Engine for i.MX (ARM64 / AArch64) ==="
+	@bash -c "source $(IMX_SDK_ENV) && $(MAKE) clean && $(MAKE) all"
+	@mkdir -p bin/arm64
+	@cp bin/nvr_server bin/arm64/
+	@echo "=== Verifying ARM64 Target Binaries ==="
+	@file bin/arm64/nvr_server
+
+web:
+	@echo "=== Web Console Ready (Static Lightweight UI) ==="
+	@test -f web/index.html && echo "web/index.html verified."
+
+web-clean:
+	@echo "=== Web Console Clean ==="
+
+-include $(DEPS)
+
+.PHONY: all clean cross web web-clean

@@ -18,6 +18,9 @@ public:
     // Allocate an aligned memory buffer from pool or heap (64-byte alignment)
     AlignedByteBuffer Allocate(size_t size);
 
+    // Allocate DecodedFrame managed with automatic buffer recycling
+    DecodedFramePtr AllocateFrame(uint32_t width, uint32_t height, PixelFormat format = PixelFormat::NV12);
+
     // Return buffer to pool for reuse
     void Release(AlignedByteBuffer&& buffer);
 

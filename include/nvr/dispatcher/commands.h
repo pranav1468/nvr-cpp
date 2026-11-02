@@ -29,11 +29,21 @@ inline UserRole StringToUserRole(const std::string& str) {
     return UserRole::NONE;
 }
 
+enum class CommandSource : uint8_t {
+    REST_API = 0,
+    WEBSOCKET = 1,
+    UI_QML = 2,
+    ONVIF = 3,
+    VOICE = 4,
+    INTERNAL = 5
+};
+
 struct CommandEnvelope {
     std::string command_id;
     std::string action;
     std::string auth_token;
     std::string client_id;
+    CommandSource source{CommandSource::REST_API};
     nlohmann::json payload;
     int64_t timestamp_ms{0};
 };

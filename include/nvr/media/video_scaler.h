@@ -26,4 +26,6 @@ public:
                                  uint32_t dst_w, uint32_t dst_h, PixelFormat dst_fmt);
 };
 
+#include "nvr/media/image_utils.h"
+
 } // namespace nvr

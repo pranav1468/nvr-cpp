@@ -40,6 +40,9 @@ public:
     // Query list of registered commands (for API documentation or discovery)
     nlohmann::json GetRegisteredCommands() const;
 
+    void SetDeviceName(const std::string& name);
+    std::string GetDeviceName() const;
+
 private:
     CommandDispatcher();
     ~CommandDispatcher() = default;
@@ -48,6 +51,7 @@ private:
 
     mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, RegisteredCommand> handlers_;
+    std::string device_name_{"NVR_iMX95"};
 };
 
 } // namespace nvr

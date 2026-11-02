@@ -1,648 +1,1181 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>NVR v2.0 Production Surveillance Hub</title>
-    <style>
-        :root {
-            --bg-primary: #0a0e14;
-            --bg-secondary: #131920;
-            --bg-card: rgba(22, 30, 41, 0.7);
-            --border: rgba(255, 255, 255, 0.08);
-            --text-primary: #f1f2f6;
-            --text-secondary: #a4b0be;
-            --accent: #1e90ff;
-            --accent-hover: #3742fa;
-            --success: #2ed573;
-            --danger: #ff4757;
-            --warning: #ffa502;
-        }
-
-        * {
-            box-sizing: border-box;
-            margin: 0;
-            padding: 0;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-        }
-
-        body {
-            background-color: var(--bg-primary);
-            color: var(--text-primary);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            overflow-x: hidden;
-        }
-
-        /* Top Header */
-        header {
-            background: var(--bg-secondary);
-            border-bottom: 1px solid var(--border);
-            padding: 12px 24px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
-
-        .brand {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .brand-badge {
-            background: linear-gradient(135deg, var(--accent), var(--accent-hover));
-            color: white;
-            font-weight: bold;
-            font-size: 13px;
-            padding: 4px 10px;
-            border-radius: 6px;
-            letter-spacing: 0.5px;
-        }
-
-        .brand h1 {
-            font-size: 18px;
-            font-weight: 600;
-            letter-spacing: -0.2px;
-        }
-
-        .telemetry-bar {
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            font-size: 13px;
-            color: var(--text-secondary);
-        }
-
-        .telemetry-item {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-        }
-
-        .telemetry-item strong {
-            color: var(--text-primary);
-        }
-
-        .status-dot {
-            width: 8px;
-            height: 8px;
-            background: var(--success);
-            border-radius: 50%;
-            box-shadow: 0 0 8px var(--success);
-        }
-
-        /* Toolbar Controls */
-        .controls-bar {
-            padding: 12px 24px;
-            background: rgba(19, 25, 32, 0.4);
-            border-bottom: 1px solid var(--border);
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-        }
-
-        .btn-group {
-            display: flex;
-            gap: 8px;
-        }
-
-        button {
-            background: var(--bg-card);
-            border: 1px solid var(--border);
-            color: var(--text-primary);
-            padding: 8px 16px;
-            border-radius: 6px;
-            font-size: 13px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-
-        button:hover {
-            background: rgba(255, 255, 255, 0.1);
-            border-color: rgba(255, 255, 255, 0.2);
-        }
-
-        button.active {
-            background: var(--accent);
-            border-color: var(--accent);
-            color: white;
-        }
-
-        /* Video Grid Layout */
-        main {
-            flex: 1;
-            padding: 20px 24px;
-        }
-
-        .video-grid {
-            display: grid;
-            gap: 16px;
-            height: calc(100vh - 160px);
-            width: 100%;
-        }
-
-        .grid-4 {
-            grid-template-columns: repeat(2, 1fr);
-            grid-template-rows: repeat(2, 1fr);
-        }
-
-        .grid-1 {
-            grid-template-columns: 1fr;
-            grid-template-rows: 1fr;
-        }
-
-        .video-tile {
-            background: #000;
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            position: relative;
-            overflow: hidden;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-        }
-
-        .video-tile video, .video-tile img {
-            width: 100%;
-            height: 100%;
-            object-fit: contain;
-        }
-
-        .tile-header {
-            position: absolute;
-            top: 10px;
-            left: 10px;
-            right: 10px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            z-index: 10;
-            pointer-events: none;
-        }
-
-        .tile-title {
-            background: rgba(10, 14, 20, 0.75);
-            backdrop-filter: blur(8px);
-            padding: 4px 10px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: 600;
-            border: 1px solid rgba(255, 255, 255, 0.1);
-        }
-
-        .badge-rec {
-            background: rgba(255, 71, 87, 0.85);
-            color: white;
-            font-size: 11px;
-            font-weight: bold;
-            padding: 2px 6px;
-            border-radius: 4px;
-            letter-spacing: 0.5px;
-        }
-
-        .badge-stream {
-            background: rgba(30, 144, 255, 0.7);
-            color: white;
-            font-size: 11px;
-            padding: 2px 6px;
-            border-radius: 4px;
-        }
-
-        .tile-footer {
-            position: absolute;
-            bottom: 10px;
-            left: 10px;
-            right: 10px;
-            display: flex;
-            justify-content: space-between;
-            font-size: 11px;
-            color: var(--text-secondary);
-            background: rgba(10, 14, 20, 0.65);
-            padding: 4px 8px;
-            border-radius: 4px;
-            pointer-events: none;
-        }
-
-        /* Login Modal */
-        .modal-overlay {
-            position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0, 0, 0, 0.8);
-            backdrop-filter: blur(10px);
-            display: none;
-            align-items: center;
-            justify-content: center;
-            z-index: 1000;
-        }
-
-        .modal-card {
-            background: var(--bg-secondary);
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 32px;
-            width: 360px;
-            box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
-        }
-
-        .modal-card h2 {
-            font-size: 20px;
-            margin-bottom: 20px;
-            text-align: center;
-        }
-
-        .form-group {
-            margin-bottom: 16px;
-        }
-
-        .form-group label {
-            display: block;
-            font-size: 12px;
-            color: var(--text-secondary);
-            margin-bottom: 6px;
-        }
-
-        .form-group input {
-            width: 100%;
-            background: var(--bg-primary);
-            border: 1px solid var(--border);
-            padding: 10px 12px;
-            border-radius: 6px;
-            color: white;
-            font-size: 14px;
-            outline: none;
-        }
-
-        .form-group input:focus {
-            border-color: var(--accent);
-        }
-
-        .btn-primary {
-            width: 100%;
-            background: var(--accent);
-            border: none;
-            padding: 10px;
-            color: white;
-            font-weight: 600;
-            border-radius: 6px;
-            margin-top: 8px;
-        }
-
-        .btn-primary:hover {
-            background: var(--accent-hover);
-        }
-    </style>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MACTRA NVR — Enterprise Surveillance Console</title>
+  <meta name="description" content="Live matrix, recordings playback, camera management and system health for the MACTRA NVR video surveillance engine." />
+  <link rel="icon" type="image/x-icon" href="assets/favicon.ico" />
+  <link rel="stylesheet" href="app.css?v=4" />
 </head>
-<body>
+<body class="bg-background text-foreground antialiased font-sans">
+  <div class="flex min-h-screen flex-col bg-background">
+    
+    <!-- Top Header Bar -->
+    <header class="sticky top-0 z-40 flex h-14 items-center justify-between border-b border-border bg-card/90 px-4 backdrop-blur lg:px-6">
+      <!-- Brandmark -->
+      <div class="flex items-center gap-2.5">
+        <div class="flex h-9 w-9 items-center justify-center rounded-xl bg-primary shadow-sm">
+          <svg viewBox="0 0 24 24" class="h-5 w-5 text-primary-foreground" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16 16.5v-9L9 12l7 4.5Z" fill="currentColor" stroke="none"></path>
+            <rect x="2" y="5" width="20" height="14" rx="2.5"></rect>
+            <path d="M6.5 2v3M17.5 2v3"></path>
+          </svg>
+        </div>
+        <div class="leading-tight">
+          <div class="font-display text-[15px] font-bold tracking-tight text-foreground">
+            MACTRA <span class="text-primary">NVR</span>
+          </div>
+          <div class="text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
+            Enterprise Surveillance
+          </div>
+        </div>
+      </div>
 
-    <header>
-        <div class="brand">
-            <span class="brand-badge">v2.0</span>
-            <h1>NVR Production Surveillance Hub</h1>
+      <!-- Telemetry Chips -->
+      <div class="flex items-center gap-2.5">
+        <div class="hidden items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-1.5 lg:flex">
+          <svg class="h-3.5 w-3.5 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+          </svg>
+          <span class="text-[11px] text-muted-foreground">Core</span>
+          <span id="header-status" class="text-[11px] font-bold uppercase tracking-wide text-success">ONLINE</span>
         </div>
-        <div class="telemetry-bar">
-            <div class="telemetry-item">
-                <span class="status-dot"></span>
-                <span>Core: <strong id="val-status">ONLINE</strong></span>
-            </div>
-            <div class="telemetry-item">
-                <span>CPU Load: <strong id="val-cpu">--</strong></span>
-            </div>
-            <div class="telemetry-item">
-                <span>RAM Free: <strong id="val-ram">--</strong></span>
-            </div>
-            <div class="telemetry-item">
-                <span>Storage Free: <strong id="val-storage">--</strong></span>
-            </div>
-            <div class="telemetry-item">
-                <span>User: <strong id="val-user">Guest</strong></span>
-            </div>
-            <button id="btn-auth" onclick="toggleAuthModal()">Login</button>
+
+        <div class="hidden items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-1.5 xl:flex">
+          <svg class="h-3.5 w-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <rect x="4" y="4" width="16" height="16" rx="2" /><rect x="9" y="9" width="6" height="6" />
+            <path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3" />
+          </svg>
+          <span class="text-[11px] text-muted-foreground">CPU</span>
+          <span id="header-cpu" class="font-mono text-[11px] font-semibold text-foreground">24.2%</span>
         </div>
+
+        <div class="hidden items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-1.5 xl:flex">
+          <svg class="h-3.5 w-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M6 19v-9a2 2 0 012-2h8a2 2 0 012 2v9m-4-6h.01M10 13h.01M10 10h.01M14 10h.01M6 19h12a2 2 0 002-2V7a2 2 0 00-2-2H6a2 2 0 00-2 2v10a2 2 0 002 2z" />
+          </svg>
+          <span class="text-[11px] text-muted-foreground">RAM free</span>
+          <span id="header-ram" class="font-mono text-[11px] font-semibold text-foreground">2140 MB</span>
+        </div>
+
+        <div class="hidden items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-1.5 xl:flex">
+          <svg class="h-3.5 w-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="4" width="20" height="16" rx="2" /><path d="M6 12h.01M10 12h.01" />
+          </svg>
+          <span class="text-[11px] text-muted-foreground">Storage</span>
+          <span id="header-storage" class="font-mono text-[11px] font-semibold text-foreground">8.9 GB</span>
+        </div>
+
+        <div class="flex items-center gap-2 rounded-lg border border-border bg-card px-2.5 py-1.5">
+          <svg class="h-3.5 w-3.5 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+          </svg>
+          <span id="header-clock" class="font-mono text-[11px] font-semibold text-foreground">----‐--‐-- --:--:--</span>
+        </div>
+      </div>
     </header>
 
-    <div class="controls-bar">
-        <div class="btn-group">
-            <button class="active" onclick="switchLayout(4)">Grid (2x2)</button>
-            <button onclick="switchLayout(1)">Single View</button>
+    <!-- Main Container: Sidebar + Views -->
+    <div class="flex flex-1">
+      
+      <!-- Collapsible Sidebar Rail -->
+      <aside id="sidebar-rail" class="sticky top-14 hidden h-[calc(100vh-3.5rem)] shrink-0 flex-col border-r border-border bg-card/60 py-3 transition-all duration-200 md:flex w-60">
+        <nav class="flex flex-1 flex-col gap-1 px-2.5">
+          
+          <a href="#live" data-nav="live" class="nav-item group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors bg-primary text-primary-foreground shadow-sm">
+            <svg class="h-[18px] w-[18px] shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+            <span class="nav-text truncate">Live Matrix</span>
+          </a>
+
+          <a href="#playback" data-nav="playback" class="nav-item group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+            <svg class="h-[18px] w-[18px] shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+            <span class="nav-text truncate">Recordings</span>
+          </a>
+
+          <a href="#cameras" data-nav="cameras" class="nav-item group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+            <svg class="h-[18px] w-[18px] shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+              <path stroke-linecap="round" stroke-linejoin="round" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+            <span class="nav-text truncate">Camera Manager</span>
+          </a>
+
+          <a href="#dashboard" data-nav="dashboard" class="nav-item group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+            <svg class="h-[18px] w-[18px] shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+            </svg>
+            <span class="nav-text truncate">Health &amp; Telemetry</span>
+          </a>
+
+          <a href="#system" data-nav="system" class="nav-item group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-colors text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+            <svg class="h-[18px] w-[18px] shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <rect x="2" y="2" width="20" height="8" rx="2" /><rect x="2" y="14" width="20" height="8" rx="2" />
+              <line x1="6" y1="6" x2="6.01" y2="6" /><line x1="6" y1="18" x2="6.01" y2="18" />
+            </svg>
+            <span class="nav-text truncate">System &amp; Storage</span>
+          </a>
+
+        </nav>
+
+        <div class="px-2.5 pt-2">
+          <button type="button" id="btn-toggle-rail" class="flex w-full items-center justify-center gap-2 rounded-xl border border-border px-3 py-2 text-xs font-semibold text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground">
+            <svg id="icon-rail-collapse" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M11 19l-7-7 7-7m8 14l-7-7 7-7" />
+            </svg>
+            <span id="label-rail-collapse">Collapse rail</span>
+          </button>
         </div>
-        <div class="btn-group">
-            <button onclick="refreshAllSnapshots()">Refresh Snapshots</button>
-            <button onclick="queryRecordings()">Query Recordings</button>
-        </div>
+      </aside>
+
+      <!-- Main Content View Container -->
+      <main class="min-w-0 flex-1 p-5 lg:p-6">
+
+        <!-- ========================================== -->
+        <!-- VIEW 1: LIVE MATRIX (#live)                -->
+        <!-- ========================================== -->
+        <section id="view-live" class="app-view">
+          <div class="mx-auto flex max-w-[1600px] gap-4">
+            
+            <!-- Left Collapsible Camera Directory -->
+            <aside id="live-camera-pane" class="hidden shrink-0 flex-col rounded-2xl border border-border bg-card shadow-panel overflow-hidden transition-all duration-200 lg:flex w-72">
+              <div class="flex h-full w-72 shrink-0 flex-col">
+                <div class="flex items-center justify-between border-b border-border px-3 py-2.5">
+                  <span class="flex items-center gap-2 text-[12px] font-bold uppercase tracking-wide text-foreground">
+                    <svg class="h-4 w-4 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                    </svg>
+                    Camera directory
+                    <span id="live-dir-count" class="inline-flex items-center rounded-md border border-transparent bg-secondary px-2.5 py-0.5 text-xs font-semibold text-secondary-foreground font-mono text-[10px]">6 / 8</span>
+                  </span>
+                  <button type="button" id="btn-collapse-cam-pane" title="Collapse camera panel" class="flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground">
+                    <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15 19l-7-7 7-7" />
+                    </svg>
+                  </button>
+                </div>
+
+                <div class="relative px-3 pt-3">
+                  <svg class="pointer-events-none absolute left-6 top-[22px] h-3.5 w-3.5 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  </svg>
+                  <input type="text" id="live-search-input" placeholder="Search cameras by name/IP..." class="h-8 w-full rounded-md border border-input bg-background pl-8 pr-3 text-xs shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+                </div>
+
+                <div class="flex gap-1.5 px-3 py-2.5">
+                  <button type="button" data-filter="all" class="live-filter-pill rounded-full px-3 py-1 text-[11px] font-semibold capitalize transition-colors bg-primary text-primary-foreground">All</button>
+                  <button type="button" data-filter="online" class="live-filter-pill rounded-full px-3 py-1 text-[11px] font-semibold capitalize transition-colors bg-secondary text-secondary-foreground hover:bg-accent">Online</button>
+                  <button type="button" data-filter="rec" class="live-filter-pill rounded-full px-3 py-1 text-[11px] font-semibold capitalize transition-colors bg-secondary text-secondary-foreground hover:bg-accent">Recording</button>
+                </div>
+
+                <ul id="live-camera-list" class="thin-scroll flex-1 overflow-y-auto px-2 pb-3">
+                  <!-- Rendered dynamically -->
+                </ul>
+              </div>
+            </aside>
+
+            <!-- Main Live Matrix Area -->
+            <div class="min-w-0 flex-1 space-y-3">
+              
+              <!-- Matrix Toolbar -->
+              <div class="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-border bg-card px-3 py-2.5 shadow-panel">
+                <div class="flex items-center gap-2">
+                  <button type="button" id="btn-expand-cam-pane" class="hidden h-8 w-8 items-center justify-center rounded-md hover:bg-accent hover:text-foreground cursor-pointer transition-colors" title="Show camera panel">
+                    <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                    </svg>
+                  </button>
+                  <div class="flex items-center gap-1 rounded-xl bg-secondary p-1">
+                    <button type="button" data-layout="1" title="Single 1080p view" class="layout-btn flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-bold transition-colors text-secondary-foreground hover:bg-accent">
+                      <span class="grid grid-cols-3 gap-[2px]">
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-transparent"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-transparent"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-transparent"></span>
+                      </span>
+                      1-CAM
+                    </button>
+                    <button type="button" data-layout="4" title="2x2 multi-grid" class="layout-btn flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-bold transition-colors bg-primary text-primary-foreground shadow-sm">
+                      <span class="grid grid-cols-3 gap-[2px]">
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-transparent"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                      </span>
+                      4-CAM
+                    </button>
+                    <button type="button" data-layout="7plus1" title="Master 7+1 pro layout" class="layout-btn flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-bold transition-colors text-secondary-foreground hover:bg-accent">
+                      <span class="grid grid-cols-3 gap-[2px]">
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-transparent"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-transparent"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-transparent"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                      </span>
+                      7+1
+                    </button>
+                    <button type="button" data-layout="8" title="4x2 full matrix" class="layout-btn flex items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-[11px] font-bold transition-colors text-secondary-foreground hover:bg-accent">
+                      <span class="grid grid-cols-3 gap-[2px]">
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                        <span class="h-[5px] w-[5px] rounded-[1px] bg-current"></span>
+                      </span>
+                      8-CAM
+                    </button>
+                  </div>
+                </div>
+                <div class="flex items-center gap-2">
+                  <button type="button" id="btn-exit-fullscreen" class="hidden h-8 items-center justify-center gap-1.5 rounded-md border border-input bg-background px-3 text-xs font-medium hover:bg-accent">
+                    <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7" />
+                    </svg>
+                    Exit fullscreen
+                  </button>
+                  <span class="hidden items-center gap-1.5 rounded-lg bg-accent px-2.5 py-1.5 text-[11px] font-semibold text-accent-foreground xl:flex">
+                    Pipeline: Zero-Transcode StreamCopy
+                  </span>
+                </div>
+              </div>
+
+              <!-- Matrix Grid Area -->
+              <div id="live-matrix-grid" class="grid h-[calc(100vh-13rem)] min-h-[420px] gap-2 matrix-4">
+                <!-- Rendered dynamically -->
+              </div>
+
+            </div>
+          </div>
+        </section>
+
+        <!-- ========================================== -->
+        <!-- VIEW 2: RECORDINGS PLAYBACK (#playback)    -->
+        <!-- ========================================== -->
+        <section id="view-playback" class="app-view hidden">
+          <div class="mx-auto max-w-7xl space-y-4">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h1 class="font-display text-xl font-bold tracking-tight text-foreground lg:text-2xl">
+                  Footage review &amp; recordings
+                </h1>
+                <p class="mt-0.5 text-[13px] text-muted-foreground">
+                  Browse activity cards with hover preview, or scrub the precision 24-hour player
+                </p>
+              </div>
+              
+              <!-- View Mode Switcher -->
+              <div class="flex items-center gap-1 rounded-lg border border-border/70 bg-secondary/60 p-1">
+                <button type="button" id="btn-pb-mode-cards" class="inline-flex h-7 items-center justify-center gap-1.5 rounded-md px-2.5 text-xs font-semibold bg-primary text-primary-foreground shadow-sm transition-colors">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="7" height="7" rx="1.5" /><rect x="14" y="3" width="7" height="7" rx="1.5" />
+                    <rect x="14" y="14" width="7" height="7" rx="1.5" /><rect x="3" y="14" width="7" height="7" rx="1.5" />
+                  </svg>
+                  Activity cards
+                </button>
+                <button type="button" id="btn-pb-mode-player" class="inline-flex h-7 items-center justify-center gap-1.5 rounded-md px-2.5 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <polygon points="5 3 19 12 5 21 5 3" />
+                  </svg>
+                  Timeline player
+                </button>
+                <button type="button" id="btn-pb-mode-table" class="inline-flex h-7 items-center justify-center gap-1.5 rounded-md px-2.5 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" />
+                    <line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" />
+                  </svg>
+                  Raw index
+                </button>
+              </div>
+            </div>
+
+            <!-- Filter Bar Card -->
+            <div class="rounded-xl border border-border/70 bg-card shadow-panel">
+              <div class="flex flex-wrap items-end gap-3 p-3.5">
+                <div class="space-y-1">
+                  <label class="text-[11px] font-medium leading-none">Channel</label>
+                  <select id="pb-channel" class="h-9 w-[150px] rounded-md border border-input bg-background px-3 text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                    <option value="all">All channels</option>
+                  </select>
+                </div>
+                <div class="space-y-1">
+                  <label class="text-[11px] font-medium leading-none">Date</label>
+                  <input type="date" id="pb-date" class="h-9 w-[150px] rounded-md border border-input bg-background px-3 text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-[11px] font-medium leading-none">From</label>
+                  <input type="time" id="pb-from" value="00:00" class="h-9 w-[105px] rounded-md border border-input bg-background px-3 text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-[11px] font-medium leading-none">To</label>
+                  <input type="time" id="pb-to" value="23:59" class="h-9 w-[105px] rounded-md border border-input bg-background px-3 text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-ring" />
+                </div>
+                <div class="space-y-1">
+                  <label class="text-[11px] font-medium leading-none">Activity type</label>
+                  <select id="pb-trigger" class="h-9 w-[140px] rounded-md border border-input bg-background px-3 text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                    <option value="all">All activity</option>
+                    <option value="event">AI alerts &amp; events</option>
+                    <option value="motion">Motion activity</option>
+                    <option value="continuous">24x7 Continuous</option>
+                  </select>
+                </div>
+                <button type="button" id="btn-search-recordings" class="inline-flex h-9 items-center justify-center gap-1.5 rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
+                  </svg>
+                  Filter activity
+                </button>
+              </div>
+            </div>
+
+            <!-- ============================================== -->
+            <!-- SUB-VIEW A: YOUTUBE-STYLE ACTIVITY CARDS FEED   -->
+            <!-- ============================================== -->
+            <div id="pb-cards-view" class="space-y-3">
+              <div class="flex items-center justify-between px-1">
+                <span id="pb-review-count" class="text-xs font-medium text-muted-foreground">Loading recorded activity...</span>
+                <span class="text-[11px] text-muted-foreground/80 flex items-center gap-1">
+                  <svg class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>
+                  Hover cards to preview &amp; scrub · Click card to open full player
+                </span>
+              </div>
+
+              <!-- Cards Grid Container -->
+              <div id="pb-review-grid" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                <!-- Dynamically populated via renderReviewCards() -->
+              </div>
+
+              <!-- Empty State -->
+              <div id="pb-review-empty" class="hidden rounded-xl border border-dashed border-border/70 p-12 text-center bg-card/50">
+                <svg class="mx-auto h-10 w-10 text-muted-foreground/60" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                <h3 class="mt-3 text-sm font-semibold text-foreground">No recorded activity discovered</h3>
+                <p class="mt-1 text-xs text-muted-foreground">No footage matched the selected camera channel, date, or event criteria.</p>
+              </div>
+            </div>
+
+            <!-- ============================================== -->
+            <!-- SUB-VIEW B: FULL PLAYER & 24H TIMELINE         -->
+            <!-- ============================================== -->
+            <div id="pb-player-view" class="hidden space-y-4">
+              <!-- Subheader Navigation -->
+              <div class="flex items-center justify-between">
+                <button type="button" id="btn-back-to-cards" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-border bg-secondary/80 px-3 text-xs font-medium text-foreground transition-colors hover:bg-accent">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M10 19l-7-7m0 0l7-7m-7 7h18" />
+                  </svg>
+                  Back to Activity feed
+                </button>
+                <div class="flex items-center gap-1 rounded-lg border border-border/70 bg-secondary/60 p-1">
+                  <button type="button" id="btn-pb-layout-1" class="inline-flex h-7 items-center justify-center rounded-md px-2.5 text-xs font-semibold bg-primary text-primary-foreground shadow-sm transition-colors">
+                    Single view
+                  </button>
+                  <button type="button" id="btn-pb-layout-4" class="inline-flex h-7 items-center justify-center rounded-md px-2.5 text-xs font-semibold text-muted-foreground transition-colors hover:text-foreground">
+                    Sync 4-Grid
+                  </button>
+                </div>
+              </div>
+
+              <!-- Player Stage Card -->
+              <div class="overflow-hidden rounded-xl border border-border/70 bg-card shadow-card">
+                <div id="pb-stage-container" class="tile-stage-bg relative aspect-video w-full overflow-hidden">
+                  
+                  <!-- Initial / Empty State -->
+                  <div id="pb-placeholder" class="absolute inset-0 flex flex-col items-center justify-center gap-2 text-white/60">
+                    <svg class="h-9 w-9" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <polygon points="5 3 19 12 5 21 5 3" />
+                    </svg>
+                    <p class="text-sm font-medium">Select an activity card from the feed to play</p>
+                    <p class="text-xs">Native zero-transcode player with HTTP 206 Range scrubbing &amp; gapless chaining</p>
+                  </div>
+
+                  <!-- Video / Stage Elements (Single View) -->
+                  <video id="pb-video" class="hidden absolute inset-0 h-full w-full object-contain bg-black" playsinline></video>
+
+                  <!-- Synchronized 4-Grid Mode View -->
+                  <div id="pb-sync-grid" class="hidden absolute inset-0 grid grid-cols-2 grid-rows-2 gap-1 bg-black p-1">
+                    <div class="relative bg-zinc-950 overflow-hidden rounded flex items-center justify-center border border-border/40">
+                      <video id="pb-sync-vid-1" class="h-full w-full object-contain bg-black" playsinline></video>
+                      <span class="absolute top-2 left-2 rounded bg-black/70 px-2 py-0.5 font-mono text-[10px] font-semibold text-white">CH 1</span>
+                    </div>
+                    <div class="relative bg-zinc-950 overflow-hidden rounded flex items-center justify-center border border-border/40">
+                      <video id="pb-sync-vid-2" class="h-full w-full object-contain bg-black" playsinline></video>
+                      <span class="absolute top-2 left-2 rounded bg-black/70 px-2 py-0.5 font-mono text-[10px] font-semibold text-white">CH 2</span>
+                    </div>
+                    <div class="relative bg-zinc-950 overflow-hidden rounded flex items-center justify-center border border-border/40">
+                      <video id="pb-sync-vid-3" class="h-full w-full object-contain bg-black" playsinline></video>
+                      <span class="absolute top-2 left-2 rounded bg-black/70 px-2 py-0.5 font-mono text-[10px] font-semibold text-white">CH 3</span>
+                    </div>
+                    <div class="relative bg-zinc-950 overflow-hidden rounded flex items-center justify-center border border-border/40">
+                      <video id="pb-sync-vid-4" class="h-full w-full object-contain bg-black" playsinline></video>
+                      <span class="absolute top-2 left-2 rounded bg-black/70 px-2 py-0.5 font-mono text-[10px] font-semibold text-white">CH 4</span>
+                    </div>
+                  </div>
+
+                  <div id="pb-overlay-hud" class="hidden pointer-events-none absolute inset-0 z-10">
+                    <div class="absolute left-3 top-3 flex items-center gap-2">
+                      <span id="pb-badge-cam" class="inline-flex items-center rounded-md border border-transparent bg-black/60 px-2.5 py-0.5 font-mono text-[10px] text-white">CH 01</span>
+                      <span id="pb-badge-state" class="inline-flex items-center rounded-md border border-transparent bg-destructive px-2.5 py-0.5 font-mono text-[10px] font-bold text-white">
+                        <span class="rec-dot mr-1 inline-block h-1.5 w-1.5 rounded-full bg-white"></span>
+                        PLAYING
+                      </span>
+                      <span id="pb-badge-rate" class="inline-flex items-center rounded-md border border-transparent bg-black/60 px-2.5 py-0.5 font-mono text-[10px] text-white">x1</span>
+                    </div>
+
+                    <div id="pb-timestamp-hud" class="absolute bottom-3 right-3 rounded-md bg-black/55 px-2 py-1 font-mono text-sm text-white">
+                      00:00:00
+                    </div>
+                  </div>
+
+                </div>
+
+                <!-- 24-Hour Timeline Bar -->
+                <div class="relative border-t border-border px-4 pb-2 pt-3">
+                  <div class="flex justify-between font-mono text-[10px] text-muted-foreground select-none">
+                    <span>00:00</span><span>03:00</span><span>06:00</span><span>09:00</span><span>12:00</span><span>15:00</span><span>18:00</span><span>21:00</span><span>24:00</span>
+                  </div>
+                  <div id="pb-timeline-track" class="relative mt-1.5 h-6 cursor-pointer overflow-hidden rounded-md bg-secondary select-none">
+                    <!-- Segments rendered dynamically -->
+                    <div id="pb-needle" class="pointer-events-none absolute top-0 h-full w-[2px] bg-foreground shadow hidden" style="left: 0%;"></div>
+                  </div>
+                  <!-- Timeline hover preview tooltip -->
+                  <div id="pb-timeline-tooltip" class="pointer-events-none absolute bottom-9 -translate-x-1/2 rounded-md bg-popover px-2.5 py-1 font-mono text-[11px] text-popover-foreground shadow-lg border border-border hidden z-20 whitespace-nowrap"></div>
+                </div>
+
+                <!-- Controls Toolbar -->
+                <div class="flex flex-wrap items-center justify-between gap-2 border-t border-border px-4 py-2.5">
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <button type="button" id="btn-pb-step-back" disabled class="inline-flex h-8 items-center justify-center rounded-md bg-secondary px-2 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent disabled:opacity-50 disabled:pointer-events-none" title="Step backward 1 frame">
+                      <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="6" y1="5" x2="6" y2="19"/><polygon points="18 4 8 12 18 20 18 4"/></svg>
+                    </button>
+                    <button type="button" id="btn-pb-back1s" disabled class="inline-flex h-8 items-center justify-center gap-1 rounded-md bg-secondary px-2.5 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent disabled:opacity-50 disabled:pointer-events-none">
+                      -1s
+                    </button>
+                    <button type="button" id="btn-pb-playpause" disabled class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90 disabled:opacity-50 disabled:pointer-events-none">
+                      <svg id="icon-pb-play" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <polygon points="5 3 19 12 5 21 5 3" />
+                      </svg>
+                      <span id="label-pb-play">Play</span>
+                    </button>
+                    <button type="button" id="btn-pb-fwd1s" disabled class="inline-flex h-8 items-center justify-center gap-1 rounded-md bg-secondary px-2.5 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent disabled:opacity-50 disabled:pointer-events-none">
+                      +1s
+                    </button>
+                    <button type="button" id="btn-pb-step-fwd" disabled class="inline-flex h-8 items-center justify-center rounded-md bg-secondary px-2 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent disabled:opacity-50 disabled:pointer-events-none" title="Step forward 1 frame">
+                      <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="5" x2="18" y2="19"/><polygon points="6 4 16 12 6 20 6 4"/></svg>
+                    </button>
+                    
+                    <div class="ml-1 flex items-center gap-0.5 rounded-lg bg-secondary p-0.5">
+                      <button type="button" data-rate="0.5" class="pb-rate-btn rounded-md px-2 py-1 text-[11px] font-bold transition-colors text-secondary-foreground hover:bg-accent">0.5x</button>
+                      <button type="button" data-rate="1" class="pb-rate-btn rounded-md px-2 py-1 text-[11px] font-bold transition-colors bg-primary text-primary-foreground">1x</button>
+                      <button type="button" data-rate="2" class="pb-rate-btn rounded-md px-2 py-1 text-[11px] font-bold transition-colors text-secondary-foreground hover:bg-accent">2x</button>
+                      <button type="button" data-rate="4" class="pb-rate-btn rounded-md px-2 py-1 text-[11px] font-bold transition-colors text-secondary-foreground hover:bg-accent">4x</button>
+                      <button type="button" data-rate="8" class="pb-rate-btn rounded-md px-2 py-1 text-[11px] font-bold transition-colors text-secondary-foreground hover:bg-accent">8x</button>
+                    </div>
+
+                    <button type="button" id="btn-pb-autonext" class="ml-1 inline-flex h-8 items-center justify-center gap-1 rounded-md border border-border bg-secondary/80 px-2.5 text-[11px] font-medium text-secondary-foreground transition-colors hover:bg-accent" title="Auto-advance to next sequential segment">
+                      <span class="inline-block h-1.5 w-1.5 rounded-full bg-success"></span>
+                      Auto-Next
+                    </button>
+
+                    <button type="button" id="btn-pb-loop" class="inline-flex h-8 items-center justify-center gap-1 rounded-md border border-border bg-secondary/80 px-2.5 text-[11px] font-medium text-muted-foreground transition-colors hover:bg-accent" title="Loop current segment">
+                      Loop
+                    </button>
+                  </div>
+
+                  <div class="flex items-center gap-2">
+                    <span id="pb-time-counter" class="font-mono text-[12px] text-foreground">00:00:00 / 00:00:00</span>
+                    <button type="button" id="btn-pb-download" disabled class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-3 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent disabled:opacity-50 disabled:pointer-events-none">
+                      <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                        <path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                      </svg>
+                      Download clip
+                    </button>
+                    <button type="button" id="btn-pb-fullscreen" disabled class="inline-flex h-8 w-8 items-center justify-center rounded-md bg-secondary text-secondary-foreground transition-colors hover:bg-accent disabled:opacity-50 disabled:pointer-events-none" title="Fullscreen">
+                      <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                        <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3" />
+                      </svg>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- ============================================== -->
+            <!-- SUB-VIEW C: RAW SEGMENTS INDEX TABLE           -->
+            <!-- ============================================== -->
+            <div id="pb-table-view" class="hidden rounded-xl border border-border/70 bg-card shadow-card">
+              <div class="p-4">
+                <div class="mb-2 flex items-center justify-between">
+                  <h3 class="font-display text-[15px] font-semibold text-foreground">Recorded segments container index</h3>
+                  <span id="pb-segments-count" class="text-xs text-muted-foreground">0 segments loaded</span>
+                </div>
+                <div class="thin-scroll max-h-[420px] overflow-auto rounded-lg border border-border">
+                  <table class="w-full caption-bottom text-sm">
+                    <thead class="[&_tr]:border-b">
+                      <tr class="border-b transition-colors hover:bg-muted/50 data-[state=selected]:bg-muted">
+                        <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Segment ID</th>
+                        <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Channel</th>
+                        <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Start (UTC)</th>
+                        <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">End</th>
+                        <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Duration</th>
+                        <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Size</th>
+                        <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Retention</th>
+                        <th class="h-10 px-4 text-left align-middle font-medium text-muted-foreground text-xs">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody id="pb-table-body" class="[&_tr:last-child]:border-0">
+                      <tr>
+                        <td colspan="8" class="p-4 align-middle h-24 text-center text-sm text-muted-foreground">
+                          No search performed yet.
+                        </td>
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- ========================================== -->
+        <!-- VIEW 3: CAMERA MANAGER (#cameras)          -->
+        <!-- ========================================== -->
+        <section id="view-cameras" class="app-view hidden">
+          <div class="mx-auto max-w-7xl space-y-5">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h1 class="font-display text-xl font-bold tracking-tight text-foreground lg:text-2xl">
+                  Camera ingress management
+                </h1>
+                <p class="mt-0.5 text-[13px] text-muted-foreground">
+                  Centralized ingress sessions · sub &amp; main stream profiles
+                </p>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <button type="button" id="btn-cam-refresh" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-3 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  Refresh
+                </button>
+                <button type="button" id="btn-cam-add-manual" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-3 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
+                  </svg>
+                  Add manually
+                </button>
+                <button type="button" id="btn-cam-open-wizard" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90">
+                  <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 20h.01" />
+                    <path d="M2 8.82a15 15 0 0 1 20 0" />
+                    <path d="M5 12.859a10 10 0 0 1 14 0" />
+                    <path d="M8.5 16.429a5 5 0 0 1 7 0" />
+                  </svg>
+                  Auto-discover ONVIF
+                </button>
+              </div>
+            </div>
+
+            <!-- Cameras Grid -->
+            <div id="cam-grid" class="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+              <!-- Rendered dynamically -->
+            </div>
+          </div>
+        </section>
+
+        <!-- ========================================== -->
+        <!-- VIEW 4: HEALTH & TELEMETRY (#dashboard)    -->
+        <!-- ========================================== -->
+        <section id="view-dashboard" class="app-view hidden">
+          <div class="mx-auto max-w-7xl space-y-5">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h1 class="font-display text-xl font-bold tracking-tight text-foreground lg:text-2xl">
+                  Enterprise Surveillance Dashboard
+                </h1>
+                <p class="mt-0.5 text-[13px] text-muted-foreground">
+                  NXP i.MX 95 system telemetry &amp; video channel health
+                </p>
+              </div>
+              <div class="flex gap-2">
+                <button type="button" id="btn-dash-refresh" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-3 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  Refresh telemetry
+                </button>
+                <a href="#live" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <polygon points="5 3 19 12 5 21 5 3" />
+                  </svg>
+                  Open live matrix
+                </a>
+              </div>
+            </div>
+
+            <!-- Stat Cards Grid -->
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+              
+              <div class="rounded-xl border border-border/70 bg-card shadow-card">
+                <div class="flex items-start justify-between p-4">
+                  <div class="min-w-0">
+                    <div class="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Core engine</div>
+                    <div id="dash-core-status" class="mt-1.5 font-display text-2xl font-bold tracking-tight text-success">ONLINE</div>
+                    <div id="dash-core-uptime" class="mt-1 truncate text-[11px] text-muted-foreground">Uptime: 42h 42m</div>
+                  </div>
+                  <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-secondary">
+                    <svg class="h-4.5 w-4.5 text-secondary-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-border/70 bg-card shadow-card">
+                <div class="flex items-start justify-between p-4">
+                  <div class="min-w-0">
+                    <div class="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">CPU utilization</div>
+                    <div id="dash-cpu-pct" class="mt-1.5 font-display text-2xl font-bold tracking-tight text-primary">24.2%</div>
+                    <div class="mt-1 truncate text-[11px] text-muted-foreground">Ceiling: under 50% target budget</div>
+                  </div>
+                  <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-secondary">
+                    <svg class="h-4.5 w-4.5 text-secondary-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <rect x="4" y="4" width="16" height="16" rx="2" /><rect x="9" y="9" width="6" height="6" />
+                      <path d="M9 1v3M15 1v3M9 20v3M15 20v3M20 9h3M20 14h3M1 9h3M1 14h3" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-border/70 bg-card shadow-card">
+                <div class="flex items-start justify-between p-4">
+                  <div class="min-w-0">
+                    <div class="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Free RAM</div>
+                    <div id="dash-ram-free" class="mt-1.5 font-display text-2xl font-bold tracking-tight text-warning">2140 MB</div>
+                    <div class="mt-1 truncate text-[11px] text-muted-foreground">Budget: 4 GB LPDDR5 partition</div>
+                  </div>
+                  <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-secondary">
+                    <svg class="h-4.5 w-4.5 text-secondary-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M6 19v-9a2 2 0 012-2h8a2 2 0 012 2v9m-4-6h.01M10 13h.01M10 10h.01M14 10h.01M6 19h12a2 2 0 002-2V7a2 2 0 00-2-2H6a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-border/70 bg-card shadow-card">
+                <div class="flex items-start justify-between p-4">
+                  <div class="min-w-0">
+                    <div class="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Storage free</div>
+                    <div id="dash-storage-free" class="mt-1.5 font-display text-2xl font-bold tracking-tight text-destructive">8.9 GB</div>
+                    <div class="mt-1 truncate text-[11px] text-muted-foreground">Circular retention FIFO</div>
+                  </div>
+                  <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-secondary">
+                    <svg class="h-4.5 w-4.5 text-secondary-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <rect x="2" y="4" width="20" height="16" rx="2" /><path d="M6 12h.01M10 12h.01" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-border/70 bg-card shadow-card">
+                <div class="flex items-start justify-between p-4">
+                  <div class="min-w-0">
+                    <div class="text-[11px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">Active cameras</div>
+                    <div id="dash-active-cams" class="mt-1.5 font-display text-2xl font-bold tracking-tight text-primary">6 / 8</div>
+                    <div class="mt-1 truncate text-[11px] text-muted-foreground">Centralized ingress sessions</div>
+                  </div>
+                  <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-secondary">
+                    <svg class="h-4.5 w-4.5 text-secondary-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                    </svg>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+
+            <!-- Media Storage Allocation Card -->
+            <div class="rounded-xl border border-border/70 bg-card shadow-card">
+              <div class="p-4">
+                <div class="flex items-center justify-between gap-3">
+                  <div>
+                    <h3 class="text-sm font-semibold text-foreground">Media storage allocation</h3>
+                    <p class="mt-0.5 text-xs text-muted-foreground">
+                      Direct filesystem container storage with WAL metadata index
+                    </p>
+                  </div>
+                  <span id="dash-storage-numbers" class="font-mono text-[13px] font-semibold text-foreground">11.1 GB / 20.0 GB</span>
+                </div>
+                
+                <div class="mt-3 h-2.5 w-full overflow-hidden rounded-full bg-secondary">
+                  <div id="dash-storage-bar" class="h-full bg-primary transition-all duration-500" style="width: 55%;"></div>
+                </div>
+
+                <div class="mt-2 flex items-center gap-4 text-[11px] text-muted-foreground">
+                  <span class="flex items-center gap-1.5">
+                    <svg class="h-3 w-3 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                      <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                    </svg>
+                    <span id="dash-bitrate">Ingest 38.4 Mbps</span>
+                  </span>
+                  <span>Segment: 60 s atomic .mp4</span>
+                  <span>Retention: 14 days FIFO</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Configured Video Channels Section -->
+            <div class="space-y-3">
+              <div class="flex items-center justify-between">
+                <h3 class="font-display text-base font-semibold text-foreground">Configured video channels</h3>
+                <a href="#cameras" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-3 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent">
+                  <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <line x1="4" y1="21" x2="4" y2="14" /><line x1="4" y1="10" x2="4" y2="3" />
+                    <line x1="12" y1="21" x2="12" y2="12" /><line x1="12" y1="8" x2="12" y2="3" />
+                    <line x1="20" y1="21" x2="20" y2="16" /><line x1="20" y1="12" x2="20" y2="3" />
+                    <line x1="1" y1="14" x2="7" y2="14" /><line x1="9" y1="8" x2="15" y2="8" /><line x1="17" y1="16" x2="23" y2="16" />
+                  </svg>
+                  Manage channels
+                </a>
+              </div>
+
+              <div id="dash-channels-grid" class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                <!-- Rendered dynamically -->
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+        <!-- ========================================== -->
+        <!-- VIEW 5: SYSTEM & STORAGE (#system)         -->
+        <!-- ========================================== -->
+        <section id="view-system" class="app-view hidden">
+          <div class="mx-auto max-w-6xl space-y-5">
+            <div class="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h1 class="font-display text-xl font-bold tracking-tight text-foreground lg:text-2xl">
+                  System hardware &amp; storage health
+                </h1>
+                <p class="mt-0.5 text-[13px] text-muted-foreground">
+                  NXP i.MX 95 target parameters · zero-DB storage · diagnostics log
+                </p>
+              </div>
+              <button type="button" id="btn-system-refresh" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-3 text-xs font-medium text-secondary-foreground transition-colors hover:bg-accent">
+                <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Refresh telemetry
+              </button>
+            </div>
+
+            <div class="grid grid-cols-1 gap-4 lg:grid-cols-2">
+              
+              <!-- Hardware Architecture Card -->
+              <div class="rounded-xl border border-border/70 bg-card shadow-card">
+                <div class="p-4">
+                  <h3 class="border-b border-border pb-2 text-sm font-semibold text-foreground">Target platform architecture (i.MX 95)</h3>
+                  <div class="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Processor target</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-foreground">6x Cortex-A55 @ 1.8GHz</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Memory budget</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-foreground">4096 MB LPDDR5 (bound &lt; 5.3MB)</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">AI acceleration</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-success">Neutron NPU (8 eTOPS INT8)</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">VPU decoding</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-primary">V4L2 H.264 / H.265 pass-through</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Compositor decoupling</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-foreground">IDisplayBackend / QQuickProvider</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Ingress architecture</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-success">1 RTSP ingress / camera</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Media Storage Policy Card -->
+              <div class="rounded-xl border border-border/70 bg-card shadow-card">
+                <div class="p-4">
+                  <h3 class="border-b border-border pb-2 text-sm font-semibold text-foreground">Dedicated media storage &amp; filesystem retention</h3>
+                  <div class="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Storage mount point</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-foreground">/recordings (dedicated disk)</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Metadata storage</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-foreground">Filesystem direct (.mp4 + .thumb)</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Segment strategy</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-primary">Two-phase atomic .tmp to .mp4</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Retention policy</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-warning">Circular FIFO file scans</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Zero-transcode rule</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-success">100% stream copy (re-encode prohibited)</div>
+                    </div>
+                    <div class="min-w-0">
+                      <span class="text-[11.5px] text-muted-foreground">Disk health</span>
+                      <div class="truncate font-mono text-[12px] font-semibold text-success">OK (write throttling ready)</div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+            </div>
+
+            <!-- Deep Trace Log Stream -->
+            <div class="rounded-xl border border-border/70 bg-card shadow-card">
+              <div class="space-y-3 p-4">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="flex items-center gap-3">
+                    <h3 class="text-sm font-semibold text-foreground">In-process deep trace log stream</h3>
+                    <span id="trace-events-badge" class="inline-flex items-center rounded-md border border-transparent bg-secondary px-2.5 py-0.5 font-mono text-[10px] font-semibold text-secondary-foreground">
+                      14 events
+                    </span>
+                  </div>
+                  <label class="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
+                    <input type="checkbox" id="trace-autotail" checked class="h-3.5 w-3.5 rounded border-gray-300 text-primary focus:ring-primary" />
+                    Auto-tail (2s)
+                  </label>
+                </div>
+
+                <pre id="trace-box" class="trace-box thin-scroll h-64 overflow-y-auto whitespace-pre-wrap rounded-xl p-3.5 font-mono text-[11px] leading-relaxed">Loading trace log...</pre>
+                
+                <p class="text-[11px] text-muted-foreground">
+                  The live engine streams this trace from its in-process diagnostics tracer; the console updates continuously.
+                </p>
+              </div>
+            </div>
+
+          </div>
+        </section>
+
+      </main>
     </div>
 
-    <main>
-        <div id="videoGrid" class="video-grid grid-4">
-            <!-- Cam 1 -->
-            <div class="video-tile" id="tile-1">
-                <div class="tile-header">
-                    <span class="tile-title">Cam 1: Front Entrance</span>
-                    <div style="display:flex; gap:6px;">
-                        <span class="badge-stream">fMP4 / H.264</span>
-                        <span class="badge-rec">REC</span>
-                    </div>
-                </div>
-                <video id="video-1" autoplay muted playsinline></video>
-                <img id="snap-1" src="/api/v1/cameras/1/snapshot" style="display:none;" alt="Live Snapshot">
-                <div class="tile-footer">
-                    <span>Engine: Hardware Pass-through</span>
-                    <span id="fps-1">0.0% CPU Transcode</span>
-                </div>
-            </div>
+    <!-- ========================================== -->
+    <!-- MODALS & DIALOGS                           -->
+    <!-- ========================================== -->
 
-            <!-- Cam 2 -->
-            <div class="video-tile" id="tile-2">
-                <div class="tile-header">
-                    <span class="tile-title">Cam 2: Parking Lot</span>
-                    <div style="display:flex; gap:6px;">
-                        <span class="badge-stream">fMP4 / H.264</span>
-                        <span class="badge-rec">REC</span>
-                    </div>
-                </div>
-                <video id="video-2" autoplay muted playsinline></video>
-                <img id="snap-2" src="/api/v1/cameras/2/snapshot" style="display:none;" alt="Live Snapshot">
-                <div class="tile-footer">
-                    <span>Engine: Hardware Pass-through</span>
-                    <span id="fps-2">0.0% CPU Transcode</span>
-                </div>
-            </div>
-
-            <!-- Cam 3 -->
-            <div class="video-tile" id="tile-3">
-                <div class="tile-header">
-                    <span class="tile-title">Cam 3: Server Room</span>
-                    <div style="display:flex; gap:6px;">
-                        <span class="badge-stream">fMP4 / H.264</span>
-                        <span class="badge-rec">REC</span>
-                    </div>
-                </div>
-                <video id="video-3" autoplay muted playsinline></video>
-                <img id="snap-3" src="/api/v1/cameras/3/snapshot" style="display:none;" alt="Live Snapshot">
-                <div class="tile-footer">
-                    <span>Engine: Hardware Pass-through</span>
-                    <span id="fps-3">0.0% CPU Transcode</span>
-                </div>
-            </div>
-
-            <!-- Cam 4 -->
-            <div class="video-tile" id="tile-4">
-                <div class="tile-header">
-                    <span class="tile-title">Cam 4: Loading Dock</span>
-                    <div style="display:flex; gap:6px;">
-                        <span class="badge-stream">fMP4 / H.264</span>
-                        <span class="badge-rec">REC</span>
-                    </div>
-                </div>
-                <video id="video-4" autoplay muted playsinline></video>
-                <img id="snap-4" src="/api/v1/cameras/4/snapshot" style="display:none;" alt="Live Snapshot">
-                <div class="tile-footer">
-                    <span>Engine: Hardware Pass-through</span>
-                    <span id="fps-4">0.0% CPU Transcode</span>
-                </div>
-            </div>
+    <!-- Edit Camera Modal -->
+    <div id="modal-edit-cam" class="modal-overlay">
+      <div class="modal-box max-w-lg">
+        <div class="modal-header relative">
+          <h2 id="modal-edit-title" class="text-lg font-semibold leading-none tracking-tight">Configure Channel</h2>
+          <p class="text-sm text-muted-foreground mt-1.5">Stream sources and connection details for this channel.</p>
+          <button type="button" class="btn-modal-close absolute right-4 top-4 rounded-sm opacity-70 cursor-pointer transition-opacity hover:opacity-100 focus:outline-none">
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
         </div>
-    </main>
-
-    <!-- Login Modal -->
-    <div id="authModal" class="modal-overlay">
-        <div class="modal-card">
-            <h2>NVR Security Login</h2>
-            <div class="form-group">
-                <label>Username</label>
-                <input type="text" id="username" value="admin">
+        <div class="modal-body space-y-3">
+          <input type="hidden" id="edit-cam-id" />
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium leading-none">Camera name</label>
+            <input type="text" id="edit-cam-name" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium leading-none">RTSP main stream URL (1080p recording)</label>
+            <input type="text" id="edit-cam-main" placeholder="rtsp://192.168.1.100:554/stream1" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 font-mono text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium leading-none">RTSP sub stream URL (live grid &amp; AI)</label>
+            <input type="text" id="edit-cam-sub" placeholder="rtsp://192.168.1.100:554/stream2" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 font-mono text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+          </div>
+          <div class="grid grid-cols-2 gap-3">
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">ONVIF / RTSP username</label>
+              <input type="text" id="edit-cam-user" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
             </div>
-            <div class="form-group">
-                <label>Password</label>
-                <input type="password" id="password" value="Admin@123">
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Password</label>
+              <input type="password" value="********" placeholder="Kept on the NVR device" disabled class="flex h-9 w-full rounded-md border border-input bg-muted px-3 py-1 text-sm opacity-60" />
             </div>
-            <button class="btn-primary" onclick="performLogin()">Authenticate Session</button>
-            <button style="width:100%; margin-top:8px;" onclick="toggleAuthModal()">Cancel</button>
+          </div>
+          <div class="rounded-lg border border-border/70 bg-secondary/50 p-2.5 text-xs text-muted-foreground">
+            <span class="font-semibold text-foreground">Hardware Encoder Settings:</span> Resolution, bitrate, codec, and framerate are managed dynamically on the physical camera via the <strong>HW Encoder Profile</strong> modal.
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium leading-none">Location label</label>
+            <input type="text" id="edit-cam-loc" placeholder="e.g. Ground floor — Main lobby" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+          </div>
         </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-modal-close inline-flex h-9 items-center justify-center rounded-md bg-secondary px-4 text-xs font-medium text-secondary-foreground shadow-sm transition-colors hover:bg-secondary/80">Cancel</button>
+          <button type="button" id="btn-save-edit-cam" class="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90">Save changes</button>
+        </div>
+      </div>
     </div>
 
-    <script>
-        let authToken = localStorage.getItem('nvr_token') || '';
-        let currentUser = localStorage.getItem('nvr_user') || 'Guest';
+    <!-- Hardware Profile Modal -->
+    <div id="modal-hw-cam" class="modal-overlay">
+      <div class="modal-box max-w-md">
+        <div class="modal-header relative">
+          <h2 id="modal-hw-title" class="text-lg font-semibold leading-none tracking-tight">HW encoder profile</h2>
+          <p class="text-sm text-muted-foreground mt-1.5">Codec, resolution and sensor settings pushed to the camera through ONVIF by the engine.</p>
+          <button type="button" class="btn-modal-close absolute right-4 top-4 rounded-sm opacity-70 cursor-pointer transition-opacity hover:opacity-100 focus:outline-none">
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="modal-body space-y-3">
+          <input type="hidden" id="hw-cam-id" />
+          <div class="grid grid-cols-2 gap-3">
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Resolution</label>
+              <select id="hw-cam-res" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                <option value="1080p">1080p</option>
+                <option value="4MP">4MP</option>
+                <option value="4K">4K</option>
+              </select>
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Codec</label>
+              <select id="hw-cam-codec" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                <option value="h264">H.264</option>
+                <option value="h265">H.265 / HEVC</option>
+              </select>
+            </div>
+            <div class="col-span-2 space-y-1.5">
+              <label class="text-sm font-medium leading-none">Target framerate</label>
+              <select id="hw-cam-fps" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                <option value="15">15 FPS</option>
+                <option value="20">20 FPS</option>
+                <option value="25">25 FPS</option>
+                <option value="30">30 FPS</option>
+              </select>
+            </div>
+          </div>
 
-        function updateAuthUI() {
-            const btn = document.getElementById('btn-auth');
-            const userLabel = document.getElementById('val-user');
-            if (authToken) {
-                btn.innerText = 'Logout';
-                userLabel.innerText = currentUser;
-            } else {
-                btn.innerText = 'Login';
-                userLabel.innerText = 'Guest';
-            }
-        }
+          <div class="border-t border-border pt-3 space-y-2">
+            <label class="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Remote ONVIF Operations</label>
+            <div class="grid grid-cols-2 gap-2">
+              <button type="button" id="btn-hw-sync-time" class="inline-flex h-8 w-full items-center justify-center gap-1.5 rounded-md border border-border bg-card px-2.5 text-xs font-medium text-foreground hover:bg-accent transition-colors">
+                <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                Sync Clock
+              </button>
+              <button type="button" id="btn-hw-reboot" class="inline-flex h-8 w-full items-center justify-center gap-1.5 rounded-md border border-border bg-card px-2.5 text-xs font-medium text-foreground hover:bg-destructive/10 hover:text-destructive hover:border-destructive/30 transition-colors">
+                <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+                Reboot Camera
+              </button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-modal-close inline-flex h-9 items-center justify-center rounded-md bg-secondary px-4 text-xs font-medium text-secondary-foreground shadow-sm transition-colors hover:bg-secondary/80">Cancel</button>
+          <button type="button" id="btn-save-hw-cam" class="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90">Save profile</button>
+        </div>
+      </div>
+    </div>
 
-        function toggleAuthModal() {
-            if (authToken) {
-                // Logout
-                fetch('/api/v1/auth/logout', {
-                    method: 'POST',
-                    headers: { 'Authorization': 'Bearer ' + authToken }
-                }).finally(() => {
-                    authToken = '';
-                    currentUser = 'Guest';
-                    localStorage.removeItem('nvr_token');
-                    localStorage.removeItem('nvr_user');
-                    updateAuthUI();
-                });
-                return;
-            }
-            const modal = document.getElementById('authModal');
-            modal.style.display = (modal.style.display === 'flex') ? 'none' : 'flex';
-        }
+    <!-- Add Camera Manually Modal -->
+    <div id="modal-add-cam" class="modal-overlay">
+      <div class="modal-box max-w-lg">
+        <div class="modal-header relative">
+          <h2 class="text-lg font-semibold leading-none tracking-tight">Add new IP camera channel</h2>
+          <p class="text-sm text-muted-foreground mt-1.5">Only free NVR channels are offered; the engine binds one RTSP session per camera.</p>
+          <button type="button" class="btn-modal-close absolute right-4 top-4 rounded-sm opacity-70 cursor-pointer transition-opacity hover:opacity-100 focus:outline-none">
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="modal-body space-y-3">
+          <div class="grid grid-cols-2 gap-3">
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">NVR channel</label>
+              <select id="add-cam-ch" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring"></select>
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Camera label</label>
+              <input type="text" id="add-cam-name" placeholder="Front Entrance" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+            </div>
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium leading-none">RTSP main stream URL (1080p)</label>
+            <input type="text" id="add-cam-main" placeholder="rtsp://192.168.1.100:554/stream1" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 font-mono text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium leading-none">RTSP sub stream URL (360p / 720p)</label>
+            <input type="text" id="add-cam-sub" placeholder="rtsp://192.168.1.100:554/stream2" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 font-mono text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+          </div>
+          <div class="grid grid-cols-3 gap-3">
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Username</label>
+              <input type="text" id="add-cam-user" value="admin" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Framerate</label>
+              <select id="add-cam-fps" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                <option value="15">15 FPS</option>
+                <option value="20">20 FPS</option>
+                <option value="25" selected>25 FPS</option>
+                <option value="30">30 FPS</option>
+              </select>
+            </div>
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Codec</label>
+              <select id="add-cam-codec" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                <option value="h264" selected>H.264</option>
+                <option value="h265">H.265</option>
+              </select>
+            </div>
+          </div>
+          <div class="space-y-1.5">
+            <label class="text-sm font-medium leading-none">Location label</label>
+            <input type="text" id="add-cam-loc" placeholder="e.g. Rear yard — Dock bays" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+          </div>
+          <p class="text-[11px] text-muted-foreground">
+            Camera passwords stay on the NVR device and are never stored in this console.
+          </p>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-modal-close inline-flex h-9 items-center justify-center rounded-md bg-secondary px-4 text-xs font-medium text-secondary-foreground shadow-sm transition-colors hover:bg-secondary/80">Cancel</button>
+          <button type="button" id="btn-submit-add-cam" class="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90">Add camera</button>
+        </div>
+      </div>
+    </div>
 
-        function performLogin() {
-            const u = document.getElementById('username').value;
-            const p = document.getElementById('password').value;
+    <!-- ONVIF Auto-Discovery Wizard Modal -->
+    <div id="modal-onvif-wizard" class="modal-overlay">
+      <div class="modal-box max-w-2xl">
+        <div class="modal-header relative">
+          <h2 class="text-lg font-semibold leading-none tracking-tight">ONVIF camera auto-discovery wizard</h2>
+          <p id="onvif-step-subtitle" class="text-sm text-muted-foreground mt-1.5">Step 1 of 2 — network scan &amp; probe</p>
+          <button type="button" class="btn-modal-close absolute right-4 top-4 rounded-sm opacity-70 cursor-pointer transition-opacity hover:opacity-100 focus:outline-none">
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        
+        <div class="modal-body space-y-3">
+          
+          <!-- Step 1 Content -->
+          <div id="onvif-step-1" class="space-y-3">
+            <div class="flex items-center justify-between">
+              <p class="text-xs text-muted-foreground">Broadcasting WS-Discovery probes across local interfaces...</p>
+              <button type="button" id="btn-onvif-rescan" class="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-secondary px-3 text-xs font-medium text-secondary-foreground hover:bg-accent">
+                <svg id="icon-onvif-spin" class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                <span id="label-onvif-scan">Re-scan network</span>
+              </button>
+            </div>
 
-            fetch('/api/v1/auth/login', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username: u, password: p })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.success && data.data.token) {
-                    authToken = data.data.token;
-                    currentUser = data.data.username + ' (' + data.data.role + ')';
-                    localStorage.setItem('nvr_token', authToken);
-                    localStorage.setItem('nvr_user', currentUser);
-                    updateAuthUI();
-                    document.getElementById('authModal').style.display = 'none';
-                    updateTelemetry();
-                } else {
-                    alert('Login failed: ' + (data.message || 'Invalid credentials'));
-                }
-            })
-            .catch(err => alert('Network error: ' + err));
-        }
+            <!-- Discovered Devices List -->
+            <div id="onvif-devices-list" class="thin-scroll max-h-56 overflow-auto rounded-lg border border-border">
+              <!-- Rendered dynamically -->
+            </div>
 
-        function updateTelemetry() {
-            if (!authToken) return;
-            fetch('/api/v1/system/status', {
-                headers: { 'Authorization': 'Bearer ' + authToken }
-            })
-            .then(res => res.json())
-            .then(res => {
-                if (res.success && res.data) {
-                    const d = res.data;
-                    document.getElementById('val-status').innerText = d.status || 'ONLINE';
-                    document.getElementById('val-cpu').innerText = (d.cpu_load_1m ? d.cpu_load_1m.toFixed(2) : '--');
-                    document.getElementById('val-ram').innerText = d.ram_free_bytes ? Math.round(d.ram_free_bytes / (1024*1024)) + ' MB' : '--';
-                    document.getElementById('val-storage').innerText = d.free_storage_bytes ? Math.round(d.free_storage_bytes / (1024*1024*1024)) + ' GB' : '--';
-                }
-            })
-            .catch(() => {});
-        }
+            <div class="grid grid-cols-2 gap-3 rounded-xl bg-secondary p-3">
+              <div class="space-y-1.5">
+                <label class="text-sm font-medium leading-none">Username</label>
+                <input type="text" id="onvif-user" value="admin" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-sm font-medium leading-none">Password</label>
+                <input type="password" id="onvif-pass" placeholder="Camera password" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+              </div>
+            </div>
+          </div>
 
-        function switchLayout(cols) {
-            const grid = document.getElementById('videoGrid');
-            if (cols === 1) {
-                grid.className = 'video-grid grid-1';
-                document.getElementById('tile-2').style.display = 'none';
-                document.getElementById('tile-3').style.display = 'none';
-                document.getElementById('tile-4').style.display = 'none';
-            } else {
-                grid.className = 'video-grid grid-4';
-                document.getElementById('tile-2').style.display = 'flex';
-                document.getElementById('tile-3').style.display = 'flex';
-                document.getElementById('tile-4').style.display = 'flex';
-            }
-        }
+          <!-- Step 2 Content -->
+          <div id="onvif-step-2" class="space-y-3 hidden">
+            <div class="flex items-center justify-between rounded-xl bg-secondary px-3 py-2.5">
+              <span id="onvif-probe-target" class="text-[13px] font-semibold text-foreground">
+                Device: 192.168.1.107 (Hikvision)
+              </span>
+              <span class="inline-flex items-center rounded-md border border-transparent bg-success px-2.5 py-0.5 text-[10px] font-semibold text-white">
+                Probe successful
+              </span>
+            </div>
 
-        function refreshAllSnapshots() {
-            for (let i = 1; i <= 4; i++) {
-                const snap = document.getElementById('snap-' + i);
-                snap.src = '/api/v1/cameras/' + i + '/snapshot?t=' + Date.now();
-                snap.style.display = 'block';
-            }
-        }
+            <div class="grid grid-cols-2 gap-3">
+              <div class="space-y-1.5">
+                <label class="text-sm font-medium leading-none">Assign to NVR channel</label>
+                <select id="onvif-assign-ch" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring"></select>
+              </div>
+              <div class="space-y-1.5">
+                <label class="text-sm font-medium leading-none">Friendly channel name</label>
+                <input type="text" id="onvif-name" class="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring" />
+              </div>
+            </div>
 
-        function queryRecordings() {
-            if (!authToken) {
-                alert('Please login to query recorded footage.');
-                return;
-            }
-            fetch('/api/v1/recordings?channel_id=1', {
-                headers: { 'Authorization': 'Bearer ' + authToken }
-            })
-            .then(res => res.json())
-            .then(res => {
-                alert('Found ' + (res.data ? res.data.length : 0) + ' recorded segments for Camera 1.');
-            })
-            .catch(err => alert('Query error: ' + err));
-        }
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Main stream profile (1080p recording)</label>
+              <select id="onvif-profile-main" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                <option value="">Auto-detected main profile</option>
+              </select>
+            </div>
 
-        // Initialize Live Stream Players (fMP4 Media Source Extensions)
-        function startLivePlayer(camId) {
-            const video = document.getElementById('video-' + camId);
-            const snap = document.getElementById('snap-' + camId);
+            <div class="space-y-1.5">
+              <label class="text-sm font-medium leading-none">Sub stream profile (live grid &amp; AI inference)</label>
+              <select id="onvif-profile-sub" class="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring">
+                <option value="">Auto-detected sub profile</option>
+              </select>
+            </div>
 
-            if (!window.MediaSource) {
-                console.warn('MediaSource not supported, using static snapshots');
-                snap.style.display = 'block';
-                return;
-            }
+            <p class="text-[11px] text-muted-foreground">
+              Credentials are held by the engine session and never displayed again.
+            </p>
+          </div>
 
-            video.muted = true;
-            video.autoplay = true;
-            video.playsInline = true;
+        </div>
 
-            const ms = new MediaSource();
-            video.src = URL.createObjectURL(ms);
+        <div class="modal-footer">
+          <button type="button" class="btn-modal-close inline-flex h-9 items-center justify-center rounded-md bg-secondary px-4 text-xs font-medium text-secondary-foreground shadow-sm transition-colors hover:bg-secondary/80">Cancel</button>
+          <button type="button" id="btn-onvif-back" class="hidden inline-flex h-9 items-center justify-center rounded-md bg-secondary px-4 text-xs font-medium text-secondary-foreground shadow-sm transition-colors hover:bg-secondary/80">Back to scan</button>
+          <button type="button" id="btn-onvif-action" class="inline-flex h-9 items-center justify-center rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground shadow transition-colors hover:bg-primary/90">Probe device &amp; next</button>
+        </div>
+      </div>
+    </div>
 
-            ms.addEventListener('sourceopen', () => {
-                let sb;
-                const candidateCodecs = [
-                    'video/mp4; codecs="avc1.64001f"', // High Profile Level 3.1 (Camera Substream)
-                    'video/mp4; codecs="avc1.640028"', // High Profile Level 4.0 (Camera Mainstream)
-                    'video/mp4; codecs="avc1.4d401f"', // Main Profile Level 3.1
-                    'video/mp4; codecs="avc1.42e01e"', // Baseline Profile Level 3.0
-                    'video/mp4; codecs="avc1.42001e"',
-                    'video/mp4'
-                ];
+    <!-- Delete Confirmation Modal -->
+    <div id="modal-delete-cam" class="modal-overlay">
+      <div class="modal-box max-w-md">
+        <div class="modal-header relative">
+          <h2 id="modal-delete-title" class="text-lg font-semibold leading-none tracking-tight">Delete camera channel?</h2>
+          <p class="text-sm text-muted-foreground mt-1.5">The ingress session stops and all recorded segments for this channel are removed. This cannot be undone.</p>
+          <button type="button" class="btn-modal-close absolute right-4 top-4 rounded-sm opacity-70 cursor-pointer transition-opacity hover:opacity-100 focus:outline-none">
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+          </button>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn-modal-close inline-flex h-9 items-center justify-center rounded-md bg-secondary px-4 text-xs font-medium text-secondary-foreground shadow-sm transition-colors hover:bg-secondary/80">Cancel</button>
+          <button type="button" id="btn-confirm-delete" class="inline-flex h-9 items-center justify-center rounded-md bg-destructive px-4 text-xs font-medium text-destructive-foreground shadow-sm transition-colors hover:bg-destructive/90">Delete channel</button>
+        </div>
+      </div>
+    </div>
 
-                let chosenMime = candidateCodecs.find(m => MediaSource.isTypeSupported(m)) || 'video/mp4; codecs="avc1.42e01e"';
-                try {
-                    sb = ms.addSourceBuffer(chosenMime);
-                } catch (e) {
-                    console.warn('SourceBuffer creation failed for Cam ' + camId, e);
-                    snap.style.display = 'block';
-                    return;
-                }
+    <!-- Toast Notification Container -->
+    <div id="toast-container"></div>
 
-                const queue = [];
-                function appendNext() {
-                    if (queue.length > 0 && !sb.updating) {
-                        try {
-                            sb.appendBuffer(queue.shift());
-                        } catch (e) {
-                            console.warn('appendBuffer error on Cam ' + camId, e);
-                        }
-                    }
-                }
+  </div>
 
-                sb.addEventListener('updateend', () => {
-                    appendNext();
-                    if (video.paused) {
-                        video.play().catch(e => console.warn('Autoplay error on Cam ' + camId, e));
-                    }
-                    // Keep playhead close to live edge (< 1.5s delay)
-                    if (video.buffered.length > 0) {
-                        const liveEdge = video.buffered.end(video.buffered.length - 1);
-                        if (liveEdge - video.currentTime > 1.5) {
-                            video.currentTime = liveEdge - 0.1;
-                        }
-                    }
-                });
-
-                fetch('/api/v1/stream?channel=' + camId + '&stream=sub')
-                    .then(res => {
-                        if (!res.ok) throw new Error('Stream status ' + res.status);
-                        snap.style.display = 'none';
-                        video.style.display = 'block';
-                        const reader = res.body.getReader();
-                        function readChunk() {
-                            reader.read().then(({done, value}) => {
-                                if (done) return;
-                                queue.push(value);
-                                appendNext();
-                                readChunk();
-                            }).catch(err => {
-                                console.warn('Stream read ended for Cam ' + camId, err);
-                                snap.style.display = 'block';
-                            });
-                        }
-                        readChunk();
-                    })
-                    .catch(err => {
-                        console.warn('Stream connection failed for Cam ' + camId, err);
-                        snap.style.display = 'block';
-                    });
-            });
-        }
-
-        // Init on page load
-        window.addEventListener('load', () => {
-            updateAuthUI();
-            updateTelemetry();
-            setInterval(updateTelemetry, 3000);
-
-            for (let i = 1; i <= 4; ++i) {
-                startLivePlayer(i);
-            }
-        });
-    </script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>

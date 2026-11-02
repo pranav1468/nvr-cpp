@@ -40,6 +40,34 @@ AlignedByteBuffer BufferAllocator::Allocate(size_t size) {
     return buf;
 }
 
+DecodedFramePtr BufferAllocator::AllocateFrame(uint32_t width, uint32_t height, PixelFormat format) {
+    size_t req_bytes = 0;
+    if (format == PixelFormat::NV12 || format == PixelFormat::YUV420P) {
+        req_bytes = CalculateSurfaceSize(width, height, 1, 1, 64);
+    } else if (format == PixelFormat::RGB24) {
+        req_bytes = static_cast<size_t>(width) * height * 3;
+    } else if (format == PixelFormat::RGBA32) {
+        req_bytes = static_cast<size_t>(width) * height * 4;
+    } else {
+        req_bytes = CalculateSurfaceSize(width, height, 1, 1, 64);
+    }
+
+    AlignedByteBuffer buf = Allocate(req_bytes);
+    auto* raw_frame = new DecodedFrame();
+    raw_frame->width = width;
+    raw_frame->height = height;
+    raw_frame->format = format;
+    raw_frame->stride = (width + 63) & ~63;
+    raw_frame->data = std::move(buf);
+
+    return DecodedFramePtr(raw_frame, [](DecodedFrame* f) {
+        if (f) {
+            BufferAllocator::Instance().Release(std::move(f->data));
+            delete f;
+        }
+    });
+}
+
 void BufferAllocator::Release(AlignedByteBuffer&& buffer) {
     if (buffer.empty()) {
         return;

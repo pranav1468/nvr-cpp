@@ -6,6 +6,7 @@
 #include <vector>
 #include <deque>
 #include <mutex>
+#include <condition_variable>
 #include <thread>
 #include <atomic>
 #include <fstream>
@@ -28,12 +29,13 @@ class DeepTracer {
 public:
     static DeepTracer& Instance();
 
-    // Start deep background monitoring and tracing
+    // Start deep background monitoring and tracing (with bounded log size rotation)
     bool Start(const std::string& log_file_path = "logs/nvr_deep_trace.log",
                const std::string& storage_path = "recordings",
-               uint32_t monitor_interval_ms = 1000);
+               uint32_t monitor_interval_ms = 1000,
+               size_t max_log_size_bytes = 10 * 1024 * 1024);
 
-    // Stop deep tracing and flush all logs
+    // Stop deep tracing and flush all logs immediately
     void Stop();
 
     // Configure storage path for disk monitoring
@@ -54,7 +56,10 @@ public:
     // Dump flight recorder history to stream
     void DumpFlightRecorder(std::ostream& os, size_t max_count = 500) const;
 
-    // Write crash dump with demangled backtrace
+    // Collect structured JSON diagnostics and recent breadcrumbs for REST/WebSocket APIs
+    std::string GetDiagnosticsJson(size_t max_count = 64) const;
+
+    // Write crash dump with async-signal-safe backtrace
     static void HandleCrashSignal(int signum);
 
 private:
@@ -66,13 +71,16 @@ private:
     void MonitorWorkerLoop();
     void InstallCrashHandlers();
     void UninstallCrashHandlers();
-    void AppendTraceLine(const std::string& line, bool flush_now = false);
+    void RotateLogIfNeededLocked();
     void CollectPipelineDiagnostics();
 
     mutable std::mutex mutex_;
+    mutable std::mutex sleep_mutex_;
+    std::condition_variable sleep_cv_;
     std::string log_file_path_;
     std::string storage_path_{"recordings"};
     uint32_t monitor_interval_ms_{1000};
+    size_t max_log_size_bytes_{10 * 1024 * 1024};
     std::ofstream log_file_;
 
     std::atomic<bool> running_{false};
@@ -104,9 +112,12 @@ private:
 
 } // namespace nvr
 
+#define NVR_CONCAT_IMPL(a, b) a##b
+#define NVR_CONCAT(a, b) NVR_CONCAT_IMPL(a, b)
+
 #ifdef NVR_ENABLE_DEEP_MONITORING
 #define TRACE_EVENT(tag, msg) nvr::DeepTracer::Instance().RecordEvent(tag, msg, __FILE__, __LINE__)
-#define TRACE_SCOPE(name) nvr::DeepScopeTracer _scope_tracer_(name, __FILE__, __LINE__)
+#define TRACE_SCOPE(name) nvr::DeepScopeTracer NVR_CONCAT(_scope_tracer_, __LINE__)(name, __FILE__, __LINE__)
 #else
 #define TRACE_EVENT(tag, msg) ((void)0)
 #define TRACE_SCOPE(name) ((void)0)

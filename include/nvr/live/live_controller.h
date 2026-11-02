@@ -1,7 +1,6 @@
 #pragma once
 
 #include "nvr/common/types.h"
-#include "nvr/live/live_queue.h"
 #include "nvr/live/display_backend.h"
 #include "nvr/media/video_decoder.h"
 #include "nvr/media/stream_broker.h"
@@ -66,6 +65,7 @@ public:
     // On-Demand Channel Feed Activation/Deactivation
     bool ActivateChannel(int channel_id, int tile_index = -1, StreamType stream_type = StreamType::SUB, uint32_t target_w = 0, uint32_t target_h = 0);
     bool DeactivateChannel(int channel_id);
+    bool RemoveChannel(int channel_id) { return DeactivateChannel(channel_id); }
     bool SetActiveChannels(const std::vector<int>& channel_ids, StreamType stream_type = StreamType::SUB);
 
     // Fullscreen single-camera view
@@ -85,6 +85,8 @@ public:
     // Query metrics for UI display and health telemetry
     std::vector<LiveTileMetrics> GetTileMetrics() const;
     LiveTileMetrics GetChannelMetrics(int channel_id) const;
+    DecodedFramePtr GetLatestFrame(int channel_id) const;
+    void RenderDecodedFrame(DecodedFramePtr frame);
 
 private:
     LiveController();
@@ -94,6 +96,8 @@ private:
 
     struct TileTarget {
         int tile_index{0};
+        uint32_t target_w{0};
+        uint32_t target_h{0};
     };
 
     struct ChannelPipeline {
@@ -102,14 +106,15 @@ private:
         VideoDecoderPtr decoder;
         mutable std::mutex targets_mutex;
         std::vector<TileTarget> targets;
-        std::unique_ptr<LiveQueue> queue;
+        std::atomic<uint64_t> enqueued_frames{0};
+        std::atomic<uint64_t> dropped_frames{0};
         StreamBroker::SubscriptionId sub_id{0};
         std::atomic<bool> active{false};
         std::atomic<bool> paused{false};
         std::mutex packet_mutex;
         std::condition_variable packet_cv;
         std::deque<MediaPacketPtr> packet_queue;
-        const size_t max_packet_depth{12};
+        size_t max_packet_depth{12};
         std::thread worker_thread;
         std::atomic<uint64_t> rendered_count{0};
         std::atomic<int64_t> last_frame_time_ms{0};
@@ -151,6 +156,9 @@ private:
     std::vector<TileConfig> custom_tiles_;
     std::unordered_map<int, std::shared_ptr<ChannelPipeline>> pipelines_;
     std::shared_ptr<ChannelPipeline> fullscreen_pipeline_;
+
+    mutable std::mutex latest_frames_mutex_;
+    std::unordered_map<int, DecodedFramePtr> latest_frames_;
 
     std::atomic<bool> running_{false};
 };

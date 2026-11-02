@@ -4,8 +4,8 @@
 
 namespace nvr {
 
-RtpDepacketizer::RtpDepacketizer(int channel_id, StreamType stream_type, CodecType codec, DepacketizedCallback callback, uint32_t clock_rate)
-    : channel_id_(channel_id), stream_type_(stream_type), codec_(codec), callback_(std::move(callback)), clock_rate_(clock_rate) {
+RtpDepacketizer::RtpDepacketizer(int channel_id, StreamType stream_type, CodecType codec, DepacketizedCallback callback, uint32_t clock_rate, uint8_t channels)
+    : channel_id_(channel_id), stream_type_(stream_type), codec_(codec), callback_(std::move(callback)), clock_rate_(clock_rate), channels_(channels > 0 ? channels : 1) {
     fu_buffer_.reserve(256 * 1024);
 }
 
@@ -21,6 +21,16 @@ void RtpDepacketizer::Reset() {
     reorder_buffer_.clear();
     has_base_pts_ = false;
     unwrapped_rtp_timestamp_ = 0;
+}
+
+void RtpDepacketizer::SetCodec(CodecType codec) {
+    if (codec_ != codec) {
+        FlushAu();
+        fu_buffer_.clear();
+        fu_in_progress_ = false;
+        fu_is_keyframe_ = false;
+        codec_ = codec;
+    }
 }
 
 void RtpDepacketizer::Flush() {
@@ -125,6 +135,25 @@ void RtpDepacketizer::ProcessRtpPacket(const uint8_t* payload, size_t size, uint
 }
 
 void RtpDepacketizer::ProcessVideoPacketInternal(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit) {
+    if (codec_ == CodecType::UNKNOWN && size >= 2) {
+        uint8_t byte0 = payload[0];
+        if ((byte0 & 0x80) == 0) {
+            uint8_t byte1 = payload[1];
+            uint8_t nal_type_h265 = (byte0 >> 1) & 0x3F;
+            bool valid_h265_hdr = IsValidH265NalHeader(byte0, byte1);
+
+            uint8_t nal_type_h264 = byte0 & 0x1F;
+            uint8_t nal_ref_idc = (byte0 >> 5) & 0x03;
+
+            if (valid_h265_hdr && (nal_type_h265 == 49 || nal_type_h265 == 48 || (nal_type_h265 >= 32 && nal_type_h265 <= 34))) {
+                codec_ = CodecType::H265;
+            } else if ((nal_type_h264 == 28 && size >= 2 && (payload[1] & 0x20) == 0) ||
+                       nal_type_h264 == 24 ||
+                       (nal_type_h264 == 7 && nal_ref_idc != 0)) {
+                codec_ = CodecType::H264;
+            }
+        }
+    }
     if (codec_ == CodecType::H264) {
         ProcessH264(payload, size, rtp_timestamp, seq_num, marker_bit);
     } else if (codec_ == CodecType::H265) {
@@ -339,16 +368,40 @@ void RtpDepacketizer::ProcessAac(const uint8_t* payload, size_t size, uint32_t r
         return;
     }
 
-    uint16_t au_header = (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
-    size_t au_size = au_header >> 3;
-    size_t payload_offset = 2 + au_headers_len_bytes;
+    size_t num_aus = au_headers_len_bits / 16;
+    if (num_aus <= 1) {
+        uint16_t au_header = (static_cast<uint16_t>(payload[2]) << 8) | payload[3];
+        size_t au_size = au_header >> 3;
+        size_t payload_offset = 2 + au_headers_len_bytes;
 
-    if (payload_offset + au_size <= size && au_size > 0) {
-        std::vector<uint8_t> frame(payload + payload_offset, payload + payload_offset + au_size);
-        EmitPacket(frame, true, rtp_timestamp, seq_num);
-    } else {
-        std::vector<uint8_t> frame(payload + payload_offset, payload + size);
-        EmitPacket(frame, true, rtp_timestamp, seq_num);
+        if (payload_offset + au_size <= size && au_size > 0) {
+            std::vector<uint8_t> frame(payload + payload_offset, payload + payload_offset + au_size);
+            EmitPacket(frame, true, rtp_timestamp, seq_num);
+        } else {
+            std::vector<uint8_t> frame(payload + payload_offset, payload + size);
+            EmitPacket(frame, true, rtp_timestamp, seq_num);
+        }
+        return;
+    }
+
+    // Multi-AU loop (RFC 3640)
+    size_t header_offset = 2;
+    size_t payload_offset = 2 + au_headers_len_bytes;
+    uint32_t current_ts = rtp_timestamp;
+
+    for (size_t i = 0; i < num_aus && header_offset + 2 <= 2 + au_headers_len_bytes; ++i) {
+        uint16_t au_header = (static_cast<uint16_t>(payload[header_offset]) << 8) | payload[header_offset + 1];
+        size_t au_size = au_header >> 3;
+        header_offset += 2;
+
+        if (payload_offset + au_size <= size && au_size > 0) {
+            std::vector<uint8_t> frame(payload + payload_offset, payload + payload_offset + au_size);
+            EmitPacket(frame, true, current_ts, seq_num);
+            payload_offset += au_size;
+            current_ts += 1024; // Standard AAC frame step in clock ticks
+        } else {
+            break;
+        }
     }
 }
 
@@ -372,6 +425,7 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
     packet->sequence_number = seq_num;
     packet->wall_time_ms = time_utils::WallTimeMs();
     packet->sample_rate = (packet->IsAudio() && clock_rate_ > 0) ? clock_rate_ : 0;
+    packet->channels = packet->IsAudio() ? channels_ : 0;
 
     // Convert RTP timestamp to microseconds with seamless 32-bit wrap unrolling
     if (!has_base_pts_) {

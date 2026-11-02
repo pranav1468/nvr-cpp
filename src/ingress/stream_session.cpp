@@ -6,6 +6,7 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -71,12 +72,51 @@ std::vector<uint8_t> Base64Decode(const std::string& in) {
     return out;
 }
 
+std::string UrlDecode(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '%' && i + 2 < in.size()) {
+            auto hex_val = [](unsigned char c) -> int {
+                int lower = std::tolower(c);
+                return (lower >= '0' && lower <= '9') ? (lower - '0') :
+                       (lower >= 'a' && lower <= 'f') ? (lower - 'a' + 10) : -1;
+            };
+            int v1 = hex_val(static_cast<unsigned char>(in[i + 1]));
+            int v2 = hex_val(static_cast<unsigned char>(in[i + 2]));
+            if (v1 >= 0 && v2 >= 0) {
+                out.push_back(static_cast<char>((v1 << 4) | v2));
+                i += 2;
+                continue;
+            }
+        }
+        out.push_back(in[i]);
+    }
+    return out;
+}
+
+std::string StripRtspCredentials(const std::string& url) {
+    if (url.size() < 7) return url;
+    std::string scheme = url.substr(0, 7);
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (scheme != "rtsp://") return url;
+    std::string rem = url.substr(7);
+    size_t first_slash = rem.find('/');
+    size_t search_end = (first_slash != std::string::npos) ? first_slash : rem.size();
+    size_t at_pos = rem.rfind('@', search_end);
+    if (at_pos != std::string::npos && at_pos < search_end) {
+        rem = rem.substr(at_pos + 1);
+    }
+    return "rtsp://" + rem;
+}
+
 } // namespace
 
-StreamSession::StreamSession(int channel_id, StreamType stream_type, const std::string& rtsp_url)
-    : channel_id_(channel_id), stream_type_(stream_type), rtsp_url_(rtsp_url) {
+StreamSession::StreamSession(int channel_id, StreamType stream_type, const std::string& rtsp_url, uint32_t reconnect_delay_sec)
+    : channel_id_(channel_id), stream_type_(stream_type), rtsp_url_(rtsp_url), reconnect_delay_sec_(reconnect_delay_sec) {
     depacketizer_ = std::make_unique<RtpDepacketizer>(
-        channel_id_, stream_type_, CodecType::H264,
+        channel_id_, stream_type_, CodecType::UNKNOWN,
         [](const MediaPacketPtr& pkt) {
             StreamBroker::Instance().Publish(pkt);
         }
@@ -96,17 +136,16 @@ void StreamSession::Start() {
 }
 
 void StreamSession::Stop() {
-    running_.store(false);
+    if (!running_.exchange(false)) {
+        return;
+    }
     stop_cv_.notify_all();
 
-    // Send TEARDOWN to the server to free camera resources before shutting down socket
-    SendRtspTeardown();
-
-    // Interrupt socket I/O without closing the descriptor.
+    // Interrupt blocking socket reads so WorkerLoop wakes immediately and sends TEARDOWN on worker_thread_
     {
         std::lock_guard<std::mutex> lock(socket_mutex_);
         if (sock_fd_ >= 0) {
-            shutdown(sock_fd_, SHUT_RDWR);
+            shutdown(sock_fd_, SHUT_RD);
         }
     }
 
@@ -136,26 +175,32 @@ bool StreamSession::ParseRtspUrl(const std::string& url, std::string& host, int&
                                  std::string& auth_header, std::string& username, std::string& password) {
     // Format: rtsp://[user:pass@]host[:port][/path]
     // host can be IPv4, hostname, or bracketed IPv6 [2001:db8::1]
-    std::string prefix = "rtsp://";
-    if (url.rfind(prefix, 0) != 0) {
+    if (url.size() < 7) {
+        return false;
+    }
+    std::string scheme = url.substr(0, 7);
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), [](unsigned char c) { return std::tolower(c); });
+    if (scheme != "rtsp://") {
         return false;
     }
 
-    std::string rem = url.substr(prefix.length());
+    std::string rem = url.substr(7);
     size_t first_slash = rem.find('/');
     size_t search_end = (first_slash != std::string::npos) ? first_slash : rem.size();
     size_t at_pos = rem.rfind('@', search_end);
     if (at_pos != std::string::npos && at_pos < search_end) {
         std::string user_pass = rem.substr(0, at_pos);
-        auth_header = "Authorization: Basic " + Base64Encode(user_pass) + "\r\n";
         size_t colon_user = user_pass.find(':');
         if (colon_user != std::string::npos) {
-            username = user_pass.substr(0, colon_user);
-            password = user_pass.substr(colon_user + 1);
+            username = UrlDecode(user_pass.substr(0, colon_user));
+            password = UrlDecode(user_pass.substr(colon_user + 1));
         } else {
-            username = user_pass;
+            username = UrlDecode(user_pass);
             password.clear();
         }
+        std::string decoded_user_pass =
+            (colon_user != std::string::npos) ? (username + ":" + password) : username;
+        auth_header = "Authorization: Basic " + Base64Encode(decoded_user_pass) + "\r\n";
         rem = rem.substr(at_pos + 1);
     } else {
         auth_header.clear();
@@ -250,14 +295,19 @@ void StreamSession::ParseDigestChallenge(const std::string& response, std::strin
 }
 
 void StreamSession::ParseDigestChallenge(const std::string& response) {
+    std::string prev_nonce = digest_nonce_;
     ParseDigestChallenge(response, digest_realm_, digest_nonce_, digest_opaque_, digest_qop_);
+    if (digest_nonce_ != prev_nonce) {
+        digest_nc_ = 0;
+    }
 }
 
 bool StreamSession::BuildDigestAuthHeader(const std::string& username, const std::string& password,
                                           const std::string& realm, const std::string& nonce,
                                           const std::string& method, const std::string& uri,
                                           const std::string& qop, const std::string& opaque,
-                                          std::string& out_header) {
+                                          std::string& out_header, uint32_t nc,
+                                          const std::string& cnonce) {
     if (username.empty() || realm.empty() || nonce.empty()) {
         return false;
     }
@@ -267,6 +317,9 @@ bool StreamSession::BuildDigestAuthHeader(const std::string& username, const std
     // HA2 = MD5(method:uri)
     std::string ha2 = crypto::ComputeMD5(method + ":" + uri);
 
+    char nc_str[16];
+    std::snprintf(nc_str, sizeof(nc_str), "%08x", nc);
+
     std::string response;
     std::ostringstream oss;
     oss << "Authorization: Digest username=\"" << username << "\", "
@@ -275,11 +328,9 @@ bool StreamSession::BuildDigestAuthHeader(const std::string& username, const std
         << "uri=\"" << uri << "\", ";
 
     if (qop.find("auth") != std::string::npos) {
-        std::string nc = "00000001";
-        std::string cnonce = "0a4f113b";
         // response = MD5(HA1:nonce:nc:cnonce:qop:HA2)
-        response = crypto::ComputeMD5(ha1 + ":" + nonce + ":" + nc + ":" + cnonce + ":auth:" + ha2);
-        oss << "qop=auth, nc=" << nc << ", cnonce=\"" << cnonce << "\", "
+        response = crypto::ComputeMD5(ha1 + ":" + nonce + ":" + nc_str + ":" + cnonce + ":auth:" + ha2);
+        oss << "qop=auth, nc=" << nc_str << ", cnonce=\"" << cnonce << "\", "
             << "response=\"" << response << "\"";
     } else {
         // response = MD5(HA1:nonce:HA2)
@@ -297,8 +348,13 @@ bool StreamSession::BuildDigestAuthHeader(const std::string& username, const std
 }
 
 bool StreamSession::BuildDigestAuthHeader(const std::string& method, const std::string& uri, std::string& out_header) {
+    digest_nc_++;
+    uint64_t now_us = time_utils::MonotonicUs();
+    char cnonce_buf[32];
+    std::snprintf(cnonce_buf, sizeof(cnonce_buf), "%08x%08x", static_cast<uint32_t>(now_us), digest_nc_);
     return BuildDigestAuthHeader(username_, password_, digest_realm_, digest_nonce_,
-                                 method, uri, digest_qop_, digest_opaque_, out_header);
+                                 method, uri, digest_qop_, digest_opaque_, out_header,
+                                 digest_nc_, cnonce_buf);
 }
 
 int StreamSession::GetSocketFd() const {
@@ -315,6 +371,8 @@ bool StreamSession::ConnectSocket() {
         LOG_ERROR << "[Channel " << channel_id_ << "] Malformed RTSP URL: " << rtsp_url_;
         return false;
     }
+    rtsp_path_ = path;
+    clean_rtsp_url_ = "rtsp://" + host + ":" + std::to_string(port) + rtsp_path_;
 
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
@@ -377,6 +435,12 @@ bool StreamSession::ConnectSocket() {
     setsockopt(local_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(local_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+    // Machine-grade network buffer tuning: 1MB receive buffer prevents TCP window collapse
+    int rcvbuf = 1024 * 1024;
+    setsockopt(local_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    int nodelay = 1;
+    setsockopt(local_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+
     {
         std::lock_guard<std::mutex> lock(socket_mutex_);
         if (!running_) {
@@ -393,8 +457,6 @@ bool StreamSession::ConnectSocket() {
 }
 
 void StreamSession::DisconnectSocket() {
-    SendRtspTeardown();
-
     int fd = -1;
     {
         std::lock_guard<std::mutex> lock(socket_mutex_);
@@ -492,13 +554,14 @@ bool StreamSession::ReadRtspResponse(std::string& response, int timeout_ms) {
 }
 
 bool StreamSession::SendRtspOptions() {
+    const std::string req_uri = !clean_rtsp_url_.empty() ? clean_rtsp_url_ : StripRtspCredentials(rtsp_url_);
     std::string opt_auth = auth_header_;
     if (!digest_nonce_.empty() && !username_.empty()) {
-        BuildDigestAuthHeader("OPTIONS", rtsp_url_, opt_auth);
+        BuildDigestAuthHeader("OPTIONS", req_uri, opt_auth);
     }
 
     std::ostringstream oss;
-    oss << "OPTIONS " << rtsp_url_ << " RTSP/1.0\r\n"
+    oss << "OPTIONS " << req_uri << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
         << "User-Agent: NVR_Core/1.0\r\n"
         << opt_auth
@@ -515,9 +578,9 @@ bool StreamSession::SendRtspOptions() {
         LOG_INFO << "[Channel " << channel_id_ << "] RTSP OPTIONS received 401 Unauthorized, testing Digest auth challenge";
         ParseDigestChallenge(resp);
         if (!digest_nonce_.empty() && !username_.empty()) {
-            BuildDigestAuthHeader("OPTIONS", rtsp_url_, opt_auth);
+            BuildDigestAuthHeader("OPTIONS", req_uri, opt_auth);
             std::ostringstream retry_oss;
-            retry_oss << "OPTIONS " << rtsp_url_ << " RTSP/1.0\r\n"
+            retry_oss << "OPTIONS " << req_uri << " RTSP/1.0\r\n"
                       << "CSeq: " << cseq_++ << "\r\n"
                       << "User-Agent: NVR_Core/1.0\r\n"
                       << opt_auth
@@ -539,7 +602,7 @@ bool StreamSession::SendRtspOptions() {
 
 void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control, CodecType& codec, int& payload_type) {
     track_control.clear();
-    codec = CodecType::H264;
+    codec = CodecType::UNKNOWN;
     payload_type = 96;
     has_audio_track_ = false;
     audio_track_control_.clear();
@@ -592,13 +655,18 @@ void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control,
             if (line.find("H265") != std::string::npos || line.find("h265") != std::string::npos ||
                 line.find("HEVC") != std::string::npos || line.find("hevc") != std::string::npos) {
                 codec = CodecType::H265;
+            } else if (line.find("H264") != std::string::npos || line.find("h264") != std::string::npos ||
+                       line.find("AVC") != std::string::npos || line.find("avc") != std::string::npos) {
+                codec = CodecType::H264;
             }
             if (line.rfind("a=control:", 0) == 0) {
                 track_control = line.substr(10);
             }
-            size_t sps_pos = line.find("sprop-parameter-sets=");
-            if (sps_pos != std::string::npos) {
-                std::string params = line.substr(sps_pos + 21);
+
+            auto publish_sprop_param = [&](const std::string& prefix, CodecType ctype) {
+                size_t pos = line.find(prefix);
+                if (pos == std::string::npos) return;
+                std::string params = line.substr(pos + prefix.size());
                 size_t semi = params.find(';');
                 if (semi != std::string::npos) params = params.substr(0, semi);
                 std::stringstream ss(params);
@@ -610,8 +678,8 @@ void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control,
                             auto pkt = std::make_shared<MediaPacket>();
                             pkt->channel_id = channel_id_;
                             pkt->stream_type = stream_type_;
-                            pkt->codec = CodecType::H264;
-                            pkt->is_keyframe = true;
+                            pkt->codec = ctype;
+                            pkt->is_keyframe = false;
                             pkt->wall_time_ms = time_utils::WallTimeMs();
                             pkt->data = {0x00, 0x00, 0x00, 0x01};
                             pkt->data.insert(pkt->data.end(), raw.begin(), raw.end());
@@ -619,6 +687,26 @@ void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control,
                         }
                     }
                 }
+            };
+
+            // H.264 parameter sets (RFC 6184)
+            if (line.find("sprop-parameter-sets=") != std::string::npos) {
+                if (codec == CodecType::UNKNOWN) {
+                    codec = CodecType::H264;
+                }
+                if (codec == CodecType::H264) {
+                    publish_sprop_param("sprop-parameter-sets=", CodecType::H264);
+                }
+            }
+
+            // H.265 / HEVC parameter sets (RFC 7798)
+            if (line.find("sprop-vps=") != std::string::npos ||
+                line.find("sprop-sps=") != std::string::npos ||
+                line.find("sprop-pps=") != std::string::npos) {
+                codec = CodecType::H265;
+                publish_sprop_param("sprop-vps=", CodecType::H265);
+                publish_sprop_param("sprop-sps=", CodecType::H265);
+                publish_sprop_param("sprop-pps=", CodecType::H265);
             }
         } else if (in_audio) {
             if (line.rfind("a=control:", 0) == 0) {
@@ -656,12 +744,13 @@ void StreamSession::ParseSdp(const std::string& sdp, std::string& track_control,
 }
 
 bool StreamSession::SendRtspDescribe() {
+    const std::string req_uri = !clean_rtsp_url_.empty() ? clean_rtsp_url_ : StripRtspCredentials(rtsp_url_);
     if (!digest_nonce_.empty() && !username_.empty()) {
-        BuildDigestAuthHeader("DESCRIBE", rtsp_url_, auth_header_);
+        BuildDigestAuthHeader("DESCRIBE", req_uri, auth_header_);
     }
 
     std::ostringstream oss;
-    oss << "DESCRIBE " << rtsp_url_ << " RTSP/1.0\r\n"
+    oss << "DESCRIBE " << req_uri << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
         << "Accept: application/sdp\r\n"
         << "User-Agent: NVR_Core/1.0\r\n"
@@ -679,9 +768,9 @@ bool StreamSession::SendRtspDescribe() {
         LOG_INFO << "[Channel " << channel_id_ << "] RTSP DESCRIBE received 401 Unauthorized, testing Digest auth challenge";
         ParseDigestChallenge(resp);
         if (!digest_nonce_.empty() && !username_.empty()) {
-            BuildDigestAuthHeader("DESCRIBE", rtsp_url_, auth_header_);
+            BuildDigestAuthHeader("DESCRIBE", req_uri, auth_header_);
             std::ostringstream retry_oss;
-            retry_oss << "DESCRIBE " << rtsp_url_ << " RTSP/1.0\r\n"
+            retry_oss << "DESCRIBE " << req_uri << " RTSP/1.0\r\n"
                       << "CSeq: " << cseq_++ << "\r\n"
                       << "Accept: application/sdp\r\n"
                       << "User-Agent: NVR_Core/1.0\r\n"
@@ -699,8 +788,18 @@ bool StreamSession::SendRtspDescribe() {
         return false;
     }
 
+    size_t cb_pos = resp.find("Content-Base: ");
+    if (cb_pos == std::string::npos) cb_pos = resp.find("content-base: ");
+    if (cb_pos != std::string::npos) {
+        size_t start = cb_pos + 14;
+        size_t end = resp.find_first_of("\r\n", start);
+        content_base_url_ = StripRtspCredentials(resp.substr(start, end - start));
+    } else {
+        content_base_url_ = req_uri;
+    }
+
     std::string track_control;
-    CodecType codec = CodecType::H264;
+    CodecType codec = CodecType::UNKNOWN;
     int payload_type = 96;
     ParseSdp(resp, track_control, codec, payload_type);
 
@@ -717,7 +816,8 @@ bool StreamSession::SendRtspDescribe() {
             [](const MediaPacketPtr& pkt) {
                 StreamBroker::Instance().Publish(pkt);
             },
-            audio_clock_rate_
+            audio_clock_rate_,
+            audio_channels_
         );
         LOG_INFO << "[Channel " << channel_id_ << "] Detected audio track: codec=" 
                  << CodecToString(audio_codec_) << " (" << audio_clock_rate_ << " Hz, "
@@ -739,9 +839,11 @@ bool StreamSession::SendRtspDescribe() {
 }
 
 bool StreamSession::SendRtspSetup(const std::string& track_control, int rtp_channel, int rtcp_channel) {
-    std::string setup_url = rtsp_url_;
-    if (track_control.rfind("rtsp://", 0) == 0) {
-        setup_url = track_control;
+    const std::string fallback_uri = !clean_rtsp_url_.empty() ? clean_rtsp_url_ : StripRtspCredentials(rtsp_url_);
+    std::string base = !content_base_url_.empty() ? StripRtspCredentials(content_base_url_) : fallback_uri;
+    std::string setup_url = base;
+    if (track_control.rfind("rtsp://", 0) == 0 || track_control.rfind("RTSP://", 0) == 0) {
+        setup_url = StripRtspCredentials(track_control);
     } else {
         if (!setup_url.empty() && setup_url.back() != '/' && !track_control.empty() && track_control.front() != '/') {
             setup_url += "/";
@@ -769,9 +871,49 @@ bool StreamSession::SendRtspSetup(const std::string& track_control, int rtp_chan
     if (fd < 0 || send(fd, req.c_str(), req.size(), 0) <= 0) return false;
 
     std::string resp;
-    if (!ReadRtspResponse(resp) || resp.find("200 OK") == std::string::npos) {
+    if (!ReadRtspResponse(resp)) return false;
+
+    if (resp.find("401") != std::string::npos) {
+        ParseDigestChallenge(resp);
+        if (!digest_nonce_.empty() && !username_.empty()) {
+            BuildDigestAuthHeader("SETUP", setup_url, auth_header_);
+            std::ostringstream retry_oss;
+            retry_oss << "SETUP " << setup_url << " RTSP/1.0\r\n"
+                      << "CSeq: " << cseq_++ << "\r\n"
+                      << "Transport: RTP/AVP/TCP;unicast;interleaved=" << rtp_channel << "-" << rtcp_channel << "\r\n";
+            if (!session_id_.empty()) {
+                retry_oss << "Session: " << session_id_ << "\r\n";
+            }
+            retry_oss << "User-Agent: NVR_Core/1.0\r\n"
+                      << auth_header_
+                      << "\r\n";
+            std::string retry_req = retry_oss.str();
+            fd = GetSocketFd();
+            if (fd >= 0 && send(fd, retry_req.c_str(), retry_req.size(), 0) > 0) {
+                ReadRtspResponse(resp);
+            }
+        }
+    }
+
+    if (resp.find("200 OK") == std::string::npos) {
         LOG_WARN << "[Channel " << channel_id_ << "] RTSP SETUP failed: " << resp;
         return false;
+    }
+
+    size_t trans_pos = resp.find("Transport: ");
+    if (trans_pos == std::string::npos) trans_pos = resp.find("transport: ");
+    if (trans_pos != std::string::npos) {
+        size_t il_pos = resp.find("interleaved=", trans_pos);
+        if (il_pos != std::string::npos) {
+            int parsed_rtp = 0, parsed_rtcp = 1;
+            if (std::sscanf(resp.c_str() + il_pos, "interleaved=%d-%d", &parsed_rtp, &parsed_rtcp) >= 1) {
+                if (rtp_channel == 0) {
+                    video_rtp_channel_ = parsed_rtp;
+                } else {
+                    audio_rtp_channel_ = parsed_rtp;
+                }
+            }
+        }
     }
 
     if (session_id_.empty()) {
@@ -789,12 +931,14 @@ bool StreamSession::SendRtspSetup(const std::string& track_control, int rtp_chan
 }
 
 bool StreamSession::SendRtspPlay() {
+    const std::string req_uri = !content_base_url_.empty() ? StripRtspCredentials(content_base_url_)
+                              : (!clean_rtsp_url_.empty() ? clean_rtsp_url_ : StripRtspCredentials(rtsp_url_));
     if (!digest_nonce_.empty() && !username_.empty()) {
-        BuildDigestAuthHeader("PLAY", rtsp_url_, auth_header_);
+        BuildDigestAuthHeader("PLAY", req_uri, auth_header_);
     }
 
     std::ostringstream oss;
-    oss << "PLAY " << rtsp_url_ << " RTSP/1.0\r\n"
+    oss << "PLAY " << req_uri << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
         << "Session: " << session_id_ << "\r\n"
         << "Range: npt=0.000-\r\n"
@@ -807,7 +951,29 @@ bool StreamSession::SendRtspPlay() {
     if (fd < 0 || send(fd, req.c_str(), req.size(), 0) <= 0) return false;
 
     std::string resp;
-    if (!ReadRtspResponse(resp) || resp.find("200 OK") == std::string::npos) {
+    if (!ReadRtspResponse(resp)) return false;
+
+    if (resp.find("401") != std::string::npos) {
+        ParseDigestChallenge(resp);
+        if (!digest_nonce_.empty() && !username_.empty()) {
+            BuildDigestAuthHeader("PLAY", req_uri, auth_header_);
+            std::ostringstream retry_oss;
+            retry_oss << "PLAY " << req_uri << " RTSP/1.0\r\n"
+                      << "CSeq: " << cseq_++ << "\r\n"
+                      << "Session: " << session_id_ << "\r\n"
+                      << "Range: npt=0.000-\r\n"
+                      << "User-Agent: NVR_Core/1.0\r\n"
+                      << auth_header_
+                      << "\r\n";
+            std::string retry_req = retry_oss.str();
+            fd = GetSocketFd();
+            if (fd >= 0 && send(fd, retry_req.c_str(), retry_req.size(), 0) > 0) {
+                ReadRtspResponse(resp);
+            }
+        }
+    }
+
+    if (resp.find("200 OK") == std::string::npos) {
         LOG_WARN << "[Channel " << channel_id_ << "] RTSP PLAY failed: " << resp;
         return false;
     }
@@ -821,13 +987,15 @@ bool StreamSession::SendRtspKeepAlive() {
     int fd = GetSocketFd();
     if (fd < 0 || session_id_.empty()) return false;
 
+    const std::string req_uri = !content_base_url_.empty() ? StripRtspCredentials(content_base_url_)
+                              : (!clean_rtsp_url_.empty() ? clean_rtsp_url_ : StripRtspCredentials(rtsp_url_));
     std::string keepalive_auth = auth_header_;
     if (!digest_nonce_.empty() && !username_.empty()) {
-        BuildDigestAuthHeader("GET_PARAMETER", rtsp_url_, keepalive_auth);
+        BuildDigestAuthHeader("GET_PARAMETER", req_uri, keepalive_auth);
     }
 
     std::ostringstream oss;
-    oss << "GET_PARAMETER " << rtsp_url_ << " RTSP/1.0\r\n"
+    oss << "GET_PARAMETER " << req_uri << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
         << "Session: " << session_id_ << "\r\n"
         << "User-Agent: NVR_Core/1.0\r\n"
@@ -842,13 +1010,15 @@ bool StreamSession::SendRtspTeardown() {
     int fd = GetSocketFd();
     if (fd < 0 || session_id_.empty()) return false;
 
+    const std::string req_uri = !content_base_url_.empty() ? StripRtspCredentials(content_base_url_)
+                              : (!clean_rtsp_url_.empty() ? clean_rtsp_url_ : StripRtspCredentials(rtsp_url_));
     std::string teardown_auth = auth_header_;
     if (!digest_nonce_.empty() && !username_.empty()) {
-        BuildDigestAuthHeader("TEARDOWN", rtsp_url_, teardown_auth);
+        BuildDigestAuthHeader("TEARDOWN", req_uri, teardown_auth);
     }
 
     std::ostringstream oss;
-    oss << "TEARDOWN " << rtsp_url_ << " RTSP/1.0\r\n"
+    oss << "TEARDOWN " << req_uri << " RTSP/1.0\r\n"
         << "CSeq: " << cseq_++ << "\r\n"
         << "Session: " << session_id_ << "\r\n"
         << "User-Agent: NVR_Core/1.0\r\n"
@@ -857,7 +1027,7 @@ bool StreamSession::SendRtspTeardown() {
 
     std::string req = oss.str();
     session_id_.clear();
-    return (send(fd, req.c_str(), req.size(), MSG_NOSIGNAL) > 0);
+    return (send(fd, req.c_str(), req.size(), MSG_DONTWAIT | MSG_NOSIGNAL) > 0);
 }
 
 void StreamSession::WorkerLoop() {
@@ -870,9 +1040,10 @@ void StreamSession::WorkerLoop() {
     auto last_keepalive = time_utils::MonotonicSec();
 
     auto compute_backoff_delay_ms = [&](int attempt) -> int {
-        // RFC 8961 / AWS Full Jitter Exponential Backoff
-        // Base delay 1000ms, max cap 30000ms
-        int backoff_ms = std::min(30000, 1000 * (1 << std::min(attempt, 5)));
+        // RFC 8961 / AWS Full Jitter Exponential Backoff with configurable base delay
+        int base_delay_ms = static_cast<int>(reconnect_delay_sec_) * 1000;
+        if (base_delay_ms <= 0) base_delay_ms = 1000;
+        int backoff_ms = std::min(30000, base_delay_ms * (1 << std::min(attempt, 4)));
         int min_delay = std::max(500, static_cast<int>(backoff_ms * 0.5));
         int max_delay = std::min(30000, static_cast<int>(backoff_ms * 1.25));
         std::uniform_int_distribution<int> dist(min_delay, max_delay);
@@ -912,16 +1083,27 @@ void StreamSession::WorkerLoop() {
 
         // Streaming reception loop for interleaved framing: '$' <channel> <length_hi> <length_lo> <data...>
         std::vector<uint8_t> rtp_buf(65536);
+        int consecutive_timeouts = 0;
         while (running_ && state_ == SessionState::STREAMING) {
             uint8_t magic = 0;
             if (!ReadExact(&magic, 1, 3000)) {
+                if (!running_) break;
+                consecutive_timeouts++;
+                if (consecutive_timeouts >= 3) {
+                    LOG_WARN << "[Channel " << channel_id_ << "] No RTP packets received for "
+                             << (consecutive_timeouts * 3) << "s; resetting RTSP connection";
+                    break;
+                }
                 // Check if time for keepalive
                 if (time_utils::MonotonicSec() - last_keepalive >= 25) {
-                    SendRtspKeepAlive();
+                    if (!SendRtspKeepAlive()) {
+                        break;
+                    }
                     last_keepalive = time_utils::MonotonicSec();
                 }
                 continue;
             }
+            consecutive_timeouts = 0;
 
             if (magic != 0x24) { // '$' magic byte
                 continue;
@@ -939,7 +1121,7 @@ void StreamSession::WorkerLoop() {
 
             if (!ReadExact(rtp_buf.data(), length, 2000)) break;
 
-            if ((channel == 0 || channel == 2) && length >= 12) { // Video (ch 0) or Audio (ch 2) RTP
+            if ((channel == video_rtp_channel_ || channel == audio_rtp_channel_) && length >= 12) {
                 // Parse RTP header
                 uint8_t b0 = rtp_buf[0];
                 uint8_t b1 = rtp_buf[1];
@@ -961,7 +1143,7 @@ void StreamSession::WorkerLoop() {
                 }
 
                 if (payload_offset < length) {
-                    if (channel == 0 && depacketizer_) {
+                    if (channel == video_rtp_channel_ && depacketizer_) {
                         depacketizer_->ProcessRtpPacket(
                             rtp_buf.data() + payload_offset,
                             length - payload_offset,
@@ -969,7 +1151,7 @@ void StreamSession::WorkerLoop() {
                             seq_num,
                             marker_bit
                         );
-                    } else if (channel == 2 && audio_depacketizer_) {
+                    } else if (channel == audio_rtp_channel_ && audio_depacketizer_) {
                         audio_depacketizer_->ProcessRtpPacket(
                             rtp_buf.data() + payload_offset,
                             length - payload_offset,
@@ -989,6 +1171,9 @@ void StreamSession::WorkerLoop() {
 
         // Streaming ended or was interrupted
         int64_t stream_duration = time_utils::MonotonicSec() - stream_start_time;
+        if (!running_ && state_ == SessionState::STREAMING) {
+            SendRtspTeardown();
+        }
         DisconnectSocket();
 
         if (!running_) {

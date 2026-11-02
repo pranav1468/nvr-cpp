@@ -20,3 +20,13 @@ logs/
 .idea/
 *.swp
 *~
+scratch/
+
+# Secrets and keys
+*.key
+config/*.key
+
+# Web frontend dependencies and build outputs
+web/node_modules/
+web/dist/
+web/.vite/

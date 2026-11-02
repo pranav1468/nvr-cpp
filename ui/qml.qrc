@@ -1,0 +1,38 @@
+<RCC>
+    <qresource prefix="/ui">
+        <file>qmldir</file>
+        <file>Main.qml</file>
+        <file>Theme.qml</file>
+        <file>ApiClient.qml</file>
+        <file>LiveGrid.qml</file>
+        <file>VideoTile.qml</file>
+        <file>components/qmldir</file>
+        <file>components/AppHeader.qml</file>
+        <file>components/AppSidebar.qml</file>
+        <file>components/AppIcon.qml</file>
+        <file>components/ClipExportModal.qml</file>
+        <file>components/HardwareGlVideoSurface.qml</file>
+        <file>components/OnvifDiscoveryModal.qml</file>
+        <file>components/CameraEditModal.qml</file>
+        <file>components/CameraHardwareModal.qml</file>
+        <file>pages/qmldir</file>
+        <file>pages/LivePage.qml</file>
+        <file>pages/PlaybackPage.qml</file>
+        <file>pages/CamerasPage.qml</file>
+        <file>pages/DashboardPage.qml</file>
+        <file>pages/SystemPage.qml</file>
+        <file>assets/images/logo.png</file>
+        <file>assets/images/live_icon.png</file>
+        <file>assets/images/calendar.png</file>
+        <file>assets/images/camera.png</file>
+        <file>assets/images/analytics.png</file>
+        <file>assets/images/display_icon.png</file>
+        <file>assets/images/search.png</file>
+        <file>assets/images/layout_1x1.png</file>
+        <file>assets/images/layout_2x2.png</file>
+        <file>assets/images/layout_7plus1.png</file>
+        <file>assets/images/layout_2x4.png</file>
+        <file>assets/images/edit.png</file>
+        <file>assets/images/delete.png</file>
+    </qresource>
+</RCC>

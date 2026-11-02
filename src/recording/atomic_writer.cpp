@@ -52,28 +52,29 @@ inline bool WriteAll(int fd, const void* data, size_t size) {
     size_t written = 0;
     while (written < size) {
         ssize_t n = write(fd, ptr + written, size - written);
-        if (n <= 0) return false;
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;
         written += static_cast<size_t>(n);
     }
     return true;
 }
 
 inline void SyncParentDirectory(const std::string& file_path) {
-    std::string parent_dir = std::filesystem::path(file_path).parent_path().string();
-    if (parent_dir.empty()) {
-        parent_dir = ".";
-    }
-    int dir_fd = open(parent_dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    std::filesystem::path p(file_path);
+    std::filesystem::path dir = p.parent_path();
+    if (dir.empty()) dir = ".";
+    int dir_fd = open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (dir_fd >= 0) {
-        if (fsync(dir_fd) != 0) {
-            int err = errno;
-            if (err != EINVAL && err != ENOTSUP && err != EACCES) {
-                LOG_WARN << "Parent directory fsync failed for " << parent_dir << ": " << strerror(err);
-            }
+        if (fsync(dir_fd) != 0 && errno != EINVAL && errno != EBADF &&
+            errno != EROFS && errno != EOPNOTSUPP && errno != ENOTSUP &&
+            errno != ENOSYS) {
+            LOG_WARN << "[AtomicWriter] Directory fsync warning on " << dir.string()
+                     << ": " << strerror(errno);
         }
         close(dir_fd);
-    } else {
-        LOG_WARN << "Failed to open parent directory for fsync: " << parent_dir << ": " << strerror(errno);
     }
 }
 
@@ -272,6 +273,37 @@ void AtomicWriter::CleanOrphanedTmpFiles(const std::string& directory) {
     }
 }
 
+bool AtomicWriter::EnsureDiskPreallocation(size_t additional_bytes) {
+    if (fd_ < 0) return false;
+    uint64_t target_size = total_bytes_written_ + additional_bytes;
+    if (allocated_bytes_ == 0 || static_cast<off_t>(target_size) > allocated_bytes_) {
+        // Pre-allocate in 8 MB chunks to eliminate filesystem inode extent fragmentation
+        constexpr off_t kChunkSize = 8 * 1024 * 1024;
+        off_t new_allocated = std::max(allocated_bytes_ + kChunkSize, static_cast<off_t>(target_size + kChunkSize));
+        int ret = posix_fallocate(fd_, 0, new_allocated);
+        if (ret == 0) {
+            allocated_bytes_ = new_allocated;
+        } else {
+            if (ret != EOPNOTSUPP && ret != EINVAL && ret != ENOSYS) {
+                LOG_WARN << "[Channel " << channel_id_ << "] posix_fallocate warning: " << strerror(ret);
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+bool AtomicWriter::WriteBuffer(const void* data, size_t size) {
+    if (fd_ < 0 || !data || size == 0) return false;
+    EnsureDiskPreallocation(size);
+    if (!WriteAll(fd_, data, size)) {
+        has_io_error_ = true;
+        return false;
+    }
+    total_bytes_written_ += size;
+    return true;
+}
+
 bool AtomicWriter::StartSegment(int64_t start_wall_time_ms) {
     if (is_active_) {
         AbortSegment();
@@ -289,7 +321,7 @@ bool AtomicWriter::StartSegment(int64_t start_wall_time_ms) {
     tmp_file_path_ = (target_dir / (base_name + ".tmp")).string();
     final_file_path_ = (target_dir / (base_name + ".mp4")).string();
 
-    fd_ = open(tmp_file_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    fd_ = open(tmp_file_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
     if (fd_ < 0) {
         LOG_ERROR << "Failed to open temporary recording file: " << tmp_file_path_;
         return false;
@@ -300,11 +332,27 @@ bool AtomicWriter::StartSegment(int64_t start_wall_time_ms) {
     frame_count_ = 0;
     keyframe_count_ = 0;
     total_bytes_written_ = 0;
+    allocated_bytes_ = 0;
+    last_fadvise_offset_ = 0;
+    EnsureDiskPreallocation(0);
     fragment_sequence_ = 1;
     segment_start_pts_us_ = -1;
     base_decode_time_ = 0;
     last_pts_us_ = 0;
     has_header_written_ = false;
+    width_ = 0;
+    height_ = 0;
+    codec_ = CodecType::H264;
+    hevc_profile_space_ = 0;
+    hevc_tier_flag_ = 0;
+    hevc_profile_idc_ = 1;
+    hevc_profile_compatibility_flags_ = 0x60000000;
+    hevc_constraint_flags_[0] = 0x90;
+    for (int i = 1; i < 6; ++i) hevc_constraint_flags_[i] = 0;
+    hevc_level_idc_ = 93;
+    sps_bytes_.clear();
+    pps_bytes_.clear();
+    vps_bytes_.clear();
     pending_samples_.clear();
     pending_mdat_bytes_.clear();
 
@@ -409,11 +457,14 @@ void AtomicWriter::ParseSps(const uint8_t* data, size_t size) {
         crop_bottom = reader.ReadExponentialGolomb();
     }
 
-    width_ = (pic_width_in_mbs_minus1 + 1) * 16 - (crop_left + crop_right) * 2;
-    height_ = (2 - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1) * 16 - (crop_top + crop_bottom) * 2;
-
-    LOG_INFO << "[Channel " << channel_id_ << "] Parsed SPS video resolution: " 
-             << width_ << "x" << height_;
+    uint32_t new_w = (pic_width_in_mbs_minus1 + 1) * 16 - (crop_left + crop_right) * 2;
+    uint32_t new_h = (2 - frame_mbs_only_flag) * (pic_height_in_map_units_minus1 + 1) * 16 - (crop_top + crop_bottom) * 2;
+    if (new_w != width_ || new_h != height_) {
+        width_ = new_w;
+        height_ = new_h;
+        LOG_INFO << "[Channel " << channel_id_ << "] Parsed SPS video resolution: " 
+                 << width_ << "x" << height_;
+    }
 }
 
 void AtomicWriter::ParseHevcSps(const uint8_t* data, size_t size) {
@@ -425,12 +476,26 @@ void AtomicWriter::ParseHevcSps(const uint8_t* data, size_t size) {
     reader.ReadBits(1); // sps_temporal_id_nesting_flag
 
     // profile_tier_level
-    reader.ReadBits(2);  // general_profile_space
-    reader.ReadBits(1);  // general_tier_flag
-    reader.ReadBits(5);  // general_profile_idc
-    reader.ReadBits(32); // general_profile_compatibility_flags
-    reader.SkipBits(48); // general_constraint_indicator_flags
-    reader.ReadBits(8);  // general_level_idc
+    uint8_t profile_space = static_cast<uint8_t>(reader.ReadBits(2));
+    uint8_t tier_flag = static_cast<uint8_t>(reader.ReadBits(1));
+    uint8_t profile_idc = static_cast<uint8_t>(reader.ReadBits(5));
+    uint32_t compat_flags = reader.ReadBits(32);
+    uint8_t constraints[6]{0};
+    for (int i = 0; i < 6; ++i) {
+        constraints[i] = static_cast<uint8_t>(reader.ReadBits(8));
+    }
+    uint8_t level_idc = static_cast<uint8_t>(reader.ReadBits(8));
+
+    if (level_idc > 0) {
+        hevc_profile_space_ = profile_space;
+        hevc_tier_flag_ = tier_flag;
+        hevc_profile_idc_ = profile_idc;
+        hevc_profile_compatibility_flags_ = compat_flags;
+        for (int i = 0; i < 6; ++i) {
+            hevc_constraint_flags_[i] = constraints[i];
+        }
+        hevc_level_idc_ = level_idc;
+    }
 
     std::vector<bool> sub_layer_profile_present(max_sub_layers_minus1);
     std::vector<bool> sub_layer_level_present(max_sub_layers_minus1);
@@ -474,10 +539,14 @@ void AtomicWriter::ParseHevcSps(const uint8_t* data, size_t size) {
     uint32_t sub_height_c = (chroma_format_idc == 1) ? 2 : 1;
 
     if (pic_width > 0 && pic_height > 0) {
-        width_ = pic_width - (conf_left + conf_right) * sub_width_c;
-        height_ = pic_height - (conf_top + conf_bottom) * sub_height_c;
-        LOG_INFO << "[Channel " << channel_id_ << "] Parsed HEVC SPS video resolution: " 
-                 << width_ << "x" << height_;
+        uint32_t new_w = pic_width - (conf_left + conf_right) * sub_width_c;
+        uint32_t new_h = pic_height - (conf_top + conf_bottom) * sub_height_c;
+        if (new_w != width_ || new_h != height_) {
+            width_ = new_w;
+            height_ = new_h;
+            LOG_INFO << "[Channel " << channel_id_ << "] Parsed HEVC SPS video resolution: " 
+                     << width_ << "x" << height_;
+        }
     }
 }
 
@@ -489,16 +558,22 @@ void AtomicWriter::WriteFtyp() {
     PutU32(buf, 0x00000200); // minor version
     PutFourCC(buf, "isom");
     PutFourCC(buf, "iso2");
-    PutFourCC(buf, "avc1");
+    bool is_h265 = (codec_ == CodecType::H265) || (!vps_bytes_.empty() && codec_ != CodecType::H264);
+    bool is_h264 = (codec_ == CodecType::H264) || (!is_h265 && !sps_bytes_.empty() && codec_ != CodecType::H265);
+    if (is_h265) {
+        PutFourCC(buf, "hvc1");
+    } else if (is_h264) {
+        PutFourCC(buf, "avc1");
+    } else {
+        PutFourCC(buf, "mp42");
+    }
     PutFourCC(buf, "mp41");
     UpdateBoxSize(buf, 0);
 
-    if (!WriteAll(fd_, buf.data(), buf.size())) {
-        has_io_error_ = true;
+    if (!WriteBuffer(buf.data(), buf.size())) {
         LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write ftyp box";
         return;
     }
-    total_bytes_written_ += buf.size();
 }
 
 void AtomicWriter::WriteMoov() {
@@ -624,10 +699,13 @@ void AtomicWriter::WriteMoov() {
     PutU32(buf, 0);
     PutU32(buf, 1); // entry_count
 
-    // avc1 box
+    // visual sample entry (avc1 or hvc1)
     size_t avc1_start = buf.size();
     PutU32(buf, 0);
-    PutFourCC(buf, (codec_ == CodecType::H265) ? "hvc1" : "avc1");
+    bool is_h265 = (codec_ == CodecType::H265) || (!vps_bytes_.empty() && codec_ != CodecType::H264);
+    bool is_h264 = (codec_ == CodecType::H264) || (!is_h265 && !sps_bytes_.empty() && codec_ != CodecType::H265);
+    const char* sample_entry_fourcc = is_h265 ? "hvc1" : (is_h264 ? "avc1" : "mp4v");
+    PutFourCC(buf, sample_entry_fourcc);
     for (int i = 0; i < 6; ++i) buf.push_back(0); // reserved
     PutU16(buf, 1); // data_reference_index
     PutU16(buf, 0); PutU16(buf, 0); // pre_defined, reserved
@@ -643,15 +721,17 @@ void AtomicWriter::WriteMoov() {
     PutU16(buf, 0xFFFF); // pre_defined -1
 
     // avcC or hvcC box
-    if (codec_ == CodecType::H265) {
+    if (is_h265) {
         size_t hvcc_start = buf.size();
         PutU32(buf, 0);
         PutFourCC(buf, "hvcC");
         buf.push_back(1); // configurationVersion
-        buf.push_back(0x01); // general_profile_space=0, tier_flag=0, profile_idc=1
-        PutU32(buf, 0x60000000); // compatibility flags
-        for (int k = 0; k < 6; ++k) buf.push_back(0); // constraint flags
-        buf.push_back(93); // level_idc 3.1
+        buf.push_back((hevc_profile_space_ << 6) | (hevc_tier_flag_ << 5) | (hevc_profile_idc_ & 0x1F));
+        PutU32(buf, hevc_profile_compatibility_flags_);
+        for (int k = 0; k < 6; ++k) {
+            buf.push_back(hevc_constraint_flags_[k]);
+        }
+        buf.push_back(hevc_level_idc_);
         PutU16(buf, 0xF000); // min_spatial_segmentation_idc
         buf.push_back(0xFC); // parallelismType = 0
         buf.push_back(0xFD); // chromaFormat = 1 (4:2:0)
@@ -679,7 +759,7 @@ void AtomicWriter::WriteMoov() {
         write_nal_array(34, pps_bytes_);
 
         UpdateBoxSize(buf, hvcc_start);
-    } else {
+    } else if (is_h264) {
         if (!sps_bytes_.empty() && !pps_bytes_.empty()) {
             size_t avcc_start = buf.size();
             PutU32(buf, 0);
@@ -701,9 +781,9 @@ void AtomicWriter::WriteMoov() {
             PutU32(buf, 0);
             PutFourCC(buf, "avcC");
             buf.push_back(1);    // configurationVersion
-            buf.push_back(0x64); // profile Main (100)
-            buf.push_back(0x00);
-            buf.push_back(0x28); // level 4.0
+            buf.push_back(sps_bytes_.size() > 1 ? sps_bytes_[1] : 0x64); // profile (High 100 default)
+            buf.push_back(sps_bytes_.size() > 2 ? sps_bytes_[2] : 0x00);
+            buf.push_back(sps_bytes_.size() > 3 ? sps_bytes_[3] : 0x28); // level 4.0
             buf.push_back(0xFF); // 4-byte NAL length
             buf.push_back(0xE0); // 0 SPS
             buf.push_back(0x00); // 0 PPS
@@ -969,12 +1049,10 @@ void AtomicWriter::WriteMoov() {
 
     UpdateBoxSize(buf, moov_start);
 
-    if (!WriteAll(fd_, buf.data(), buf.size())) {
-        has_io_error_ = true;
+    if (!WriteBuffer(buf.data(), buf.size())) {
         LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write moov box";
         return;
     }
-    total_bytes_written_ += buf.size();
     has_header_written_ = true;
 }
 
@@ -1111,12 +1189,10 @@ void AtomicWriter::WriteMoof(const std::vector<SampleEntry>& video_samples, uint
         buf[audio_data_offset_pos + 3] = static_cast<uint8_t>(audio_data_offset & 0xFF);
     }
 
-    if (!WriteAll(fd_, buf.data(), buf.size())) {
-        has_io_error_ = true;
+    if (!WriteBuffer(buf.data(), buf.size())) {
         LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write moof box";
         return;
     }
-    total_bytes_written_ += buf.size();
 }
 
 void AtomicWriter::WriteMdat(const std::vector<uint8_t>& video_payload, const std::vector<uint8_t>& audio_payload) {
@@ -1124,28 +1200,22 @@ void AtomicWriter::WriteMdat(const std::vector<uint8_t>& video_payload, const st
     std::vector<uint8_t> mdat_hdr;
     PutU32(mdat_hdr, total_payload + 8);
     PutFourCC(mdat_hdr, "mdat");
-    if (!WriteAll(fd_, mdat_hdr.data(), mdat_hdr.size())) {
-        has_io_error_ = true;
+    if (!WriteBuffer(mdat_hdr.data(), mdat_hdr.size())) {
         LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write mdat box header";
         return;
     }
-    total_bytes_written_ += mdat_hdr.size();
 
     if (!video_payload.empty()) {
-        if (!WriteAll(fd_, video_payload.data(), video_payload.size())) {
-            has_io_error_ = true;
+        if (!WriteBuffer(video_payload.data(), video_payload.size())) {
             LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write video mdat payload";
             return;
         }
-        total_bytes_written_ += video_payload.size();
     }
     if (has_audio_ && !audio_payload.empty()) {
-        if (!WriteAll(fd_, audio_payload.data(), audio_payload.size())) {
-            has_io_error_ = true;
+        if (!WriteBuffer(audio_payload.data(), audio_payload.size())) {
             LOG_ERROR << "[Channel " << channel_id_ << "] Failed to write audio mdat payload";
             return;
         }
-        total_bytes_written_ += audio_payload.size();
     }
 }
 
@@ -1175,6 +1245,17 @@ void AtomicWriter::FlushCurrentFragment() {
     pending_mdat_bytes_.clear();
     pending_audio_samples_.clear();
     pending_audio_mdat_bytes_.clear();
+
+    // Proactively evict committed pages from kernel page cache every >= 2 MB
+    if (fd_ >= 0 && total_bytes_written_ > last_fadvise_offset_) {
+        uint64_t unevicted = total_bytes_written_ - last_fadvise_offset_;
+        constexpr uint64_t kFadviseThreshold = 2 * 1024 * 1024; // 2 MB
+        if (unevicted >= kFadviseThreshold) {
+            posix_fadvise(fd_, static_cast<off_t>(last_fadvise_offset_),
+                          static_cast<off_t>(unevicted), POSIX_FADV_DONTNEED);
+            last_fadvise_offset_ = total_bytes_written_;
+        }
+    }
 }
 
 bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
@@ -1276,7 +1357,9 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
     }
 
 
-    codec_ = packet->codec;
+    if (packet->codec != CodecType::UNKNOWN) {
+        codec_ = packet->codec;
+    }
     const uint8_t* ptr = packet->data.data();
     size_t len = packet->data.size();
 
@@ -1311,6 +1394,10 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
         nals.push_back({ptr, len});
     }
 
+    if (codec_ == CodecType::UNKNOWN) {
+        codec_ = DetectNalCodecFromParamSets(ptr, len);
+    }
+
     uint32_t frame_sample_size = 0;
     std::vector<uint8_t> frame_bytes;
 
@@ -1319,11 +1406,15 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
         if (codec_ == CodecType::H264) {
             uint8_t nal_type = nal_data[0] & 0x1F;
             if (nal_type == 7) { // SPS
-                sps_bytes_.assign(nal_data, nal_data + nal_len);
-                ParseSps(nal_data, nal_len);
+                if (sps_bytes_.empty() || (!has_header_written_ && frame_count_ == 0)) {
+                    sps_bytes_.assign(nal_data, nal_data + nal_len);
+                    ParseSps(nal_data, nal_len);
+                }
             } else if (nal_type == 8) { // PPS
-                pps_bytes_.assign(nal_data, nal_data + nal_len);
-            } else if (nal_type == 1 || nal_type == 5 || nal_type == 6) { // Slice or SEI
+                if (pps_bytes_.empty() || (!has_header_written_ && frame_count_ == 0)) {
+                    pps_bytes_.assign(nal_data, nal_data + nal_len);
+                }
+            } else if ((nal_type >= 1 && nal_type <= 5) || nal_type == 6) { // VCL Slice or SEI
                 PutU32(frame_bytes, static_cast<uint32_t>(nal_len));
                 frame_bytes.insert(frame_bytes.end(), nal_data, nal_data + nal_len);
                 frame_sample_size += static_cast<uint32_t>(4 + nal_len);
@@ -1331,12 +1422,18 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
         } else if (codec_ == CodecType::H265) {
             uint8_t nal_type = (nal_data[0] >> 1) & 0x3F;
             if (nal_type == 32) { // VPS
-                vps_bytes_.assign(nal_data, nal_data + nal_len);
+                if (vps_bytes_.empty() || (!has_header_written_ && frame_count_ == 0)) {
+                    vps_bytes_.assign(nal_data, nal_data + nal_len);
+                }
             } else if (nal_type == 33) { // SPS
-                sps_bytes_.assign(nal_data, nal_data + nal_len);
-                ParseHevcSps(nal_data, nal_len);
+                if (sps_bytes_.empty() || (!has_header_written_ && frame_count_ == 0)) {
+                    sps_bytes_.assign(nal_data, nal_data + nal_len);
+                    ParseHevcSps(nal_data, nal_len);
+                }
             } else if (nal_type == 34) { // PPS
-                pps_bytes_.assign(nal_data, nal_data + nal_len);
+                if (pps_bytes_.empty() || (!has_header_written_ && frame_count_ == 0)) {
+                    pps_bytes_.assign(nal_data, nal_data + nal_len);
+                }
             } else if (nal_type <= 31 || nal_type == 39 || nal_type == 40) { // VCL Slices or SEI
                 PutU32(frame_bytes, static_cast<uint32_t>(nal_len));
                 frame_bytes.insert(frame_bytes.end(), nal_data, nal_data + nal_len);
@@ -1796,6 +1893,380 @@ bool AtomicWriter::ValidateMp4File(const std::string& path) {
     return true;
 }
 
+bool AtomicWriter::ExtractMp4Metadata(const std::string& path, SegmentMetadata& out_meta) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) {
+        LOG_ERROR << "MP4 metadata extraction failed: cannot open file: " << path;
+        return false;
+    }
+
+    file.seekg(0, std::ios::end);
+    std::streampos fsize_pos = file.tellg();
+    if (fsize_pos < 32) {
+        LOG_ERROR << "MP4 metadata extraction failed: file size " << fsize_pos << " bytes is smaller than minimum header: " << path;
+        return false;
+    }
+    uint64_t file_size = static_cast<uint64_t>(fsize_pos);
+    file.seekg(0, std::ios::beg);
+
+    out_meta.file_path = path;
+    out_meta.file_size_bytes = file_size;
+
+    uint64_t current_pos = 0;
+    bool found_ftyp = false;
+    bool found_moov = false;
+    bool found_video_trak = false;
+    uint32_t video_track_id = 0;
+    uint32_t video_timescale = 90000;
+
+    int64_t mvhd_duration_ms = 0;
+    std::map<uint32_t, uint32_t> default_durations;
+
+    uint32_t fmp4_frame_count = 0;
+    uint32_t fmp4_keyframe_count = 0;
+    uint64_t fmp4_video_duration_ticks = 0;
+
+    uint32_t non_frag_frame_count = 0;
+    uint32_t non_frag_keyframe_count = 0;
+    int64_t non_frag_duration_ms = 0;
+
+    while (current_pos < file_size) {
+        file.seekg(current_pos);
+        BoxHeader box;
+        if (!ReadBoxHeader(file, file_size, box)) {
+            break;
+        }
+
+        if (std::strcmp(box.type, "ftyp") == 0) {
+            found_ftyp = true;
+            current_pos = box.offset + box.size;
+        } else if (std::strcmp(box.type, "moov") == 0) {
+            found_moov = true;
+            if (box.size >= 16 && box.size <= 20 * 1024 * 1024) {
+                std::vector<uint8_t> moov_payload(box.size - box.header_size);
+                if (file.read(reinterpret_cast<char*>(moov_payload.data()), moov_payload.size())) {
+                    std::vector<MemBox> moov_children;
+                    if (ParseMemBoxes(moov_payload.data(), moov_payload.size(), moov_children)) {
+                        const MemBox* mvhd = FindBox(moov_children, "mvhd");
+                        if (mvhd && mvhd->payload_size >= 16) {
+                            uint8_t mvhd_ver = mvhd->payload[0];
+                            uint32_t timescale = (mvhd_ver == 1)
+                                ? ((mvhd->payload_size >= 24) ? ReadU32BE(mvhd->payload + 20) : 90000)
+                                : ReadU32BE(mvhd->payload + 12);
+                            uint64_t duration = (mvhd_ver == 1)
+                                ? ((mvhd->payload_size >= 32) ? ReadU64BE(mvhd->payload + 24) : 0)
+                                : ReadU32BE(mvhd->payload + 16);
+                            if (timescale > 0) {
+                                video_timescale = timescale;
+                                if (duration > 0) {
+                                    mvhd_duration_ms = static_cast<int64_t>((duration * 1000) / timescale);
+                                }
+                            }
+                        }
+
+                        // Parse tracks
+                        for (const auto& child : moov_children) {
+                            if (std::strcmp(child.type, "trak") == 0) {
+                                std::vector<MemBox> trak_children;
+                                if (!ParseMemBoxes(child.payload, child.payload_size, trak_children)) continue;
+
+                                const MemBox* tkhd = FindBox(trak_children, "tkhd");
+                                if (!tkhd || tkhd->payload_size < 20) continue;
+                                uint8_t tkhd_ver = tkhd->payload[0];
+                                uint32_t track_id = (tkhd_ver == 1)
+                                    ? ((tkhd->payload_size >= 28) ? ReadU32BE(tkhd->payload + 20) : 0)
+                                    : ReadU32BE(tkhd->payload + 12);
+                                uint32_t width_fp = (tkhd_ver == 1)
+                                    ? ((tkhd->payload_size >= 92) ? ReadU32BE(tkhd->payload + 88) : 0)
+                                    : ((tkhd->payload_size >= 80) ? ReadU32BE(tkhd->payload + 76) : 0);
+                                uint32_t height_fp = (tkhd_ver == 1)
+                                    ? ((tkhd->payload_size >= 96) ? ReadU32BE(tkhd->payload + 92) : 0)
+                                    : ((tkhd->payload_size >= 84) ? ReadU32BE(tkhd->payload + 80) : 0);
+
+                                const MemBox* mdia = FindBox(trak_children, "mdia");
+                                if (!mdia) continue;
+                                std::vector<MemBox> mdia_children;
+                                if (!ParseMemBoxes(mdia->payload, mdia->payload_size, mdia_children)) continue;
+
+                                const MemBox* mdhd = FindBox(mdia_children, "mdhd");
+                                uint32_t track_timescale = 0;
+                                if (mdhd && mdhd->payload_size >= 16) {
+                                    uint8_t mdhd_ver = mdhd->payload[0];
+                                    track_timescale = (mdhd_ver == 1)
+                                        ? ((mdhd->payload_size >= 24) ? ReadU32BE(mdhd->payload + 20) : 0)
+                                        : ReadU32BE(mdhd->payload + 12);
+                                }
+
+                                const MemBox* hdlr = FindBox(mdia_children, "hdlr");
+                                if (!hdlr || hdlr->payload_size < 12) continue;
+                                char handler[5]{0};
+                                std::memcpy(handler, hdlr->payload + 8, 4);
+
+                                const MemBox* minf = FindBox(mdia_children, "minf");
+                                if (!minf) continue;
+                                std::vector<MemBox> minf_children;
+                                if (!ParseMemBoxes(minf->payload, minf->payload_size, minf_children)) continue;
+
+                                const MemBox* stbl = FindBox(minf_children, "stbl");
+                                if (!stbl) continue;
+                                std::vector<MemBox> stbl_children;
+                                if (!ParseMemBoxes(stbl->payload, stbl->payload_size, stbl_children)) continue;
+
+                                const MemBox* stsd = FindBox(stbl_children, "stsd");
+                                if (!stsd || stsd->payload_size < 8) continue;
+
+                                if (std::strcmp(handler, "vide") == 0) {
+                                    video_track_id = track_id;
+                                    found_video_trak = true;
+                                    if (track_timescale > 0) video_timescale = track_timescale;
+                                    if (width_fp > 0) out_meta.width = width_fp >> 16;
+                                    if (height_fp > 0) out_meta.height = height_fp >> 16;
+
+                                    std::vector<MemBox> stsd_entries;
+                                    if (ParseMemBoxes(stsd->payload + 8, stsd->payload_size - 8, stsd_entries)) {
+                                        for (const auto& entry : stsd_entries) {
+                                            if (std::strcmp(entry.type, "avc1") == 0) {
+                                                out_meta.codec = CodecType::H264;
+                                                if (entry.payload_size >= 28) {
+                                                    uint16_t w = (static_cast<uint16_t>(entry.payload[24]) << 8) | entry.payload[25];
+                                                    uint16_t h = (static_cast<uint16_t>(entry.payload[26]) << 8) | entry.payload[27];
+                                                    if (w > 0) out_meta.width = w;
+                                                    if (h > 0) out_meta.height = h;
+                                                }
+                                            } else if (std::strcmp(entry.type, "hvc1") == 0 || std::strcmp(entry.type, "hev1") == 0) {
+                                                out_meta.codec = CodecType::H265;
+                                                if (entry.payload_size >= 28) {
+                                                    uint16_t w = (static_cast<uint16_t>(entry.payload[24]) << 8) | entry.payload[25];
+                                                    uint16_t h = (static_cast<uint16_t>(entry.payload[26]) << 8) | entry.payload[27];
+                                                    if (w > 0) out_meta.width = w;
+                                                    if (h > 0) out_meta.height = h;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Non-fragmented MP4 tables
+                                    const MemBox* stsz = FindBox(stbl_children, "stsz");
+                                    if (stsz && stsz->payload_size >= 8) {
+                                        uint32_t sc = ReadU32BE(stsz->payload + 8);
+                                        if (sc > 0) non_frag_frame_count = sc;
+                                    }
+
+                                    const MemBox* stss = FindBox(stbl_children, "stss");
+                                    if (stss && stss->payload_size >= 4) {
+                                        uint32_t kc = ReadU32BE(stss->payload + 4);
+                                        non_frag_keyframe_count = kc;
+                                    }
+
+                                    const MemBox* stts = FindBox(stbl_children, "stts");
+                                    if (stts && stts->payload_size >= 4) {
+                                        uint32_t entry_count = ReadU32BE(stts->payload + 4);
+                                        uint64_t total_ticks = 0;
+                                        size_t pos = 8;
+                                        for (uint32_t i = 0; i < entry_count && pos + 8 <= stts->payload_size; ++i) {
+                                            uint32_t cnt = ReadU32BE(stts->payload + pos);
+                                            uint32_t delta = ReadU32BE(stts->payload + pos + 4);
+                                            total_ticks += static_cast<uint64_t>(cnt) * delta;
+                                            pos += 8;
+                                        }
+                                        if (total_ticks > 0 && video_timescale > 0) {
+                                            non_frag_duration_ms = static_cast<int64_t>((total_ticks * 1000) / video_timescale);
+                                        }
+                                    }
+                                } else if (std::strcmp(handler, "soun") == 0) {
+                                    out_meta.has_audio = true;
+                                    if (track_timescale > 0) out_meta.audio_sample_rate = track_timescale;
+
+                                    std::vector<MemBox> stsd_entries;
+                                    if (ParseMemBoxes(stsd->payload + 8, stsd->payload_size - 8, stsd_entries)) {
+                                        for (const auto& entry : stsd_entries) {
+                                            if (std::strcmp(entry.type, "mp4a") == 0) {
+                                                out_meta.audio_codec = CodecType::AAC;
+                                            } else if (std::strcmp(entry.type, "alaw") == 0) {
+                                                out_meta.audio_codec = CodecType::PCMA;
+                                            } else if (std::strcmp(entry.type, "ulaw") == 0) {
+                                                out_meta.audio_codec = CodecType::PCMU;
+                                            }
+                                            if (entry.payload_size >= 28) {
+                                                uint16_t channels = (static_cast<uint16_t>(entry.payload[16]) << 8) | entry.payload[17];
+                                                if (channels > 0) out_meta.audio_channels = static_cast<uint8_t>(channels);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check mvex for default durations
+                        const MemBox* mvex = FindBox(moov_children, "mvex");
+                        if (mvex) {
+                            std::vector<MemBox> mvex_children;
+                            if (ParseMemBoxes(mvex->payload, mvex->payload_size, mvex_children)) {
+                                for (const auto& mc : mvex_children) {
+                                    if (std::strcmp(mc.type, "trex") == 0 && mc.payload_size >= 16) {
+                                        uint32_t tid = ReadU32BE(mc.payload + 4);
+                                        uint32_t dur = ReadU32BE(mc.payload + 12);
+                                        default_durations[tid] = dur;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            current_pos = box.offset + box.size;
+        } else if (std::strcmp(box.type, "moof") == 0) {
+            if (box.size >= 16 && box.size <= 20 * 1024 * 1024) {
+                std::vector<uint8_t> moof_payload(box.size - box.header_size);
+                if (file.read(reinterpret_cast<char*>(moof_payload.data()), moof_payload.size())) {
+                    std::vector<MemBox> moof_children;
+                    if (ParseMemBoxes(moof_payload.data(), moof_payload.size(), moof_children)) {
+                        for (const auto& child : moof_children) {
+                            if (std::strcmp(child.type, "traf") == 0) {
+                                std::vector<MemBox> traf_children;
+                                if (!ParseMemBoxes(child.payload, child.payload_size, traf_children)) continue;
+
+                                const MemBox* tfhd = FindBox(traf_children, "tfhd");
+                                if (!tfhd || tfhd->payload_size < 8) continue;
+                                uint32_t t_id = ReadU32BE(tfhd->payload + 4);
+                                if (video_track_id != 0 && t_id != video_track_id) {
+                                    continue;
+                                }
+
+                                const MemBox* trun = FindBox(traf_children, "trun");
+                                if (!trun || trun->payload_size < 8) continue;
+
+                                uint32_t trun_flags = (static_cast<uint32_t>(trun->payload[1]) << 16) |
+                                                      (static_cast<uint32_t>(trun->payload[2]) << 8) |
+                                                      static_cast<uint32_t>(trun->payload[3]);
+                                uint32_t scount = ReadU32BE(trun->payload + 4);
+                                fmp4_frame_count += scount;
+
+                                size_t trun_pos = 8;
+                                if (trun_flags & 0x000001) trun_pos += 4; // data-offset
+                                uint32_t first_flags = 0;
+                                bool has_first_flags = false;
+                                if (trun_flags & 0x000004) { // first-sample-flags
+                                    if (trun_pos + 4 <= trun->payload_size) {
+                                        first_flags = ReadU32BE(trun->payload + trun_pos);
+                                        has_first_flags = true;
+                                        trun_pos += 4;
+                                    }
+                                }
+
+                                for (uint32_t s = 0; s < scount; ++s) {
+                                    uint32_t s_dur = 0;
+                                    if (trun_flags & 0x000100) { // sample-duration-present
+                                        if (trun_pos + 4 <= trun->payload_size) {
+                                            s_dur = ReadU32BE(trun->payload + trun_pos);
+                                            trun_pos += 4;
+                                        }
+                                    } else if (default_durations.count(t_id)) {
+                                        s_dur = default_durations[t_id];
+                                    }
+                                    fmp4_video_duration_ticks += s_dur;
+
+                                    if (trun_flags & 0x000200) { // sample-size-present
+                                        if (trun_pos + 4 <= trun->payload_size) trun_pos += 4;
+                                    }
+
+                                    uint32_t s_flags = 0;
+                                    bool has_s_flags = false;
+                                    if (trun_flags & 0x000400) { // sample-flags-present
+                                        if (trun_pos + 4 <= trun->payload_size) {
+                                            s_flags = ReadU32BE(trun->payload + trun_pos);
+                                            has_s_flags = true;
+                                            trun_pos += 4;
+                                        }
+                                    } else if (s == 0 && has_first_flags) {
+                                        s_flags = first_flags;
+                                        has_s_flags = true;
+                                    }
+
+                                    if (has_s_flags) {
+                                        if (((s_flags & 0x02000000) != 0) || ((s_flags & 0x00010000) == 0)) {
+                                            fmp4_keyframe_count++;
+                                        }
+                                    } else if (s == 0 && fmp4_keyframe_count == 0) {
+                                        fmp4_keyframe_count++;
+                                    }
+
+                                    if (trun_flags & 0x000800) { // cto
+                                        if (trun_pos + 4 <= trun->payload_size) trun_pos += 4;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            current_pos = box.offset + box.size;
+        } else {
+            current_pos = box.offset + box.size;
+        }
+    }
+
+    if (!found_ftyp || !found_moov || !found_video_trak) {
+        LOG_ERROR << "MP4 metadata extraction failed: missing required ftyp/moov/video track in " << path;
+        return false;
+    }
+
+    if (fmp4_frame_count > 0) {
+        out_meta.frame_count = fmp4_frame_count;
+        out_meta.keyframe_count = (fmp4_keyframe_count > 0) ? fmp4_keyframe_count : 1;
+        if (video_timescale > 0 && fmp4_video_duration_ticks > 0) {
+            out_meta.duration_ms = static_cast<int64_t>((fmp4_video_duration_ticks * 1000) / video_timescale);
+        }
+    } else if (non_frag_frame_count > 0) {
+        out_meta.frame_count = non_frag_frame_count;
+        out_meta.keyframe_count = (non_frag_keyframe_count > 0) ? non_frag_keyframe_count : 1;
+        if (non_frag_duration_ms > 0) {
+            out_meta.duration_ms = non_frag_duration_ms;
+        } else if (mvhd_duration_ms > 0) {
+            out_meta.duration_ms = mvhd_duration_ms;
+        }
+    }
+
+    if (out_meta.duration_ms <= 0) {
+        if (mvhd_duration_ms > 0) {
+            out_meta.duration_ms = mvhd_duration_ms;
+        } else if (out_meta.start_time_ms > 0) {
+            std::error_code ec;
+            auto ftime = std::filesystem::last_write_time(path, ec);
+            if (!ec) {
+                auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+                    ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now());
+                int64_t mtime_ms = std::chrono::duration_cast<std::chrono::milliseconds>(sctp.time_since_epoch()).count();
+                if (mtime_ms > out_meta.start_time_ms) {
+                    out_meta.duration_ms = mtime_ms - out_meta.start_time_ms;
+                }
+            }
+        }
+    }
+
+    if (out_meta.duration_ms <= 0) {
+        if (out_meta.frame_count > 0) {
+            out_meta.duration_ms = static_cast<int64_t>(out_meta.frame_count * 1000) / 25;
+        } else {
+            out_meta.duration_ms = 1000;
+        }
+    }
+
+    out_meta.fps = (out_meta.duration_ms > 0 && out_meta.frame_count > 0)
+        ? static_cast<uint32_t>((static_cast<uint64_t>(out_meta.frame_count) * 1000 + (out_meta.duration_ms / 2)) / out_meta.duration_ms)
+        : 25;
+    if (out_meta.fps == 0) out_meta.fps = 25;
+
+    if (out_meta.keyframe_count == 0 && out_meta.frame_count > 0) {
+        out_meta.keyframe_count = 1;
+    }
+
+    out_meta.end_time_ms = out_meta.start_time_ms + out_meta.duration_ms;
+    out_meta.is_locked = false;
+
+    return true;
+}
+
 bool AtomicWriter::FinalizeSegment(SegmentMetadata& out_meta) {
     if (!is_active_) {
         return false;
@@ -1804,11 +2275,32 @@ bool AtomicWriter::FinalizeSegment(SegmentMetadata& out_meta) {
     FlushCurrentFragment();
 
     if (fd_ >= 0) {
-        // Two-phase commit: flush to disk surface
-        if (fdatasync(fd_) != 0) {
-            has_io_error_ = true;
-            LOG_ERROR << "[Channel " << channel_id_ << "] fdatasync failed: " << strerror(errno);
+        // Truncate preallocated extents back down to the exact byte size written
+        if (allocated_bytes_ > static_cast<off_t>(total_bytes_written_)) {
+            if (ftruncate(fd_, static_cast<off_t>(total_bytes_written_)) != 0) {
+                LOG_WARN << "[Channel " << channel_id_ << "] ftruncate failed: " << strerror(errno);
+            }
+            allocated_bytes_ = static_cast<off_t>(total_bytes_written_);
         }
+
+        int sync_ret = 0;
+        do {
+            sync_ret = fdatasync(fd_);
+        } while (sync_ret == -1 && errno == EINTR);
+        if (sync_ret != 0) {
+            if (errno == EINVAL || errno == EROFS || errno == EOPNOTSUPP ||
+                errno == ENOTSUP || errno == ENOSYS) {
+                LOG_WARN << "[Channel " << channel_id_ << "] fdatasync not supported by underlying filesystem ("
+                         << strerror(errno) << "); continuing without hardware sync";
+            } else {
+                LOG_ERROR << "[Channel " << channel_id_ << "] fdatasync failed: " << strerror(errno);
+                has_io_error_ = true;
+            }
+        }
+
+        // Evict written file pages from Linux page cache to avoid thrashing system RAM
+        posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+
         close(fd_);
         fd_ = -1;
     }
@@ -1845,8 +2337,11 @@ bool AtomicWriter::FinalizeSegment(SegmentMetadata& out_meta) {
 
     int64_t duration_ms = 0;
     int64_t max_last_pts_us = std::max(last_pts_us_, last_audio_pts_us_);
-    if (segment_start_pts_us_ >= 0 && max_last_pts_us > segment_start_pts_us_) {
+    if (segment_start_pts_us_ >= 0 && max_last_pts_us >= segment_start_pts_us_) {
         duration_ms = (max_last_pts_us - segment_start_pts_us_) / 1000;
+        if (duration_ms <= 0) {
+            duration_ms = 40;
+        }
     } else {
         int64_t end_time_ms = time_utils::WallTimeMs();
         duration_ms = end_time_ms - start_time_ms_;
@@ -1891,6 +2386,8 @@ void AtomicWriter::AbortSegment() {
     if (std::filesystem::exists(tmp_file_path_)) {
         std::filesystem::remove(tmp_file_path_);
     }
+    allocated_bytes_ = 0;
+    last_fadvise_offset_ = 0;
     is_active_ = false;
     LOG_WARN << "[Channel " << channel_id_ << "] Aborted and removed partial segment: " << tmp_file_path_;
 }

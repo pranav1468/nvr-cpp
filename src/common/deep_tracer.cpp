@@ -4,12 +4,14 @@
 #include "nvr/recording/recording_scheduler.h"
 #include "nvr/live/live_controller.h"
 #include "nvr/storage/retention_manager.h"
-#include "nvr/storage/segment_index.h"
+#include "3rdparty/nlohmann/json.hpp"
 
 #include <execinfo.h>
 #include <cxxabi.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -19,6 +21,72 @@
 #include <filesystem>
 
 namespace nvr {
+
+namespace {
+
+std::atomic<int> g_crash_fd{-1};
+
+struct ProcMetrics {
+    long rss_kb{0};
+    long vm_size_kb{0};
+    int num_threads{0};
+    int open_fds{0};
+};
+
+ProcMetrics ReadProcessMetrics() {
+    ProcMetrics pm;
+    std::ifstream status_in("/proc/self/status");
+    std::string line;
+    while (std::getline(status_in, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            std::istringstream iss(line.substr(6));
+            iss >> pm.rss_kb;
+        } else if (line.rfind("VmSize:", 0) == 0) {
+            std::istringstream iss(line.substr(7));
+            iss >> pm.vm_size_kb;
+        } else if (line.rfind("Threads:", 0) == 0) {
+            std::istringstream iss(line.substr(8));
+            iss >> pm.num_threads;
+        }
+    }
+
+    DIR* dir = opendir("/proc/self/fd");
+    if (dir) {
+        int count = 0;
+        while (readdir(dir) != nullptr) {
+            count++;
+        }
+        closedir(dir);
+        pm.open_fds = (count > 2) ? (count - 2) : 0;
+    }
+    return pm;
+}
+
+size_t SafeIntToDec(int val, char* buf, size_t buf_size) {
+    if (buf_size == 0) return 0;
+    char tmp[24];
+    int idx = 0;
+    unsigned int uval = (val < 0) ? static_cast<unsigned int>(-val) : static_cast<unsigned int>(val);
+    if (uval == 0) {
+        tmp[idx++] = '0';
+    } else {
+        while (uval > 0 && idx < 20) {
+            tmp[idx++] = static_cast<char>('0' + (uval % 10));
+            uval /= 10;
+        }
+    }
+    size_t pos = 0;
+    if (val < 0 && pos + 1 < buf_size) {
+        buf[pos++] = '-';
+    }
+    while (idx > 0 && pos + 1 < buf_size) {
+        buf[pos++] = tmp[--idx];
+    }
+    buf[pos] = '\0';
+    return pos;
+}
+
+} // namespace
 
 DeepTracer& DeepTracer::Instance() {
     static DeepTracer instance;
@@ -31,7 +99,8 @@ DeepTracer::~DeepTracer() {
 
 bool DeepTracer::Start(const std::string& log_file_path,
                        const std::string& storage_path,
-                       uint32_t monitor_interval_ms) {
+                       uint32_t monitor_interval_ms,
+                       size_t max_log_size_bytes) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (running_.load()) {
         return true;
@@ -39,15 +108,22 @@ bool DeepTracer::Start(const std::string& log_file_path,
 
     log_file_path_ = log_file_path;
     storage_path_ = storage_path;
-    monitor_interval_ms_ = monitor_interval_ms;
+    monitor_interval_ms_ = (monitor_interval_ms < 200) ? 200 : monitor_interval_ms;
+    max_log_size_bytes_ = (max_log_size_bytes < 512 * 1024) ? (512 * 1024) : max_log_size_bytes;
 
-    // Ensure logs directory exists
     try {
         std::filesystem::path p(log_file_path_);
         if (p.has_parent_path()) {
             std::filesystem::create_directories(p.parent_path());
         }
     } catch (...) {}
+
+    std::string crash_path = log_file_path_ + ".crash";
+    int cfd = ::open(crash_path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+    int old_cfd = g_crash_fd.exchange(cfd);
+    if (old_cfd >= 0) {
+        ::close(old_cfd);
+    }
 
     log_file_.open(log_file_path_, std::ios::out | std::ios::app);
     if (!log_file_.is_open()) {
@@ -60,13 +136,12 @@ bool DeepTracer::Start(const std::string& log_file_path,
               << "[DeepTracer] Deep Diagnostics & Telemetry Sentinel Started at " << now_str << "\n"
               << "[DeepTracer] Log Destination: " << log_file_path_ << "\n"
               << "[DeepTracer] Target Storage Path: " << storage_path_ << "\n"
-              << "[DeepTracer] Sampling Interval: " << monitor_interval_ms_ << " ms\n"
+              << "[DeepTracer] Sampling Interval: " << monitor_interval_ms_ << " ms | Max Log Size: " << max_log_size_bytes_ << " bytes\n"
               << "================================================================================\n"
               << std::flush;
 
     InstallCrashHandlers();
 
-    // Hook Logger: capture all levels (including DEBUG) into tracer
     saved_console_level_ = Logger::Instance().GetConsoleLogLevel();
     Logger::Instance().SetLogLevel(LogLevel::DEBUG);
     Logger::Instance().SetSink([this](LogLevel level, const char* file, int line, const std::string& msg) {
@@ -83,6 +158,7 @@ void DeepTracer::Stop() {
         return;
     }
 
+    sleep_cv_.notify_all();
     if (monitor_thread_.joinable()) {
         monitor_thread_.join();
     }
@@ -92,6 +168,11 @@ void DeepTracer::Stop() {
 
     UninstallCrashHandlers();
 
+    int cfd = g_crash_fd.exchange(-1);
+    if (cfd >= 0) {
+        ::close(cfd);
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     if (log_file_.is_open()) {
         std::string now_str = time_utils::FormatIso8601(time_utils::WallTimeMs());
@@ -100,6 +181,24 @@ void DeepTracer::Stop() {
                   << "================================================================================\n"
                   << std::flush;
         log_file_.close();
+    }
+}
+
+void DeepTracer::RotateLogIfNeededLocked() {
+    if (!log_file_.is_open() || log_file_path_.empty()) {
+        return;
+    }
+    std::streampos pos = log_file_.tellp();
+    if (pos > 0 && static_cast<size_t>(pos) >= max_log_size_bytes_) {
+        log_file_.flush();
+        log_file_.close();
+        std::error_code ec;
+        std::filesystem::rename(log_file_path_, log_file_path_ + ".1", ec);
+        log_file_.open(log_file_path_, std::ios::out | std::ios::trunc);
+        if (log_file_.is_open()) {
+            log_file_ << "[DeepTracer] Log rotated at "
+                      << time_utils::FormatIso8601(time_utils::WallTimeMs()) << "\n";
+        }
     }
 }
 
@@ -117,10 +216,6 @@ void DeepTracer::RecordEvent(const std::string& tag, const std::string& message,
 }
 
 void DeepTracer::OnLog(LogLevel level, const char* file, int line, const std::string& message) {
-    if (!running_.load(std::memory_order_relaxed)) {
-        return;
-    }
-
     uint64_t tid = 0;
 #ifdef SYS_gettid
     tid = static_cast<uint64_t>(syscall(SYS_gettid));
@@ -129,8 +224,8 @@ void DeepTracer::OnLog(LogLevel level, const char* file, int line, const std::st
 #endif
 
     int64_t now_us = time_utils::WallTimeMs() * 1000;
-    const char* base_file = strrchr(file, '/');
-    base_file = (base_file != nullptr) ? (base_file + 1) : file;
+    const char* base_file = file ? strrchr(file, '/') : nullptr;
+    base_file = (base_file != nullptr) ? (base_file + 1) : (file ? file : "nvr");
 
     const char* lvl_str = "INFO ";
     switch (level) {
@@ -164,12 +259,13 @@ void DeepTracer::OnLog(LogLevel level, const char* file, int line, const std::st
                   static_cast<unsigned long>(tid), lvl_str, base_file, line, message.c_str());
 
     std::lock_guard<std::mutex> lock(mutex_);
-    breadcrumbs_.push_back(b);
+    breadcrumbs_.push_back(std::move(b));
     if (breadcrumbs_.size() > kMaxBreadcrumbs) {
         breadcrumbs_.pop_front();
     }
 
-    if (log_file_.is_open()) {
+    if (running_.load(std::memory_order_relaxed) && log_file_.is_open()) {
+        RotateLogIfNeededLocked();
         log_file_ << entry << "\n";
         if (level >= LogLevel::WARN) {
             if (level == LogLevel::ERROR) {
@@ -208,9 +304,54 @@ void DeepTracer::DumpFlightRecorder(std::ostream& os, size_t max_count) const {
     os << ">>> END FLIGHT RECORDER DUMP <<<\n";
 }
 
+std::string DeepTracer::GetDiagnosticsJson(size_t max_count) const {
+    nlohmann::json root;
+    int64_t now_ms = time_utils::WallTimeMs();
+    ProcMetrics pm = ReadProcessMetrics();
+
+    root["timestamp_ms"] = now_ms;
+    root["timestamp_iso"] = time_utils::FormatIso8601(now_ms);
+    root["running"] = running_.load();
+    root["process"] = {
+        {"rss_kb", pm.rss_kb},
+        {"vm_size_kb", pm.vm_size_kb},
+        {"threads", pm.num_threads},
+        {"open_fds", pm.open_fds}
+    };
+    root["process_metrics"] = root["process"];
+
+    auto recs = GetRecentBreadcrumbs(max_count);
+    nlohmann::json crumbs = nlohmann::json::array();
+    for (const auto& r : recs) {
+        const char* lvl = "INFO";
+        switch (r.level) {
+            case LogLevel::DEBUG: lvl = "DEBUG"; break;
+            case LogLevel::INFO:  lvl = "INFO";  break;
+            case LogLevel::WARN:  lvl = "WARN";  break;
+            case LogLevel::ERROR: lvl = "ERROR"; break;
+        }
+        nlohmann::json item;
+        item["timestamp_us"] = r.timestamp_us;
+        item["thread_id"] = r.thread_id;
+        item["level"] = lvl;
+        item["file"] = r.file;
+        item["line"] = r.line;
+        item["tag"] = r.tag;
+        item["message"] = r.message;
+        crumbs.push_back(std::move(item));
+    }
+    root["breadcrumbs"] = std::move(crumbs);
+    return root.dump();
+}
+
 void DeepTracer::MonitorWorkerLoop() {
     while (running_.load(std::memory_order_relaxed)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(monitor_interval_ms_));
+        {
+            std::unique_lock<std::mutex> slock(sleep_mutex_);
+            sleep_cv_.wait_for(slock, std::chrono::milliseconds(monitor_interval_ms_), [this]() {
+                return !running_.load(std::memory_order_relaxed);
+            });
+        }
         if (!running_.load(std::memory_order_relaxed)) {
             break;
         }
@@ -220,8 +361,11 @@ void DeepTracer::MonitorWorkerLoop() {
 
 void DeepTracer::CollectPipelineDiagnostics() {
     std::string time_str = time_utils::FormatIso8601(time_utils::WallTimeMs());
+    ProcMetrics pm = ReadProcessMetrics();
     std::ostringstream ss;
-    ss << "\n--- [PIPELINE HEALTH SNAPSHOT] " << time_str << " ---\n";
+    ss << "\n--- [PIPELINE HEALTH SNAPSHOT] " << time_str
+       << " | RSS=" << (pm.rss_kb / 1024.0) << "MB Threads=" << pm.num_threads
+       << " FDs=" << pm.open_fds << " ---\n";
 
     // 1. Ingress Subsystem
     auto cameras = CameraManager::Instance().GetCameras();
@@ -268,12 +412,14 @@ void DeepTracer::CollectPipelineDiagnostics() {
     }
 
     // 4. Storage & Index Subsystem
-    uint64_t free_mb = RetentionManager::Instance().GetFreeDiskSpaceBytes(storage_path_) / (1024 * 1024);
-    uint64_t total_mb = RetentionManager::Instance().GetTotalDiskSpaceBytes(storage_path_) / (1024 * 1024);
-    int seg_count = SegmentIndex::Instance().GetTotalSegmentCount();
-    uint64_t stored_mb = SegmentIndex::Instance().GetTotalRecordingSizeBytes() / (1024 * 1024);
-    ss << "  [STORAGE] Disk Free: " << free_mb << " MB / " << total_mb << " MB"
-       << ", Total Segments: " << seg_count << " (" << stored_mb << " MB stored)\n";
+    std::string target_storage;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        target_storage = storage_path_;
+    }
+    uint64_t free_mb = RetentionManager::Instance().GetFreeDiskSpaceBytes(target_storage) / (1024 * 1024);
+    uint64_t total_mb = RetentionManager::Instance().GetTotalDiskSpaceBytes(target_storage) / (1024 * 1024);
+    ss << "  [STORAGE] Disk Free: " << free_mb << " MB / " << total_mb << " MB\n";
     if (free_mb < 500 && total_mb > 0) {
         ss << "      [ALERT] Low storage warning! Less than 500 MB remaining.\n";
     }
@@ -283,6 +429,7 @@ void DeepTracer::CollectPipelineDiagnostics() {
     std::string snapshot = ss.str();
     std::lock_guard<std::mutex> lock(mutex_);
     if (log_file_.is_open()) {
+        RotateLogIfNeededLocked();
         log_file_ << snapshot;
         log_file_.flush();
     }
@@ -310,17 +457,33 @@ void DeepTracer::UninstallCrashHandlers() {
 }
 
 void DeepTracer::HandleCrashSignal(int signum) {
-    const char prefix[] = "[FATAL] Process received signal ";
-    ssize_t w1 = ::write(STDERR_FILENO, prefix, sizeof(prefix) - 1);
+    char header[96] = "[FATAL] Process received fatal signal ";
+    size_t pos = 38;
+    pos += SafeIntToDec(signum, header + pos, sizeof(header) - pos);
+    const char suffix[] = "; dumping stack trace:\n";
+    for (size_t i = 0; i < sizeof(suffix) - 1 && pos + 1 < sizeof(header); ++i) {
+        header[pos++] = suffix[i];
+    }
+
+    ssize_t w1 = ::write(STDERR_FILENO, header, pos);
     (void)w1;
-    // Keep signal-context work minimal. The numeric signal is
-    // available from the process's exit/core-dump information.
-    (void)signum;
-    const char suffix[] = "; terminating.\n";
-    ssize_t w2 = ::write(STDERR_FILENO, suffix, sizeof(suffix) - 1);
-    (void)w2;
-    // Restore the default disposition and re-raise the signal.
-    // Do not call C++ logging, allocate memory, or open files here.
+
+    void* frames[48];
+    int nframes = ::backtrace(frames, 48);
+    if (nframes > 0) {
+        ::backtrace_symbols_fd(frames, nframes, STDERR_FILENO);
+    }
+
+    int cfd = g_crash_fd.load();
+    if (cfd >= 0) {
+        ssize_t w2 = ::write(cfd, header, pos);
+        (void)w2;
+        if (nframes > 0) {
+            ::backtrace_symbols_fd(frames, nframes, cfd);
+        }
+        ::fsync(cfd);
+    }
+
     ::signal(signum, SIG_DFL);
     ::raise(signum);
     _exit(128 + signum);

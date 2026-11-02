@@ -1,6 +1,7 @@
 #include "nvr/live/live_controller.h"
 #include "nvr/ingress/camera_manager.h"
 #include "nvr/recording/recording_scheduler.h"
+#include "nvr/ai/motion_gate.h"
 #include "nvr/common/logger.h"
 #include <algorithm>
 #include <unordered_set>
@@ -50,9 +51,6 @@ void LiveController::TeardownPipeline(std::shared_ptr<ChannelPipeline> pipe) {
     if (!pipe) return;
     pipe->active = false;
     pipe->packet_cv.notify_all();
-    if (pipe->queue) {
-        pipe->queue->Stop();
-    }
     if (pipe->sub_id != 0) {
         StreamBroker::Instance().Unsubscribe(pipe->sub_id);
         pipe->sub_id = 0;
@@ -211,7 +209,7 @@ bool LiveController::SetTileLayout(const std::vector<TileConfig>& tiles) {
     return true;
 }
 
-bool LiveController::ActivateChannel(int channel_id, int tile_index, StreamType stream_type, uint32_t /*target_w*/, uint32_t /*target_h*/) {
+bool LiveController::ActivateChannel(int channel_id, int tile_index, StreamType stream_type, uint32_t target_w, uint32_t target_h) {
     std::unique_lock<std::mutex> layout_lock(layout_mutex_);
 
     if (!CameraManager::Instance().HasCamera(channel_id)) {
@@ -248,13 +246,15 @@ bool LiveController::ActivateChannel(int channel_id, int tile_index, StreamType 
         if (!found) {
             TileTarget tt;
             tt.tile_index = tidx;
+            tt.target_w = target_w;
+            tt.target_h = target_h;
             pipe->targets.push_back(std::move(tt));
         }
         LOG_INFO << "[LiveController] On-demand channel " << channel_id << " target updated on tile " << tidx;
         return true;
     }
 
-    StartChannelPipeline(channel_id, tidx, stream_type, 0, 0);
+    StartChannelPipeline(channel_id, tidx, stream_type, target_w, target_h);
     LOG_INFO << "[LiveController] On-demand channel " << channel_id << " activated on tile " << tidx;
     return true;
 }
@@ -344,6 +344,7 @@ bool LiveController::SetFullscreen(int channel_id) {
     }
 
     std::shared_ptr<ChannelPipeline> old_fs_pipe;
+    DecodedFramePtr seed_frame;
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -372,15 +373,10 @@ bool LiveController::SetFullscreen(int channel_id) {
             it->second->targets.clear();
             it->second->targets.push_back(std::move(tt));
 
-            // Instant Continuity: seed fullscreen tile 0 immediately with last decoded frame
-            DecodedFramePtr seed_frame;
+            // Instant Continuity: capture last decoded frame to render outside mutex_
             {
                 std::lock_guard<std::mutex> f_lock(it->second->frame_mutex);
                 seed_frame = it->second->last_rendered_frame;
-            }
-            auto backend = GetDisplayBackend();
-            if (backend && seed_frame) {
-                backend->RenderTile(0, channel_id, seed_frame);
             }
         }
 
@@ -389,6 +385,13 @@ bool LiveController::SetFullscreen(int channel_id) {
             if (id != channel_id) {
                 pipe->paused.store(true);
             }
+        }
+    }
+
+    if (seed_frame) {
+        auto backend = GetDisplayBackend();
+        if (backend) {
+            backend->RenderTile(0, channel_id, seed_frame);
         }
     }
 
@@ -407,11 +410,12 @@ bool LiveController::SetFullscreen(int channel_id) {
     auto fs_pipe = std::make_shared<ChannelPipeline>();
     fs_pipe->channel_id = channel_id;
     fs_pipe->stream_type = StreamType::MAIN;
-    fs_pipe->decoder = VideoDecoderFactory::Create(CodecType::UNKNOWN, 0, 0, true);
-    fs_pipe->queue = std::make_unique<LiveQueue>(config_.max_queue_depth);
+    CodecType initial_codec = StreamBroker::Instance().GetCachedCodec(channel_id, StreamType::MAIN);
+    fs_pipe->decoder = VideoDecoderFactory::Create(initial_codec, 0, 0, true);
     fs_pipe->active = true;
     fs_pipe->paused = false;
     fs_pipe->awaiting_keyframe = true;
+    fs_pipe->max_packet_depth = std::max<size_t>(4, config_.max_queue_depth * 3);
     {
         TileTarget tt;
         tt.tile_index = 0;
@@ -430,9 +434,6 @@ bool LiveController::SetFullscreen(int channel_id) {
                     std::lock_guard<std::mutex> lk(sub_pipe->packet_mutex);
                     sub_pipe->packet_queue.clear();
                 }
-                if (sub_pipe->queue) {
-                    sub_pipe->queue->Clear();
-                }
                 LOG_INFO << "[LiveController] MAIN stream first frame rendered for channel "
                          << channel_id << "; paused SUB stream and flushed pending queue";
             }
@@ -447,20 +448,27 @@ bool LiveController::SetFullscreen(int channel_id) {
             if (!p || !p->active || p->paused || !pkt || pkt->IsAudio()) return;
 
             // Ingress admission gating: if awaiting keyframe, discard non-keyframes immediately
-            // without taking the mutex or waking the worker thread.
-            if (p->awaiting_keyframe.load(std::memory_order_relaxed) && !pkt->is_keyframe) {
+            // (except parameter sets SPS/PPS/VPS needed by the decoder).
+            if (p->awaiting_keyframe.load(std::memory_order_relaxed) &&
+                !pkt->is_keyframe && !pkt->HasParameterSets()) {
                 return;
             }
 
             std::lock_guard<std::mutex> lk(p->packet_mutex);
             if (p->packet_queue.size() >= p->max_packet_depth) {
-                p->packet_queue.clear();
-                p->awaiting_keyframe.store(true, std::memory_order_release);
-                if (!pkt->is_keyframe) {
-                    return;
+                if (pkt->is_keyframe) {
+                    p->dropped_frames.fetch_add(p->packet_queue.size(), std::memory_order_relaxed);
+                    p->packet_queue.clear();
+                    p->awaiting_keyframe.store(false, std::memory_order_release);
+                } else {
+                    while (p->packet_queue.size() >= p->max_packet_depth) {
+                        p->packet_queue.pop_front();
+                        p->dropped_frames.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
             p->packet_queue.push_back(pkt);
+            p->enqueued_frames.fetch_add(1, std::memory_order_relaxed);
             p->packet_cv.notify_one();
         }
     );
@@ -579,7 +587,6 @@ void LiveController::Stop() {
         for (auto& [id, pipe] : pipelines_) {
             pipe->active = false;
             pipe->packet_cv.notify_all();
-            if (pipe->queue) pipe->queue->Stop();
             old_pipes.push_back(std::move(pipe));
         }
         pipelines_.clear();
@@ -611,7 +618,9 @@ void LiveController::SetupGridPipelines() {
     if (channels_to_use.empty()) {
         auto cams = CameraManager::Instance().GetCameras();
         for (const auto& c : cams) {
-            channels_to_use.push_back(c.id);
+            if (c.enabled) {
+                channels_to_use.push_back(c.id);
+            }
         }
     }
 
@@ -624,6 +633,8 @@ void LiveController::SetupGridPipelines() {
             int cols = (custom_cols > 0) ? custom_cols : 2;
             int rows = (custom_rows > 0) ? custom_rows : 2;
             int max_tiles = cols * rows;
+            uint32_t tw = (cols > 0) ? (1920 / cols) : 640;
+            uint32_t th = (rows > 0) ? (1080 / rows) : 360;
 
             int tile_idx = 0;
             for (int ch : channels_to_use) {
@@ -632,11 +643,18 @@ void LiveController::SetupGridPipelines() {
                 dt.tile_index = tile_idx++;
                 dt.channel_id = ch;
                 dt.stream_type = StreamType::SUB;
+                dt.target_w = tw;
+                dt.target_h = th;
                 desired_tiles.push_back(dt);
             }
         }
     } else {
         int max_tiles = static_cast<int>(layout);
+        uint32_t tw = 640, th = 360;
+        if (layout == LiveGridLayout::SINGLE) { tw = 1920; th = 1080; }
+        else if (layout == LiveGridLayout::GRID_4) { tw = 960; th = 540; }
+        else if (layout == LiveGridLayout::GRID_6) { tw = 640; th = 540; }
+        else if (layout == LiveGridLayout::GRID_8) { tw = 480; th = 540; }
 
         // Deduplicate channels for preset grids so distinct cameras fill each tile
         std::vector<int> distinct_channels;
@@ -654,6 +672,8 @@ void LiveController::SetupGridPipelines() {
             dt.tile_index = tile_idx++;
             dt.channel_id = ch;
             dt.stream_type = StreamType::SUB;
+            dt.target_w = tw;
+            dt.target_h = th;
             desired_tiles.push_back(dt);
         }
     }
@@ -748,6 +768,8 @@ void LiveController::ReconcilePipelines(const std::vector<TileConfig>& desired_t
         for (const auto& dt : d_tiles) {
             TileTarget tt;
             tt.tile_index = dt.tile_index;
+            tt.target_w = dt.target_w;
+            tt.target_h = dt.target_h;
             new_targets.push_back(std::move(tt));
             if (std::find(old_indices.begin(), old_indices.end(), dt.tile_index) == old_indices.end()) {
                 newly_assigned_tiles.push_back(dt.tile_index);
@@ -820,15 +842,18 @@ void LiveController::StartChannelPipelineMulti(int channel_id, StreamType stream
     auto pipe = std::make_shared<ChannelPipeline>();
     pipe->channel_id = channel_id;
     pipe->stream_type = stream_type;
-    pipe->decoder = VideoDecoderFactory::Create(CodecType::UNKNOWN, 0, 0, true);
-    pipe->queue = std::make_unique<LiveQueue>(config_.max_queue_depth);
+    CodecType initial_codec = StreamBroker::Instance().GetCachedCodec(channel_id, stream_type);
+    pipe->decoder = VideoDecoderFactory::Create(initial_codec, 0, 0, true);
     pipe->active = true;
     pipe->paused = false;
     pipe->awaiting_keyframe = true;
+    pipe->max_packet_depth = std::max<size_t>(4, config_.max_queue_depth * 3);
 
     for (const auto& t : targets) {
         TileTarget tt;
         tt.tile_index = t.tile_index;
+        tt.target_w = t.target_w;
+        tt.target_h = t.target_h;
         pipe->targets.push_back(std::move(tt));
     }
 
@@ -840,20 +865,27 @@ void LiveController::StartChannelPipelineMulti(int channel_id, StreamType stream
             if (!p || !p->active || p->paused || !pkt || pkt->IsAudio()) return;
 
             // Ingress admission gating: if awaiting keyframe, discard non-keyframes immediately
-            // without taking the mutex or waking the worker thread.
-            if (p->awaiting_keyframe.load(std::memory_order_relaxed) && !pkt->is_keyframe) {
+            // (except parameter sets SPS/PPS/VPS needed by the decoder).
+            if (p->awaiting_keyframe.load(std::memory_order_relaxed) &&
+                !pkt->is_keyframe && !pkt->HasParameterSets()) {
                 return;
             }
 
             std::lock_guard<std::mutex> lk(p->packet_mutex);
             if (p->packet_queue.size() >= p->max_packet_depth) {
-                p->packet_queue.clear();
-                p->awaiting_keyframe.store(true, std::memory_order_release);
-                if (!pkt->is_keyframe) {
-                    return;
+                if (pkt->is_keyframe) {
+                    p->dropped_frames.fetch_add(p->packet_queue.size(), std::memory_order_relaxed);
+                    p->packet_queue.clear();
+                    p->awaiting_keyframe.store(false, std::memory_order_release);
+                } else {
+                    while (p->packet_queue.size() >= p->max_packet_depth) {
+                        p->packet_queue.pop_front();
+                        p->dropped_frames.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
             p->packet_queue.push_back(pkt);
+            p->enqueued_frames.fetch_add(1, std::memory_order_relaxed);
             p->packet_cv.notify_one();
         }
     );
@@ -887,9 +919,14 @@ void LiveController::ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline
 
         if (!pkt) continue;
 
-        // L7 Resynchronization: discard non-keyframes when dependency chain is broken
+        // L7 Resynchronization: discard non-keyframes when dependency chain is broken,
+        // while allowing parameter sets (SPS/PPS/VPS) to be cached by the decoder.
         if (pipeline->awaiting_keyframe.load()) {
             if (!pkt->is_keyframe) {
+                if (pkt->HasParameterSets() && pipeline->decoder) {
+                    DecodedFramePtr unused_frame;
+                    pipeline->decoder->Decode(pkt, unused_frame);
+                }
                 continue;
             }
             if (pipeline->decoder) {
@@ -905,23 +942,22 @@ void LiveController::ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline
         if (pipeline->decoder) {
             bool decode_ok = pipeline->decoder->Decode(pkt, frame);
             if (!decode_ok) {
-                pipeline->awaiting_keyframe.store(true);
-                pipeline->decoder->Flush();
+                if (pipeline->decoder->HadDecodeError()) {
+                    pipeline->awaiting_keyframe.store(true);
+                    pipeline->decoder->Flush();
+                }
                 continue;
             }
         }
 
         if (frame) {
+            // Software motion gate evaluation fallback
+            MotionGateManager::Instance().ProcessFrame(pipeline->channel_id, frame);
+
             // Discard frame if pipeline is paused to avoid stale overwrites
             if (pipeline->paused.load(std::memory_order_relaxed)) {
-                if (pipeline->queue) {
-                    pipeline->queue->RecordDirect(true);
-                }
+                pipeline->dropped_frames.fetch_add(1, std::memory_order_relaxed);
                 continue;
-            }
-
-            if (pipeline->queue) {
-                pipeline->queue->RecordDirect(false);
             }
 
             // Record native stream resolution
@@ -954,6 +990,10 @@ void LiveController::ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline
                 {
                     std::lock_guard<std::mutex> f_lock(pipeline->frame_mutex);
                     pipeline->last_rendered_frame = frame;
+                }
+                {
+                    std::lock_guard<std::mutex> lf_lock(latest_frames_mutex_);
+                    latest_frames_[pipeline->channel_id] = frame;
                 }
 
                 if (!pipeline->first_frame_rendered.exchange(true)) {
@@ -1009,12 +1049,12 @@ std::vector<LiveTileMetrics> LiveController::GetTileMetrics() const {
         m.channel_id = fullscreen_pipeline_->channel_id;
         m.tile_index = 0;
         m.stream_type = StreamType::MAIN;
-        uint32_t sw = fullscreen_pipeline_->stream_width.load();
-        uint32_t sh = fullscreen_pipeline_->stream_height.load();
-        m.width = (sw > 0) ? sw : 1920;
-        m.height = (sh > 0) ? sh : 1080;
-        m.enqueued_frames = fullscreen_pipeline_->queue ? fullscreen_pipeline_->queue->GetTotalEnqueued() : 0;
-        m.dropped_frames = fullscreen_pipeline_->queue ? fullscreen_pipeline_->queue->GetTotalDropped() : 0;
+        uint32_t fw = fullscreen_pipeline_->stream_width.load();
+        uint32_t fh = fullscreen_pipeline_->stream_height.load();
+        m.width = (fw > 0) ? fw : 1920;
+        m.height = (fh > 0) ? fh : 1080;
+        m.enqueued_frames = fullscreen_pipeline_->enqueued_frames.load(std::memory_order_relaxed);
+        m.dropped_frames = fullscreen_pipeline_->dropped_frames.load(std::memory_order_relaxed);
         m.rendered_frames = fullscreen_pipeline_->rendered_count.load();
         m.estimated_fps = fullscreen_pipeline_->current_fps;
         m.is_fullscreen = true;
@@ -1037,12 +1077,15 @@ std::vector<LiveTileMetrics> LiveController::GetTileMetrics() const {
             active_targets = pipe->targets;
         }
 
-        uint32_t sw = pipe->stream_width.load();
-        uint32_t sh = pipe->stream_height.load();
-        uint32_t def_w = (pipe->stream_type == StreamType::MAIN) ? 1920 : 640;
-        uint32_t def_h = (pipe->stream_type == StreamType::MAIN) ? 1080 : 360;
-        uint32_t actual_w = (sw > 0) ? sw : def_w;
-        uint32_t actual_h = (sh > 0) ? sh : def_h;
+        uint32_t actual_w = pipe->stream_width.load();
+        uint32_t actual_h = pipe->stream_height.load();
+        if (actual_w == 0) {
+            if (current_layout_ == LiveGridLayout::SINGLE) { actual_w = 1920; actual_h = 1080; }
+            else if (current_layout_ == LiveGridLayout::GRID_4) { actual_w = 960; actual_h = 540; }
+            else if (current_layout_ == LiveGridLayout::GRID_6) { actual_w = 640; actual_h = 540; }
+            else if (current_layout_ == LiveGridLayout::GRID_8) { actual_w = 480; actual_h = 540; }
+            else { actual_w = 640; actual_h = 360; }
+        }
 
         if (active_targets.empty()) {
             LiveTileMetrics m;
@@ -1051,8 +1094,8 @@ std::vector<LiveTileMetrics> LiveController::GetTileMetrics() const {
             m.stream_type = pipe->stream_type;
             m.width = actual_w;
             m.height = actual_h;
-            m.enqueued_frames = pipe->queue ? pipe->queue->GetTotalEnqueued() : 0;
-            m.dropped_frames = pipe->queue ? pipe->queue->GetTotalDropped() : 0;
+            m.enqueued_frames = pipe->enqueued_frames.load(std::memory_order_relaxed);
+            m.dropped_frames = pipe->dropped_frames.load(std::memory_order_relaxed);
             m.rendered_frames = rendered;
             m.estimated_fps = pipe->current_fps;
             m.is_fullscreen = false;
@@ -1064,10 +1107,10 @@ std::vector<LiveTileMetrics> LiveController::GetTileMetrics() const {
                 m.channel_id = pipe->channel_id;
                 m.tile_index = target.tile_index;
                 m.stream_type = pipe->stream_type;
-                m.width = actual_w;
-                m.height = actual_h;
-                m.enqueued_frames = pipe->queue ? pipe->queue->GetTotalEnqueued() : 0;
-                m.dropped_frames = pipe->queue ? pipe->queue->GetTotalDropped() : 0;
+                m.width = (target.target_w > 0) ? target.target_w : actual_w;
+                m.height = (target.target_h > 0) ? target.target_h : actual_h;
+                m.enqueued_frames = pipe->enqueued_frames.load(std::memory_order_relaxed);
+                m.dropped_frames = pipe->dropped_frames.load(std::memory_order_relaxed);
                 m.rendered_frames = rendered;
                 m.estimated_fps = pipe->current_fps;
                 m.is_fullscreen = false;
@@ -1087,12 +1130,12 @@ LiveTileMetrics LiveController::GetChannelMetrics(int channel_id) const {
     if (fullscreen_channel_id_ == channel_id && fullscreen_pipeline_) {
         m.tile_index = 0;
         m.stream_type = StreamType::MAIN;
-        uint32_t sw = fullscreen_pipeline_->stream_width.load();
-        uint32_t sh = fullscreen_pipeline_->stream_height.load();
-        m.width = (sw > 0) ? sw : 1920;
-        m.height = (sh > 0) ? sh : 1080;
-        m.enqueued_frames = fullscreen_pipeline_->queue ? fullscreen_pipeline_->queue->GetTotalEnqueued() : 0;
-        m.dropped_frames = fullscreen_pipeline_->queue ? fullscreen_pipeline_->queue->GetTotalDropped() : 0;
+        uint32_t fw = fullscreen_pipeline_->stream_width.load();
+        uint32_t fh = fullscreen_pipeline_->stream_height.load();
+        m.width = (fw > 0) ? fw : 1920;
+        m.height = (fh > 0) ? fh : 1080;
+        m.enqueued_frames = fullscreen_pipeline_->enqueued_frames.load(std::memory_order_relaxed);
+        m.dropped_frames = fullscreen_pipeline_->dropped_frames.load(std::memory_order_relaxed);
         m.rendered_frames = fullscreen_pipeline_->rendered_count.load();
         m.estimated_fps = fullscreen_pipeline_->current_fps;
         m.is_fullscreen = true;
@@ -1113,16 +1156,21 @@ LiveTileMetrics LiveController::GetChannelMetrics(int channel_id) const {
                 has_target = true;
             }
         }
-        uint32_t sw = pipe->stream_width.load();
-        uint32_t sh = pipe->stream_height.load();
-        uint32_t def_w = (pipe->stream_type == StreamType::MAIN) ? 1920 : 640;
-        uint32_t def_h = (pipe->stream_type == StreamType::MAIN) ? 1080 : 360;
         m.tile_index = has_target ? first_target.tile_index : 0;
         m.stream_type = pipe->stream_type;
-        m.width = (sw > 0) ? sw : def_w;
-        m.height = (sh > 0) ? sh : def_h;
-        m.enqueued_frames = pipe->queue ? pipe->queue->GetTotalEnqueued() : 0;
-        m.dropped_frames = pipe->queue ? pipe->queue->GetTotalDropped() : 0;
+        uint32_t cw = (has_target && first_target.target_w > 0) ? first_target.target_w : pipe->stream_width.load();
+        uint32_t ch_h = (has_target && first_target.target_h > 0) ? first_target.target_h : pipe->stream_height.load();
+        if (cw == 0) {
+            if (current_layout_ == LiveGridLayout::SINGLE) { cw = 1920; ch_h = 1080; }
+            else if (current_layout_ == LiveGridLayout::GRID_4) { cw = 960; ch_h = 540; }
+            else if (current_layout_ == LiveGridLayout::GRID_6) { cw = 640; ch_h = 540; }
+            else if (current_layout_ == LiveGridLayout::GRID_8) { cw = 480; ch_h = 540; }
+            else { cw = 640; ch_h = 360; }
+        }
+        m.width = cw;
+        m.height = ch_h;
+        m.enqueued_frames = pipe->enqueued_frames.load(std::memory_order_relaxed);
+        m.dropped_frames = pipe->dropped_frames.load(std::memory_order_relaxed);
         m.rendered_frames = pipe->rendered_count.load();
         m.estimated_fps = pipe->current_fps;
         m.is_fullscreen = false;
@@ -1132,6 +1180,53 @@ LiveTileMetrics LiveController::GetChannelMetrics(int channel_id) const {
         m.state = ComputeTileState(is_online, m.rendered_frames, pipe->last_frame_time_ms.load(std::memory_order_relaxed));
     }
     return m;
+}
+
+DecodedFramePtr LiveController::GetLatestFrame(int channel_id) const {
+    std::shared_ptr<ChannelPipeline> pipe;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (fullscreen_channel_id_ == channel_id && fullscreen_pipeline_) {
+            pipe = fullscreen_pipeline_;
+        } else {
+            auto it = pipelines_.find(channel_id);
+            if (it != pipelines_.end()) {
+                pipe = it->second;
+            }
+        }
+    }
+    if (pipe) {
+        std::lock_guard<std::mutex> f_lock(pipe->frame_mutex);
+        if (pipe->last_rendered_frame) {
+            return pipe->last_rendered_frame;
+        }
+    }
+    std::lock_guard<std::mutex> lf_lock(latest_frames_mutex_);
+    auto it = latest_frames_.find(channel_id);
+    if (it != latest_frames_.end()) {
+        return it->second;
+    }
+    return nullptr;
+}
+
+void LiveController::RenderDecodedFrame(DecodedFramePtr frame) {
+    if (!frame) return;
+    std::shared_ptr<ChannelPipeline> pipe;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = pipelines_.find(frame->channel_id);
+        if (it != pipelines_.end()) {
+            pipe = it->second;
+        }
+    }
+    if (pipe) {
+        std::lock_guard<std::mutex> f_lock(pipe->frame_mutex);
+        pipe->last_rendered_frame = frame;
+    }
+    {
+        std::lock_guard<std::mutex> lf_lock(latest_frames_mutex_);
+        latest_frames_[frame->channel_id] = frame;
+    }
 }
 
 } // namespace nvr

@@ -28,7 +28,7 @@ The backend has four main jobs:
 |       ( Recording Engine )                 ( Hardware Decoder )                   |
 |                 |                               /          \                      |
 |                 v                              v            v                     |
-|       [ Hard Drive / SQLite ]            [ Live Display ]  ( AI Engine: NPU )     |
+|       [ Hard Drive / Storage ]           [ Live Display ]  ( AI Engine: NPU )     |
 |                                                 |                  |              |
 |                                                 |                  v              |
 |                                                 |           [ Alerts / Rules ]    |
@@ -64,7 +64,7 @@ nvr-cpp/
 │   ├── notifications/          # Email and hardware buzzer alerts
 │   ├── playback/               # Recorded video player and clip export
 │   ├── recording/              # Safe file segmentation and writing
-│   ├── storage/                # SQLite database and disk space manager
+│   ├── storage/                # Disk space and retention manager
 │   └── voice/                  # Microphone input and voice commands
 └── src/                        # C++ source implementations (.cpp)
     ├── ai/
@@ -96,7 +96,7 @@ Connects to IP cameras over the local network and unpacks video packets.
 | :--- | :--- | :--- |
 | `include/nvr/ingress/camera_manager.h`<br>`src/ingress/camera_manager.cpp` | Manages the list of all connected cameras. | Keeps track of who is online, detects if a camera cable is unplugged, and automatically reconnects when it comes back. |
 | `include/nvr/ingress/stream_session.h`<br>`src/ingress/stream_session.cpp` | Handles the single network RTSP connection per camera. | Pulls both the 1080p MAIN stream and the 360p SUB stream over **one** network connection so the camera is never overloaded. |
-| `include/nvr/ingress/onvif_client.h`<br>`src/ingress/onvif_client.cpp` | Scans the local network for cameras using ONVIF. | Allows one-click camera discovery without typing IP addresses manually, and sends Pan-Tilt-Zoom (PTZ) motor commands. |
+| `include/nvr/ingress/onvif_client.h`<br>`src/ingress/onvif_client.cpp` | Scans the local network for cameras using ONVIF. | Allows one-click camera discovery without typing IP addresses manually, and configures hardware video encoders (FPS, bitrate, resolution). |
 | `include/nvr/ingress/rtp_depacketizer.h`<br>`src/ingress/rtp_depacketizer.cpp` | Unpacks raw network packets into clean video frames. | Camera video arrives chopped up into small network packets (RTP). This reassembles them into clean H.264/H.265 frames. |
 
 ---
@@ -161,15 +161,12 @@ Finds people, cars, and security violations using the dedicated AI accelerator c
 
 ---
 
-### 7. Storage: Database & Disk Management
-Keeps an index of all videos and manages hard drive space.
+### 7. Storage: Direct Disk Retention Management
+Manages hard drive space and FIFO footage pruning directly on the filesystem.
 
 | File Path | What It Does (In Plain English) | Why We Need It |
 | :--- | :--- | :--- |
-| `include/nvr/storage/database_manager.h`<br>`src/storage/database_manager.cpp` | SQLite database connection. | Uses Write-Ahead Logging (WAL) mode for fast, crash-safe saving and querying of recording and event logs. |
-| `include/nvr/storage/segment_index.h`<br>`src/storage/segment_index.cpp` | Recording index table. | Stores the start time, end time, and file path of every recorded `.mp4` file so the timeline can find them instantly. |
-| `include/nvr/storage/event_index.h`<br>`src/storage/event_index.cpp` | AI event search index. | Stores every detection alert (camera, timestamp, object type, bounding box coordinates) for quick searching. |
-| `include/nvr/storage/retention_manager.h`<br>`src/storage/retention_manager.cpp` | Disk space cleaner. | Monitors free hard drive space. When the drive is 90% full, deletes the oldest non-event video files so the NVR never stops recording. |
+| `include/nvr/storage/retention_manager.h`<br>`src/storage/retention_manager.cpp` | Disk space cleaner. | Monitors free hard drive space. When the drive is 90% full or age exceeds limit, prunes oldest video and thumbnail files directly via filesystem scan so the NVR never stops recording. |
 
 ---
 
@@ -189,8 +186,7 @@ The central command desk of the NVR. All actions go through here.
 | File Path | What It Does (In Plain English) | Why We Need It |
 | :--- | :--- | :--- |
 | `include/nvr/dispatcher/command_dispatcher.h`<br>`src/dispatcher/command_dispatcher.cpp` | Central command router. | The single place where all requests (from UI, Web API, or Voice) are received, validated, and executed. |
-| `include/nvr/dispatcher/commands.h` | List of all allowed commands. | Defines standard JSON command formats (e.g. `START_RECORDING`, `SET_LAYOUT`, `ADD_CAMERA`, `PTZ_MOVE`). |
-| `include/nvr/dispatcher/rbac_validator.h`<br>`src/dispatcher/rbac_validator.cpp` | Security permission checker. | Checks user login credentials and roles (Admin vs. Viewer) before allowing any command to run. |
+| `include/nvr/dispatcher/commands.h` | List of all allowed commands. | Defines standard JSON command formats (e.g. `recording.start`, `cameras.list`, `onvif.encoder.set`). |
 
 ---
 
@@ -199,8 +195,7 @@ Allows phones, web browsers, and external software to communicate with the NVR.
 
 | File Path | What It Does (In Plain English) | Why We Need It |
 | :--- | :--- | :--- |
-| `include/nvr/api/rest_server.h`<br>`src/api/rest_server.cpp` | Embedded web server (HTTP REST). | Lets remote web browsers view camera lists, check system status, and change settings. |
-| `include/nvr/api/websocket_server.h`<br>`src/api/websocket_server.cpp` | Real-time WebSocket server. | Pushes live AI alert notifications immediately to connected web browsers or mobile apps without polling. |
+| `include/nvr/api/rest_server.h`<br>`src/api/rest_server.cpp` | Embedded HTTP/WebSocket server (RFC 6455). | Serves web assets, control plane REST endpoints, and zero-transcode live video streams without polling. |
 
 ---
 
@@ -266,9 +261,6 @@ segmenter.cpp (splits stream into 1-minute chunks on I-frames)
       │
       ▼
 atomic_writer.cpp (writes video.tmp -> flushes -> renames to video.mp4)
-      │
-      ▼
-segment_index.cpp (logs file path and timestamps into SQLite database)
 ```
 
 ### 2. The Live View Pipeline (Zero-Lag Display)
@@ -310,10 +302,7 @@ object_tracker.cpp (tracks person/car across frames with persistent ID)
       ▼
 rule_engine.cpp (checks tripwires and restricted zones)
       │
-      ▼
-event_index.cpp (saves event to database)
-      │
-      ├──> websocket_server.cpp (pushes instant alert to UI and phone)
+      ├──> rest_server.cpp (pushes instant alert to UI and phone via WebSocket)
       └──> notification_manager.cpp (sends email / triggers buzzer)
 ```
 
@@ -343,13 +332,9 @@ Sent to UI Video Surface -> Screen shows recorded video
 
 ```bash
 # 1. Compile with Makefile or CMake
-make -j$(nproc)
+make clean && make -j$(nproc)
 
-# 2. Run automated test suites
-./bin/test_recording_pipeline
-./bin/test_live_pipeline
-
-# 3. Start the backend service
+# 2. Start the production backend service with live camera feeds
 ./bin/nvr_server
 ```
 

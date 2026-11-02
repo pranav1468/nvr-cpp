@@ -1,63 +1,75 @@
 {
-  "system": {
-    "device_name": "NVR_Main",
-    "log_level": "info",
-    "max_channels": 8
-  },
-  "storage": {
-    "recording_path": "./recordings",
-    "database_path": "./nvr_metadata.db",
-    "segment_duration_seconds": 60,
-    "min_free_space_mb": 512,
-    "max_retention_days": 14
-  },
-  "live": {
-    "grid_layout": 4,
-    "max_queue_depth": 2,
-    "drop_stale_frames": true
-  },
-  "ai": {
-    "enabled": false,
-    "max_concurrent_models": 2,
-    "motion_threshold": 0.05
-  },
   "api": {
+    "bind_address": "0.0.0.0",
     "enabled": true,
     "port": 8080,
     "web_root": "./web"
   },
   "cameras": [
     {
-      "id": 1,
-      "name": "Live_Cam_1",
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
       "enabled": true,
-      "record_mode": 1
+      "id": 1,
+      "name": "Camera 01",
+      "onvif_password": "Admin$123",
+      "onvif_username": "admin",
+      "onvif_xaddr": "http://172.24.103.221/onvif/device_service",
+      "reconnect_delay_sec": 3,
+      "record_mode": 1,
+      "rtsp_url": "rtsp://admin:Admin$123@172.24.103.221:554/video/live?channel=1&subtype=0",
+      "sub_rtsp_url": "rtsp://admin:Admin$123@172.24.103.221:554/video/live?channel=1&subtype=1"
     },
     {
+      "enabled": true,
       "id": 2,
-      "name": "Live_Cam_2",
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
-      "enabled": false,
-      "record_mode": 1
+      "name": "Camera 02",
+      "onvif_password": "Admin$123",
+      "onvif_username": "admin",
+      "onvif_xaddr": "http://172.24.103.172/onvif/device_service",
+      "reconnect_delay_sec": 3,
+      "record_mode": 1,
+      "rtsp_url": "rtsp://admin:Admin$123@172.24.103.172:554/video/live?channel=1&subtype=0",
+      "sub_rtsp_url": "rtsp://admin:Admin$123@172.24.103.172:554/video/live?channel=1&subtype=1"
     },
     {
+      "enabled": true,
       "id": 3,
-      "name": "Live_Cam_3",
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
-      "enabled": false,
-      "record_mode": 1
+      "name": "Camera 03",
+      "onvif_password": "Admin@123",
+      "onvif_username": "admin",
+      "onvif_xaddr": "http://172.24.103.220:8090/onvif/device_service",
+      "reconnect_delay_sec": 3,
+      "record_mode": 1,
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.220:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.220:554/substream"
     },
     {
+      "enabled": true,
       "id": 4,
-      "name": "Live_Cam_4",
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.240:554/substream",
-      "enabled": false,
-      "record_mode": 1
+      "name": "Camera 04",
+      "onvif_password": "Admin@123",
+      "onvif_username": "admin",
+      "onvif_xaddr": "http://172.24.103.210:8090/onvif/device_service",
+      "reconnect_delay_sec": 3,
+      "record_mode": 1,
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.210:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.210:554/substream"
     }
-  ]
+  ],
+  "live": {
+    "drop_stale_frames": true,
+    "grid_layout": 4,
+    "max_queue_depth": 2
+  },
+  "storage": {
+    "max_retention_days": 14,
+    "min_free_space_mb": 512,
+    "recording_path": "./recordings",
+    "segment_duration_seconds": 60
+  },
+  "system": {
+    "device_name": "NVR_Main",
+    "log_dir": "logs",
+    "log_level": "info",
+    "max_channels": 8
+  }
 }

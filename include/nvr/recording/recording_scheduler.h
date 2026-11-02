@@ -8,16 +8,11 @@
 #include <condition_variable>
 #include <atomic>
 #include <chrono>
+#include <string>
+#include <unordered_map>
+#include "3rdparty/nlohmann/json.hpp"
 
 namespace nvr {
-
-struct ScheduleTimeWindow {
-    int start_hour{0};       // 0..23
-    int start_minute{0};     // 0..59
-    int end_hour{24};        // 0..24
-    int end_minute{0};       // 0..59
-    uint8_t days_mask{0x7F}; // Bit 0=Sun, 1=Mon, ..., 6=Sat (0x7F = all 7 days)
-};
 
 class RecordingScheduler {
 public:
@@ -45,15 +40,22 @@ public:
     void SetPostRollSeconds(int channel_id, int seconds);
     void SetPreRollSeconds(int channel_id, int seconds);
 
-    // Schedule configuration for RecordMode::SCHEDULED
-    void SetSchedule(int channel_id, const std::vector<ScheduleTimeWindow>& schedule);
-    bool IsScheduleActiveNow(int channel_id, int64_t now_ms) const;
+    // Event control for RecordMode::EVENT_ONLY and SCHEDULED event slots
+    void SetEventActive(int channel_id, const std::string& event_type, bool active);
+    void TriggerEventRecording(int channel_id, const std::string& event_type, int pre_roll_sec = 5, int post_roll_sec = 10);
+    bool IsEventActive(int channel_id) const;
+    std::string GetCurrentEventType(int channel_id) const;
+
 
     // Enqueue packet asynchronously from StreamBroker ingress callback
     void EnqueuePacket(int channel_id, const MediaPacketPtr& packet);
 
     // Flush and synchronize channel worker queue
     void FlushChannel(int channel_id);
+
+    // Schedule control & query
+    nlohmann::json GetChannelSchedule(int channel_id) const;
+    bool SetChannelSchedule(int channel_id, const nlohmann::json& schedule_payload);
 
 private:
     RecordingScheduler() = default;
@@ -82,14 +84,23 @@ private:
         int post_roll_seconds{5};
         int preroll_seconds{5};
         bool is_in_motion_recording{false};
+
+        // Event mode state machine
+        std::atomic<bool> event_active{false};
+        std::atomic<bool> has_event_occurred{false};
+        std::chrono::steady_clock::time_point last_event_time;
+        std::string current_event_type;
+        mutable std::mutex event_mutex;
+        bool is_in_event_recording{false};
+
+        // In-memory rolling pre-roll buffer (used as fallback or worker staging)
         std::mutex preroll_mutex;
         std::deque<MediaPacketPtr> preroll_buffer;
         size_t preroll_bytes{0};
         const size_t max_preroll_bytes{8 * 1024 * 1024}; // 8 MB bound
         const size_t max_preroll_packets{150};
 
-        // Scheduled mode configuration
-        std::vector<ScheduleTimeWindow> schedule;
+
     };
 
     void ChannelWorkerLoop(std::shared_ptr<ChannelRecordState> state);
@@ -97,6 +108,9 @@ private:
     StorageConfig storage_config_;
     mutable std::mutex mutex_;
     std::unordered_map<int, std::shared_ptr<ChannelRecordState>> channels_;
+
+    std::unordered_map<int, std::pair<bool, std::string>> channel_event_states_;
+    std::unordered_map<int, nlohmann::json> channel_schedules_;
 };
 
 } // namespace nvr

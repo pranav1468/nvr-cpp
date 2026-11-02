@@ -1,40 +1,73 @@
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
+import "components"
 
+/**
+ * Surveillance Matrix Video Tile
+ * Exact pixel replica of web console video stage (web_live_actual.png)
+ */
 Rectangle {
     id: root
 
     // Public Properties
     property int tileIndex: 0
     property int channelId: 1
-    property string cameraName: "Camera " + channelId
+    property string cameraName: "Empty"
     property string streamType: "SUB" // "SUB" or "MAIN"
-    property int resolutionWidth: 640
-    property int resolutionHeight: 360
+    property int resolutionWidth: 360
+    property int resolutionHeight: 0
     property double fps: 25.0
     property int droppedFrames: 0
     property bool isRecording: false
-    property string status: "STREAMING" // "STREAMING", "CONNECTING", "STALLED", "OFFLINE"
-    property bool isOnline: status !== "OFFLINE"
+    property string status: "STANDBY" // "STREAMING", "STANDBY", "CONNECTING", "OFFLINE"
+    property bool isOnline: (typeof LiveBridge !== "undefined" && LiveBridge && LiveBridge["online" + root.tileIndex] !== undefined) ? LiveBridge["online" + root.tileIndex] : (status === "STREAMING")
     property bool isFullscreen: false
-    property int frameRevision: 0
+    property int frameRevision: (typeof LiveBridge !== "undefined" && LiveBridge && LiveBridge["rev" + root.tileIndex] !== undefined) ? LiveBridge["rev" + root.tileIndex] : 0
+    property bool isSelected: false
+    property bool hwAccelerated: (typeof LiveBridge !== "undefined" && LiveBridge && LiveBridge.hasHardwareGlSink) ? true : false
 
     // Signals
     signal fullscreenRequested(int channelId)
     signal tileSelected(int channelId)
 
-    color: "#0a0f1d"
-    border.color: mouseArea.containsMouse ? "#38bdf8" : "#1e293b"
-    border.width: mouseArea.containsMouse ? 2 : 1
-    radius: 6
+    color: Theme.bgTileStage
+    border.color: isSelected ? Theme.accentPrimary : (mouseArea.containsMouse ? Qt.rgba(0.07, 0.4, 0.83, 0.6) : Qt.rgba(0.88, 0.91, 0.94, 0.15))
+    border.width: isSelected ? 2 : (mouseArea.containsMouse ? 2 : 1)
+    radius: 12
     clip: true
+
+    // 1-second clock timer for video timestamp matching web console
+    property string liveClockText: ""
+    Timer {
+        interval: 1000
+        running: true
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: {
+            var now = new Date();
+            var y = now.getFullYear();
+            var m = ("0" + (now.getMonth() + 1)).slice(-2);
+            var d = ("0" + now.getDate()).slice(-2);
+            var hh = ("0" + now.getHours()).slice(-2);
+            var mm = ("0" + now.getMinutes()).slice(-2);
+            var ss = ("0" + now.getSeconds()).slice(-2);
+            root.liveClockText = y + "-" + m + "-" + d + " " + hh + ":" + mm + ":" + ss;
+        }
+    }
 
     // Video Canvas / Image Surface
     Item {
         id: videoSurface
         anchors.fill: parent
-        anchors.margins: 1
+
+        Loader {
+            id: hwSurfaceLoader
+            anchors.fill: parent
+            active: (typeof LiveBridge !== "undefined" && LiveBridge && LiveBridge.hasHardwareGlSink) ? true : false
+            source: active ? "components/HardwareGlVideoSurface.qml" : ""
+            visible: active && root.isOnline
+        }
 
         Image {
             id: videoFrame
@@ -42,225 +75,232 @@ Rectangle {
             fillMode: Image.PreserveAspectFit
             cache: false
             asynchronous: true
-            source: (root.isOnline || root.frameRevision > 0) ? "image://live/" + root.tileIndex + "/" + root.frameRevision : ""
-            visible: root.isOnline || (root.status !== "OFFLINE" && root.frameRevision > 0)
+            source: (root.isOnline && root.frameRevision > 0 && !hwSurfaceLoader.active) ? "image://live/" + root.tileIndex + "/" + root.frameRevision : ""
+            visible: root.isOnline && root.frameRevision > 0 && !hwSurfaceLoader.active
         }
 
-        // Offline / Connecting Placeholder
-        Rectangle {
+        // Empty / Standby Placeholder State (Matches web console)
+        Item {
             anchors.fill: parent
-            color: "#070b14"
-            visible: root.status === "OFFLINE" || (!root.isOnline && root.frameRevision === 0) || (root.status === "CONNECTING" && root.frameRevision === 0)
+            visible: !root.isOnline || (root.frameRevision === 0 && !hwSurfaceLoader.active)
 
             ColumnLayout {
                 anchors.centerIn: parent
-                spacing: 8
+                spacing: root.width < 220 ? 4 : 8
+
+                AppIcon {
+                    name: "video"
+                    size: root.width < 220 ? 22 : 32
+                    color: Qt.rgba(1, 1, 1, 0.35)
+                    strokeWidth: 1.5
+                    Layout.alignment: Qt.AlignHCenter
+                }
 
                 Text {
-                    text: root.status === "CONNECTING" ? "CONNECTING..." : "SIGNAL LOST"
-                    color: root.status === "CONNECTING" ? "#38bdf8" : "#ef4444"
-                    font.pixelSize: 13
+                    text: "NO CAMERA ON THIS CHANNEL"
+                    color: Qt.rgba(1, 1, 1, 0.75)
+                    font.pixelSize: root.width < 220 ? 9 : 11
                     font.bold: true
-                    font.family: "Monospace"
+                    font.family: Theme.fontDisplay
                     Layout.alignment: Qt.AlignHCenter
                 }
 
                 Text {
-                    text: root.status === "CONNECTING" ? ("Connecting Channel " + root.channelId + "...") : ("Reconnecting Channel " + root.channelId + "...")
-                    color: "#64748b"
-                    font.pixelSize: 11
-                    Layout.alignment: Qt.AlignHCenter
-                }
-            }
-        }
-
-        // Subtle Stalled Overlay Badge (last rendered frame remains visible underneath)
-        Rectangle {
-            anchors.centerIn: parent
-            width: stalledCol.implicitWidth + 24
-            height: stalledCol.implicitHeight + 16
-            color: Qt.rgba(0.04, 0.07, 0.13, 0.88)
-            border.color: "#eab308"
-            border.width: 1
-            radius: 6
-            visible: root.status === "STALLED" && root.frameRevision > 0
-
-            ColumnLayout {
-                id: stalledCol
-                anchors.centerIn: parent
-                spacing: 4
-
-                Text {
-                    text: "STREAM STALLED"
-                    color: "#eab308"
-                    font.pixelSize: 12
-                    font.bold: true
-                    font.family: "Monospace"
-                    Layout.alignment: Qt.AlignHCenter
-                }
-
-                Text {
-                    text: "Awaiting video packets..."
-                    color: "#94a3b8"
-                    font.pixelSize: 10
+                    text: "Assign a camera"
+                    color: Qt.rgba(1, 1, 1, 0.5)
+                    font.pixelSize: root.width < 220 ? 9 : 11
+                    font.underline: true
+                    font.family: Theme.fontSans
                     Layout.alignment: Qt.AlignHCenter
                 }
             }
         }
     }
 
-    // Top Header Overlay Bar (Auto-fades or stays subtle)
-    Rectangle {
+    // Top Header Overlay Bar (Matches web console)
+    Item {
         id: topBar
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
         height: 32
-        color: Qt.rgba(0.04, 0.07, 0.13, 0.82)
 
         RowLayout {
             anchors.fill: parent
-            anchors.leftMargin: 10
-            anchors.rightMargin: 10
-            spacing: 8
+            anchors.leftMargin: 8
+            anchors.rightMargin: 8
+            spacing: 4
 
-            // Channel & Name Badge
+            // Channel Indicator Dot + Title
             Rectangle {
-                color: "#1e293b"
-                radius: 4
-                Layout.preferredHeight: 20
-                Layout.preferredWidth: channelLabel.implicitWidth + 12
-
-                Text {
-                    id: channelLabel
-                    anchors.centerIn: parent
-                    text: "CAM " + (root.channelId < 10 ? "0" + root.channelId : root.channelId)
-                    color: "#f8fafc"
-                    font.pixelSize: 10
-                    font.bold: true
-                    font.family: "Monospace"
-                }
+                width: 6
+                height: 6
+                radius: 3
+                color: root.isOnline ? Theme.statusOnline : "#64748b"
+                Layout.alignment: Qt.AlignVCenter
             }
 
             Text {
-                text: root.cameraName
-                color: "#94a3b8"
-                font.pixelSize: 11
-                elide: Text.ElideRight
+                text: "CH " + (root.channelId < 10 ? "0" + root.channelId : root.channelId) + ": " + root.cameraName
+                color: "#ffffff"
+                font.pixelSize: root.width < 220 ? 9 : 10
+                font.bold: true
+                font.family: Theme.fontMono
                 Layout.fillWidth: true
+                elide: Text.ElideRight
+                Layout.alignment: Qt.AlignVCenter
             }
 
-            // Stream Type (SUB vs MAIN) Badge
+            // Stream Resolution Badge (e.g. SUB 360p)
             Rectangle {
-                color: root.streamType === "MAIN" ? "#065f46" : "#1e293b"
+                color: Qt.rgba(0, 0, 0, 0.75)
                 radius: 4
                 Layout.preferredHeight: 18
-                Layout.preferredWidth: streamLabel.implicitWidth + 8
+                Layout.preferredWidth: subLabel.implicitWidth + 8
+                Layout.alignment: Qt.AlignVCenter
 
                 Text {
-                    id: streamLabel
+                    id: subLabel
                     anchors.centerIn: parent
-                    text: root.streamType
-                    color: root.streamType === "MAIN" ? "#34d399" : "#94a3b8"
+                    text: root.streamType === "MAIN" ? "MAIN 1080p" : "SUB 360p"
+                    color: Qt.rgba(1, 1, 1, 0.85)
                     font.pixelSize: 9
                     font.bold: true
-                    font.family: "Monospace"
+                    font.family: Theme.fontMono
                 }
             }
 
-            // REC Badge
+            // VPU HW Acceleration Badge (Responsive: hidden on narrow tiles < 210px)
             Rectangle {
-                visible: root.isRecording
-                color: "#7f1d1d"
+                visible: root.width >= 210
+                color: Qt.rgba(0, 0, 0, 0.75)
                 radius: 4
                 Layout.preferredHeight: 18
-                Layout.preferredWidth: recLabel.implicitWidth + 8
+                Layout.preferredWidth: vpuLabel.implicitWidth + 8
+                Layout.alignment: Qt.AlignVCenter
+
+                Text {
+                    id: vpuLabel
+                    anchors.centerIn: parent
+                    text: "VPU HW"
+                    color: Qt.rgba(1, 1, 1, 0.85)
+                    font.pixelSize: 9
+                    font.bold: true
+                    font.family: Theme.fontMono
+                }
+            }
+
+            // REC Badge (if recording)
+            Rectangle {
+                visible: root.isRecording
+                color: Theme.statusRec
+                radius: 4
+                Layout.preferredHeight: 18
+                Layout.preferredWidth: recLabel.implicitWidth + 10
+                Layout.alignment: Qt.AlignVCenter
 
                 RowLayout {
                     anchors.centerIn: parent
                     spacing: 4
 
                     Rectangle {
-                        width: 6
-                        height: 6
-                        radius: 3
-                        color: "#ef4444"
+                        width: 5
+                        height: 5
+                        radius: 2.5
+                        color: "#ffffff"
                     }
 
                     Text {
                         id: recLabel
                         text: "REC"
-                        color: "#fca5a5"
+                        color: "#ffffff"
                         font.pixelSize: 9
                         font.bold: true
-                        font.family: "Monospace"
+                        font.family: Theme.fontMono
                     }
-                }
-            }
-
-            // Fullscreen Button
-            Rectangle {
-                id: expandBtn
-                Layout.preferredWidth: 22
-                Layout.preferredHeight: 22
-                radius: 4
-                color: expandMouse.containsMouse ? "#334155" : "transparent"
-
-                Text {
-                    anchors.centerIn: parent
-                    text: root.isFullscreen ? "⤓" : "⤢"
-                    color: expandMouse.containsMouse ? "#38bdf8" : "#94a3b8"
-                    font.pixelSize: 14
-                }
-
-                MouseArea {
-                    id: expandMouse
-                    anchors.fill: parent
-                    hoverEnabled: true
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.fullscreenRequested(root.channelId)
                 }
             }
         }
     }
 
-    // Bottom Telemetry Overlay Bar
-    Rectangle {
+    // Bottom Telemetry Overlay Bar (Matches web console)
+    Item {
         id: bottomBar
+        z: 10
         anchors.bottom: parent.bottom
         anchors.left: parent.left
         anchors.right: parent.right
-        height: 22
-        color: Qt.rgba(0.04, 0.07, 0.13, 0.75)
+        height: 32
 
         RowLayout {
             anchors.fill: parent
-            anchors.leftMargin: 10
-            anchors.rightMargin: 10
-            spacing: 12
+            anchors.leftMargin: 8
+            anchors.rightMargin: 8
+            spacing: 5
 
+            // Timestamp (e.g. 2026-11-01 20:35:46)
             Text {
-                text: root.resolutionWidth + "x" + root.resolutionHeight
-                color: "#64748b"
-                font.pixelSize: 10
-                font.family: "Monospace"
-            }
-
-            Text {
-                text: root.fps.toFixed(1) + " FPS"
-                color: "#38bdf8"
-                font.pixelSize: 10
-                font.family: "Monospace"
+                text: root.liveClockText
+                color: Qt.rgba(1, 1, 1, 0.75)
+                font.pixelSize: root.width < 220 ? 9 : 10
+                font.family: Theme.fontMono
+                Layout.alignment: Qt.AlignVCenter
             }
 
             Item { Layout.fillWidth: true }
 
-            Text {
-                visible: root.droppedFrames > 0
-                text: "Drops: " + root.droppedFrames
-                color: "#eab308"
-                font.pixelSize: 10
-                font.family: "Monospace"
+            // Standby / FPS Badge (visible on wider tiles)
+            Rectangle {
+                visible: root.width >= 250
+                color: Qt.rgba(0, 0, 0, 0.75)
+                radius: 4
+                Layout.preferredHeight: 20
+                Layout.preferredWidth: statusLabel.implicitWidth + 10
+                Layout.alignment: Qt.AlignVCenter
+
+                Text {
+                    id: statusLabel
+                    anchors.centerIn: parent
+                    text: root.isOnline ? (root.fps.toFixed(1) + " FPS") : "Standby"
+                    color: Qt.rgba(1, 1, 1, 0.85)
+                    font.pixelSize: 9
+                    font.bold: true
+                    font.family: Theme.fontMono
+                }
+            }
+
+            // Max-Min (Fullscreen / Restore) Action Icon Button
+            Rectangle {
+                id: maxMinBtn
+                Layout.preferredWidth: 24
+                Layout.preferredHeight: 24
+                radius: 6
+                color: maxMinBtnMouse.containsMouse ? Theme.accentPrimary : Qt.rgba(0, 0, 0, 0.65)
+                border.color: maxMinBtnMouse.containsMouse ? Theme.accentPrimary : Qt.rgba(1, 1, 1, 0.25)
+                border.width: 1
+                opacity: mouseArea.containsMouse || maxMinBtnMouse.containsMouse ? 1.0 : 0.85
+                Layout.alignment: Qt.AlignVCenter
+
+                Behavior on color { ColorAnimation { duration: 120 } }
+                Behavior on opacity { NumberAnimation { duration: 120 } }
+
+                AppIcon {
+                    name: root.isFullscreen ? "minimize" : "expand"
+                    size: 13
+                    color: "#ffffff"
+                    strokeWidth: 1.75
+                    anchors.centerIn: parent
+                }
+
+                MouseArea {
+                    id: maxMinBtnMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: {
+                        root.fullscreenRequested(root.channelId);
+                    }
+                }
             }
         }
     }

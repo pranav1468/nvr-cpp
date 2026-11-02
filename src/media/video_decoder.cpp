@@ -1,5 +1,6 @@
 #include "nvr/media/video_decoder.h"
 #include "nvr/media/buffer_allocator.h"
+#include "nvr/api/fmp4_muxer.h"
 #include "nvr/common/logger.h"
 #include <unistd.h>
 #include <fcntl.h>
@@ -70,134 +71,7 @@ bool CopyNv12Frame(
     return true;
 }
 
-class BitstreamReader {
-public:
-    BitstreamReader(const uint8_t* data, size_t size) : data_(data), size_(size) {}
 
-    uint32_t ReadBits(size_t n) {
-        uint32_t val = 0;
-        for (size_t i = 0; i < n; ++i) {
-            val = (val << 1) | ReadBit();
-        }
-        return val;
-    }
-
-    uint32_t ReadBit() {
-        if (byte_offset_ >= size_) return 0;
-        uint32_t bit = (data_[byte_offset_] >> (7 - bit_offset_)) & 1;
-        bit_offset_++;
-        if (bit_offset_ == 8) {
-            bit_offset_ = 0;
-            byte_offset_++;
-        }
-        return bit;
-    }
-
-    uint32_t ReadUE() {
-        int zeros = 0;
-        while (ReadBit() == 0 && byte_offset_ < size_) {
-            zeros++;
-            if (zeros >= 31) return 0;
-        }
-        if (zeros == 0) return 0;
-        uint32_t val = ReadBits(zeros);
-        return (1U << zeros) - 1 + val;
-    }
-
-private:
-    const uint8_t* data_{nullptr};
-    size_t size_{0};
-    size_t byte_offset_{0};
-    size_t bit_offset_{0};
-};
-
-bool ParseSpsDimensions(const uint8_t* data, size_t size, uint32_t& out_w, uint32_t& out_h) {
-    if (size < 4) return false;
-    // Strip emulation prevention bytes 0x000003
-    std::vector<uint8_t> rbsp;
-    rbsp.reserve(size);
-    for (size_t i = 0; i < size; ++i) {
-        if (i + 2 < size && data[i] == 0x00 && data[i+1] == 0x00 && data[i+2] == 0x03) {
-            rbsp.push_back(0x00);
-            rbsp.push_back(0x00);
-            i += 2;
-        } else {
-            rbsp.push_back(data[i]);
-        }
-    }
-
-    if (rbsp.size() < 4) return false;
-
-    BitstreamReader reader(rbsp.data() + 1, rbsp.size() - 1);
-    uint32_t profile_idc = reader.ReadBits(8);
-    reader.ReadBits(16); // constraint flags + level_idc
-    reader.ReadUE();     // seq_parameter_set_id
-
-    if (profile_idc == 100 || profile_idc == 110 || profile_idc == 122 || profile_idc == 244) {
-        uint32_t chroma_format_idc = reader.ReadUE();
-        if (chroma_format_idc == 3) reader.ReadBit();
-        reader.ReadUE(); // bit_depth_luma_minus8
-        reader.ReadUE(); // bit_depth_chroma_minus8
-        reader.ReadBit(); // qpprime_y_zero_transform_bypass_flag
-        if (reader.ReadBit()) { // seq_scaling_matrix_present_flag
-            for (int i = 0; i < ((chroma_format_idc != 3) ? 8 : 12); ++i) {
-                if (reader.ReadBit()) {
-                    int lastScale = 8, nextScale = 8;
-                    int sizeOfScalingList = (i < 6) ? 16 : 64;
-                    for (int j = 0; j < sizeOfScalingList; ++j) {
-                        if (nextScale != 0) {
-                            int delta_scale = reader.ReadUE();
-                            nextScale = (lastScale + delta_scale) % 256;
-                        }
-                        lastScale = (nextScale == 0) ? lastScale : nextScale;
-                    }
-                }
-            }
-        }
-    }
-
-    reader.ReadUE(); // log2_max_frame_num_minus4
-    uint32_t pic_order_cnt_type = reader.ReadUE();
-    if (pic_order_cnt_type == 0) {
-        reader.ReadUE(); // log2_max_pic_order_cnt_lsb_minus4
-    } else if (pic_order_cnt_type == 1) {
-        reader.ReadBit();
-        reader.ReadUE();
-        reader.ReadUE();
-        uint32_t num_ref_frames_in_pic_order_cnt_cycle = reader.ReadUE();
-        for (uint32_t i = 0; i < num_ref_frames_in_pic_order_cnt_cycle; ++i) reader.ReadUE();
-    }
-
-    reader.ReadUE(); // max_num_ref_frames
-    reader.ReadBit(); // gaps_in_frame_num_value_allowed_flag
-    uint32_t pic_width_in_mbs_minus1 = reader.ReadUE();
-    uint32_t pic_height_in_map_units_minus1 = reader.ReadUE();
-    uint32_t frame_mbs_only_flag = reader.ReadBit();
-
-    uint32_t w = (pic_width_in_mbs_minus1 + 1) * 16;
-    uint32_t h = (2 - frame_mbs_only_flag) * ((pic_height_in_map_units_minus1 + 1) * 16);
-
-    uint32_t frame_cropping_flag = reader.ReadBit();
-    if (frame_cropping_flag) {
-        uint32_t crop_left = reader.ReadUE();
-        uint32_t crop_right = reader.ReadUE();
-        uint32_t crop_top = reader.ReadUE();
-        uint32_t crop_bottom = reader.ReadUE();
-        uint32_t crop_x = (crop_left + crop_right) * 2;
-        uint32_t crop_y = (crop_top + crop_bottom) * 2;
-        if (crop_x < w && crop_y < h) {
-            w -= crop_x;
-            h -= crop_y;
-        }
-    }
-
-    if (w > 0 && h > 0 && w <= 4096 && h <= 2160) {
-        out_w = w;
-        out_h = h;
-        return true;
-    }
-    return false;
-}
 
 class SoftwareDecoderShim {
 public:
@@ -277,7 +151,16 @@ public:
             return false;
         }
 
-        const char* codec_name = (codec == CodecType::H265) ? "hevc" : "h264";
+        const char* codec_name = nullptr;
+        if (codec == CodecType::H265) {
+            codec_name = "hevc";
+        } else if (codec == CodecType::H264) {
+            codec_name = "h264";
+        } else {
+            Close();
+            return false;
+        }
+
         codec_ = find_decoder_by_name_(codec_name);
         if (!codec_) {
             Close();
@@ -319,7 +202,9 @@ public:
             return false;
         }
 
-        if (frame_->width <= 0 || frame_->height <= 0 || frame_->width > 4096 || frame_->height > 2160 || !frame_->data[0]) {
+        if (frame_->width <= 0 || frame_->height <= 0 ||
+            static_cast<uint64_t>(frame_->width) * static_cast<uint64_t>(frame_->height) > 4096ULL * 2160ULL ||
+            frame_->width > 4096 || frame_->height > 4096 || !frame_->data[0]) {
             if (frame_unref_) frame_unref_(frame_);
             return false;
         }
@@ -435,56 +320,73 @@ public:
         Close();
     }
 
+    bool ProbeAndSetupVpu() {
+        if (!prefer_vpu_ || (codec_ != CodecType::H264 && codec_ != CodecType::H265)) {
+            return false;
+        }
+        std::vector<std::string> candidate_devs = {"/dev/video10", "/dev/video11", "/dev/video-dec0", "/dev/mxc_vpu"};
+        for (int i = 0; i <= 31; ++i) {
+            std::string d = "/dev/video" + std::to_string(i);
+            if (std::find(candidate_devs.begin(), candidate_devs.end(), d) == candidate_devs.end()) {
+                candidate_devs.push_back(d);
+            }
+        }
+        for (const std::string& dev : candidate_devs) {
+            if (access(dev.c_str(), F_OK) == 0) {
+                int fd = open(dev.c_str(), O_RDWR | O_NONBLOCK);
+                if (fd >= 0) {
+                    struct v4l2_capability cap{};
+                    if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+                        uint32_t caps = cap.capabilities;
+                        if (caps & V4L2_CAP_DEVICE_CAPS) {
+                            caps = cap.device_caps;
+                        }
+                        if (caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE)) {
+                            v4l2_fd_ = fd;
+                            v4l2_device_path_ = dev;
+                            is_hardware_ = true;
+                            output_buf_type_ = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) ?
+                                V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE : V4L2_BUF_TYPE_VIDEO_OUTPUT;
+                            capture_buf_type_ = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) ?
+                                V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                            
+                            if (SetupV4l2Queues()) {
+                                LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 M2M VPU device configured at " 
+                                         << v4l2_device_path_;
+                                return true;
+                            }
+                        }
+                    }
+                    CleanupV4l2Buffers();
+                    close(fd);
+                    v4l2_fd_ = -1;
+                    is_hardware_ = false;
+                }
+            }
+        }
+        return false;
+    }
+
     bool Initialize(CodecType codec, uint32_t width, uint32_t height) override {
         codec_ = codec;
         if (width > 0) width_ = width;
         if (height > 0) height_ = height;
 
         // Probe for Linux V4L2 M2M hardware decoder device (NXP i.MX 95 VPU)
-        if (prefer_vpu_) {
-            const char* vpu_devs[] = {"/dev/video10", "/dev/video11", "/dev/video-dec0", "/dev/mxc_vpu"};
-            for (const char* dev : vpu_devs) {
-                if (access(dev, F_OK) == 0) {
-                    int fd = open(dev, O_RDWR | O_NONBLOCK);
-                    if (fd >= 0) {
-                        struct v4l2_capability cap{};
-                        if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
-                            uint32_t caps = cap.capabilities;
-                            if (caps & V4L2_CAP_DEVICE_CAPS) {
-                                caps = cap.device_caps;
-                            }
-                            if (caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE)) {
-                                v4l2_fd_ = fd;
-                                v4l2_device_path_ = dev;
-                                is_hardware_ = true;
-                                output_buf_type_ = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) ?
-                                    V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE : V4L2_BUF_TYPE_VIDEO_OUTPUT;
-                                capture_buf_type_ = (caps & V4L2_CAP_VIDEO_M2M_MPLANE) ?
-                                    V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE : V4L2_BUF_TYPE_VIDEO_CAPTURE;
-                                
-                                if (SetupV4l2Queues()) {
-                                    LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 M2M VPU device configured at " 
-                                             << v4l2_device_path_;
-                                    break;
-                                }
-                            }
-                        }
-                        CleanupV4l2Buffers();
-                        close(fd);
-                        v4l2_fd_ = -1;
-                        is_hardware_ = false;
-                    }
+        if (codec_ == CodecType::H264 || codec_ == CodecType::H265) {
+            if (width_ > 0 && height_ > 0 && ProbeAndSetupVpu()) {
+                LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming active at " << v4l2_device_path_;
+            } else {
+                sw_decoder_.Initialize(codec_);
+                if (width_ == 0 || height_ == 0) {
+                    LOG_INFO << "[VpuVideoDecoder] Deferring VPU queue allocation until camera SPS is parsed ("
+                             << CodecToString(codec_) << ")";
+                } else {
+                    LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 device not present, active engine: "
+                             << (sw_decoder_.IsAvailable() ? "Software-FFmpeg" : "Aligned-Surface")
+                             << " (" << CodecToString(codec_) << ")";
                 }
             }
-        }
-
-        if (is_hardware_) {
-            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming active at " << v4l2_device_path_;
-        } else if (codec_ != CodecType::UNKNOWN) {
-            sw_decoder_.Initialize(codec_);
-            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 device not present, active engine: "
-                     << (sw_decoder_.IsAvailable() ? "Software-FFmpeg" : "Aligned-Surface")
-                     << " (" << CodecToString(codec_) << ")";
         }
 
         software_awaiting_keyframe_ = false;
@@ -493,57 +395,62 @@ public:
     }
 
     bool Decode(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) override {
+        last_decode_error_ = false;
         if (!packet || packet->data.size() < 4 || packet->IsAudio()) {
+            last_decode_error_ = true;
             return false;
-        }
-
-        // Dynamically adopt packet's codec if unconfigured or changed
-        if (packet->codec != CodecType::UNKNOWN && packet->codec != codec_) {
-            codec_ = packet->codec;
-
-            // Parameter sets from the previous codec are no longer valid.
-            software_parameter_sets_.clear();
-
-            if (is_hardware_) {
-                if (!SetupV4l2Queues()) {
-                    LOG_ERROR << "[PIPELINE][DECODER][RECONFIGURE_FAILED] Codec-change reconfiguration failed; "
-                              << "switching to software fallback. codec=" << CodecToString(codec_)
-                              << " device=" << v4l2_device_path_
-                              << " errno=" << errno << " reason=" << std::strerror(errno);
-                    HandleHardwareFatal();
-                    // Do not send this packet to software here. The existing
-                    // recovery path waits for parameter sets and a keyframe.
-                    return false;
-                }
-            } else {
-                sw_decoder_.Close();
-                if (!sw_decoder_.Initialize(codec_)) {
-                    LOG_ERROR << "[PIPELINE][DECODER][SW_INIT_FAILED] Software decoder initialization "
-                              << "failed after codec change. codec=" << CodecToString(codec_);
-                }
-            }
         }
 
         // Validate Annex-B start code
         const auto& d = packet->data;
         bool has_start_code = (d[0] == 0x00 && d[1] == 0x00 && (d[2] == 0x01 || (d.size() >= 4 && d[2] == 0x00 && d[3] == 0x01)));
         if (!has_start_code) {
+            last_decode_error_ = true;
             return false;
         }
 
-        // Parse SPS if present to update dimensions dynamically
-        if (packet->codec == CodecType::H264) {
-            ExtractSpsAndConfigure(packet->data);
+        // Dynamically detect packet's codec if UNKNOWN
+        CodecType pkt_codec = packet->codec;
+        if (pkt_codec == CodecType::UNKNOWN) {
+            pkt_codec = DetectNalCodecFromParamSets(packet->data.data(), packet->data.size());
+            if (pkt_codec != CodecType::UNKNOWN) {
+                const_cast<MediaPacket*>(packet.get())->codec = pkt_codec;
+            } else {
+                pkt_codec = codec_;
+            }
         }
 
-        if (width_ == 0 || height_ == 0) {
-            // Default to 1080p for MAIN, 360p for SUB if not yet parsed
-            if (packet->stream_type == StreamType::MAIN) {
-                width_ = 1920;
-                height_ = 1080;
-            } else {
-                width_ = 640;
-                height_ = 360;
+        bool codec_changed = (pkt_codec != CodecType::UNKNOWN && pkt_codec != codec_);
+        if (codec_changed) {
+            codec_ = pkt_codec;
+            // Parameter sets from the previous codec are no longer valid.
+            software_parameter_sets_.clear();
+        }
+
+        // Parse SPS if present to update dimensions dynamically before configuring queues
+        ExtractSpsAndConfigure(packet->data, pkt_codec);
+
+        // Dynamically reconfigure decoder if codec changed
+        if (codec_changed) {
+            if (is_hardware_ && v4l2_fd_ >= 0) {
+                if (!SetupV4l2Queues()) {
+                    LOG_ERROR << "[PIPELINE][DECODER][RECONFIGURE_FAILED] Codec-change reconfiguration failed; "
+                              << "switching to software fallback. codec=" << CodecToString(codec_)
+                              << " device=" << v4l2_device_path_
+                              << " errno=" << errno << " reason=" << std::strerror(errno);
+                    HandleHardwareFatal();
+                    last_decode_error_ = true;
+                    return false;
+                }
+            } else if (prefer_vpu_ && v4l2_fd_ < 0 && width_ > 0 && height_ > 0 && ProbeAndSetupVpu()) {
+                LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming dynamically activated at "
+                         << v4l2_device_path_ << " (" << CodecToString(codec_) << ")";
+            } else if (!is_hardware_) {
+                sw_decoder_.Close();
+                if (!sw_decoder_.Initialize(codec_)) {
+                    LOG_ERROR << "[PIPELINE][DECODER][SW_INIT_FAILED] Software decoder initialization "
+                              << "failed after codec change. codec=" << CodecToString(codec_);
+                }
             }
         }
 
@@ -555,7 +462,7 @@ public:
         out_frame->frame_index = frame_counter_++;
         out_frame->format = PixelFormat::NV12;
 
-        CacheParameterSets(packet);
+        CacheParameterSets(packet, pkt_codec);
 
         // 1. Hardware V4L2 M2M decoding path
         if (is_hardware_ && v4l2_fd_ >= 0) {
@@ -565,11 +472,13 @@ public:
             }
             if (res == V4l2DecodeResult::FRAME_PENDING) {
                 out_frame.reset();
+                last_decode_error_ = false;
                 return false;
             }
             if (res == V4l2DecodeResult::HARDWARE_FATAL) {
                 out_frame.reset();
                 HandleHardwareFatal();
+                last_decode_error_ = true;
                 // Never software-decode this packet: hardware already accepted it
                 return false;
             }
@@ -584,6 +493,7 @@ public:
 
                 if (!PrepareSoftwareRecoveryPacket(packet, recovery_data)) {
                     out_frame.reset();
+                    last_decode_error_ = packet->HasVclSlice();
                     return false;
                 }
 
@@ -592,20 +502,42 @@ public:
                         recovery_data.size(),
                         *out_frame)) {
                     software_awaiting_keyframe_ = false;
+                    if (out_frame->width > 0 && out_frame->height > 0) {
+                        width_ = out_frame->width;
+                        height_ = out_frame->height;
+                    }
                     return true;
                 }
 
                 out_frame.reset();
+                last_decode_error_ = packet->HasVclSlice();
                 return false;
             }
 
-            if (sw_decoder_.Decode(packet->data.data(), packet->data.size(), *out_frame)) {
+            std::vector<uint8_t> combined;
+            const uint8_t* dec_data = packet->data.data();
+            size_t dec_size = packet->data.size();
+            if (packet->is_keyframe && !packet->HasParameterSets() &&
+                PrepareSoftwareRecoveryPacket(packet, combined)) {
+                dec_data = combined.data();
+                dec_size = combined.size();
+            }
+
+            if (sw_decoder_.Decode(dec_data, dec_size, *out_frame)) {
+                if (out_frame->width > 0 && out_frame->height > 0) {
+                    width_ = out_frame->width;
+                    height_ = out_frame->height;
+                }
                 return true;
             }
+            out_frame.reset();
+            last_decode_error_ = packet->HasVclSlice();
+            return false;
         }
 
         // Decode failed on both hardware and software engines; do not report fake success
         out_frame.reset();
+        last_decode_error_ = true;
         return false;
     }
 
@@ -719,6 +651,7 @@ public:
 
     uint32_t GetWidth() const override { return width_; }
     uint32_t GetHeight() const override { return height_; }
+    bool HadDecodeError() const override { return last_decode_error_; }
 
 private:
     enum class V4l2DecodeResult {
@@ -729,13 +662,15 @@ private:
     };
 
     V4l2DecodeResult DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
-        uint32_t frame_w = (width_ > 0) ? width_ : (negotiated_width_ > 0 ? negotiated_width_ : 1920);
-        uint32_t frame_h = (height_ > 0) ? height_ : (negotiated_height_ > 0 ? negotiated_height_ : 1080);
+        uint32_t frame_w = (width_ > 0) ? width_ : negotiated_width_;
+        uint32_t frame_h = (height_ > 0) ? height_ : negotiated_height_;
+        if (frame_w == 0 || frame_h == 0) {
+            return V4l2DecodeResult::INPUT_REJECTED;
+        }
         frame_w = (frame_w & ~1U);
         frame_h = (frame_h & ~1U);
         uint32_t dst_stride = (frame_w + 63) & ~size_t(63);
         uint32_t src_stride = (negotiated_stride_ > 0) ? negotiated_stride_ : dst_stride;
-        size_t surface_size = BufferAllocator::CalculateSurfaceSize(frame_w, frame_h, 1, 1, 64);
 
         int out_idx = -1;
         for (size_t i = 0; i < output_buffers_.size(); ++i) {
@@ -763,15 +698,23 @@ private:
             return V4l2DecodeResult::INPUT_REJECTED;
         }
 
+        std::vector<uint8_t> hw_combined;
+        const uint8_t* src_ptr = packet->data.data();
+        size_t copy_bytes = packet->data.size();
+        if (packet->is_keyframe && !packet->HasParameterSets() &&
+            PrepareSoftwareRecoveryPacket(packet, hw_combined)) {
+            src_ptr = hw_combined.data();
+            copy_bytes = hw_combined.size();
+        }
+
         // Reject oversized compressed packets; never silently truncate encoded video
-        if (packet->data.size() > output_buffers_[out_idx].length) {
+        if (copy_bytes > output_buffers_[out_idx].length) {
             LOG_WARN << "[VpuVideoDecoder] Rejecting oversized compressed packet (" 
-                     << packet->data.size() << " bytes > buffer limit " 
+                     << copy_bytes << " bytes > buffer limit " 
                      << output_buffers_[out_idx].length << " bytes)";
             return V4l2DecodeResult::INPUT_REJECTED;
         }
-        size_t copy_bytes = packet->data.size();
-        std::memcpy(output_buffers_[out_idx].start, packet->data.data(), copy_bytes);
+        std::memcpy(output_buffers_[out_idx].start, src_ptr, copy_bytes);
 
         struct v4l2_buffer q{};
         q.type = output_buf_type_;
@@ -808,23 +751,14 @@ private:
             uint32_t cap_idx = dq_cap.index;
             capture_buffers_[cap_idx].queued = false;
 
-            out_frame->width = frame_w;
-            out_frame->height = frame_h;
+            out_frame = BufferAllocator::Instance().AllocateFrame(frame_w, frame_h, PixelFormat::NV12);
             out_frame->stride = dst_stride;
-            out_frame->format = PixelFormat::NV12;
-            // Safe buffer ownership: downstream consumes owned memory in out_frame->data.
-            // dmabuf_fd is set to -1 to prevent premature reuse race conditions.
             out_frame->dmabuf_fd = -1;
 
             // Associate driver-propagated PTS from capture buffer
             int64_t cap_pts = static_cast<int64_t>(dq_cap.timestamp.tv_sec) * 1000000LL + dq_cap.timestamp.tv_usec;
             if (cap_pts > 0) {
                 out_frame->pts_us = cap_pts;
-            }
-
-            out_frame->data = BufferAllocator::Instance().Allocate(surface_size);
-            if (out_frame->data.size() < surface_size) {
-                out_frame->data.resize(surface_size, 0);
             }
 
             bool copy_ok = CopyNv12Frame(
@@ -871,15 +805,26 @@ private:
     }
 
     bool SetupV4l2Queues() {
-        if (v4l2_fd_ < 0) return false;
+        if (v4l2_fd_ < 0 || width_ == 0 || height_ == 0) return false;
 
         // Clean up previous buffers/streaming if re-configuring
         CleanupV4l2Buffers();
 
+        if (codec_ != CodecType::H264 && codec_ != CodecType::H265) {
+            return false;
+        }
+
         // 1. Output queue format (bitstream input)
         struct v4l2_format fmt_out{};
         fmt_out.type = output_buf_type_;
-        uint32_t pix_fmt = (codec_ == CodecType::H264) ? V4L2_PIX_FMT_H264 : V4L2_PIX_FMT_HEVC;
+        uint32_t pix_fmt = 0;
+        if (codec_ == CodecType::H264) {
+            pix_fmt = V4L2_PIX_FMT_H264;
+        } else if (codec_ == CodecType::H265) {
+            pix_fmt = V4L2_PIX_FMT_HEVC;
+        } else {
+            return false;
+        }
 
         // Verify driver output queue actually advertises the requested codec
         bool has_codec_fmt = false;
@@ -917,14 +862,14 @@ private:
 
         if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
             fmt_out.fmt.pix_mp.pixelformat = pix_fmt;
-            fmt_out.fmt.pix_mp.width = (width_ > 0) ? width_ : 1920;
-            fmt_out.fmt.pix_mp.height = (height_ > 0) ? height_ : 1080;
+            fmt_out.fmt.pix_mp.width = width_;
+            fmt_out.fmt.pix_mp.height = height_;
             fmt_out.fmt.pix_mp.num_planes = 1;
             fmt_out.fmt.pix_mp.plane_fmt[0].sizeimage = 1024 * 1024;
         } else {
             fmt_out.fmt.pix.pixelformat = pix_fmt;
-            fmt_out.fmt.pix.width = (width_ > 0) ? width_ : 1920;
-            fmt_out.fmt.pix.height = (height_ > 0) ? height_ : 1080;
+            fmt_out.fmt.pix.width = width_;
+            fmt_out.fmt.pix.height = height_;
             fmt_out.fmt.pix.sizeimage = 1024 * 1024;
         }
 
@@ -942,22 +887,38 @@ private:
         fmt_cap.type = capture_buf_type_;
         if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
             fmt_cap.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12;
-            fmt_cap.fmt.pix_mp.width = (width_ > 0) ? width_ : 1920;
-            fmt_cap.fmt.pix_mp.height = (height_ > 0) ? height_ : 1080;
+            fmt_cap.fmt.pix_mp.width = width_;
+            fmt_cap.fmt.pix_mp.height = height_;
             fmt_cap.fmt.pix_mp.num_planes = 1;
         } else {
             fmt_cap.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
-            fmt_cap.fmt.pix.width = (width_ > 0) ? width_ : 1920;
-            fmt_cap.fmt.pix.height = (height_ > 0) ? height_ : 1080;
+            fmt_cap.fmt.pix.width = width_;
+            fmt_cap.fmt.pix.height = height_;
         }
 
         if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt_cap) < 0) {
-            LOG_ERROR << "[PIPELINE][DECODER][SETUP_FAILED] Capture VIDIOC_S_FMT failed"
-                      << " codec=" << CodecToString(codec_)
-                      << " device=" << v4l2_device_path_
-                      << " errno=" << errno << " reason=" << std::strerror(errno);
-            CleanupV4l2Buffers();
-            return false;
+            bool s_fmt_ok = false;
+#ifdef V4L2_PIX_FMT_NV12M
+            if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                std::memset(&fmt_cap, 0, sizeof(fmt_cap));
+                fmt_cap.type = capture_buf_type_;
+                fmt_cap.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_NV12M;
+                fmt_cap.fmt.pix_mp.width = width_;
+                fmt_cap.fmt.pix_mp.height = height_;
+                fmt_cap.fmt.pix_mp.num_planes = 2;
+                if (ioctl(v4l2_fd_, VIDIOC_S_FMT, &fmt_cap) == 0) {
+                    s_fmt_ok = true;
+                }
+            }
+#endif
+            if (!s_fmt_ok) {
+                LOG_ERROR << "[PIPELINE][DECODER][SETUP_FAILED] Capture VIDIOC_S_FMT failed"
+                          << " codec=" << CodecToString(codec_)
+                          << " device=" << v4l2_device_path_
+                          << " errno=" << errno << " reason=" << std::strerror(errno);
+                CleanupV4l2Buffers();
+                return false;
+            }
         }
 
         // Query driver negotiated format & stride
@@ -974,8 +935,8 @@ private:
                 negotiated_stride_ = gfmt_cap.fmt.pix.bytesperline;
             }
         }
-        if (negotiated_width_ == 0) negotiated_width_ = (width_ > 0) ? width_ : 1920;
-        if (negotiated_height_ == 0) negotiated_height_ = (height_ > 0) ? height_ : 1080;
+        if (negotiated_width_ == 0) negotiated_width_ = width_;
+        if (negotiated_height_ == 0) negotiated_height_ = height_;
         if (negotiated_stride_ == 0) negotiated_stride_ = (negotiated_width_ + 63) & ~size_t(63);
 
         // 3. Request buffers for output queue
@@ -1098,30 +1059,97 @@ private:
     }
 
 private:
-    void ExtractSpsAndConfigure(const std::vector<uint8_t>& data) {
+    void ExtractSpsAndConfigure(const std::vector<uint8_t>& data, CodecType codec) {
         size_t i = 0;
-        while (i + 4 < data.size()) {
+        while (i + 3 < data.size()) {
             if (data[i] == 0x00 && data[i+1] == 0x00 &&
                 ((data[i+2] == 0x01) || (data[i+2] == 0x00 && i + 3 < data.size() && data[i+3] == 0x01))) {
                 size_t prefix_len = (data[i+2] == 0x01) ? 3 : 4;
                 size_t nal_start = i + prefix_len;
                 if (nal_start >= data.size()) break;
-                uint8_t nal_type = data[nal_start] & 0x1F;
-                if (nal_type == 7) { // SPS
-                    size_t nal_end = data.size();
-                    for (size_t j = nal_start + 1; j + 3 < data.size(); ++j) {
-                        if (data[j] == 0x00 && data[j+1] == 0x00 &&
-                            ((data[j+2] == 0x01) || (data[j+2] == 0x00 && data[j+3] == 0x01))) {
-                            nal_end = j;
-                            break;
+
+                size_t nal_end = data.size();
+                for (size_t j = nal_start + 1; j + 3 < data.size(); ++j) {
+                    if (data[j] == 0x00 && data[j+1] == 0x00 &&
+                        ((data[j+2] == 0x01) || (data[j+2] == 0x00 && data[j+3] == 0x01))) {
+                        nal_end = j;
+                        break;
+                    }
+                }
+
+                auto apply_sps_dimensions = [this](uint32_t parsed_w, uint32_t parsed_h) {
+                    if (parsed_w == 0 || parsed_h == 0) return;
+                    if (static_cast<uint64_t>(parsed_w) * static_cast<uint64_t>(parsed_h) > 4096ULL * 2160ULL ||
+                        parsed_w > 4096 || parsed_h > 4096) {
+                        LOG_WARN << "[VpuVideoDecoder] Stream dimensions " << parsed_w << "x" << parsed_h
+                                 << " exceed hardware 4K ceiling; clamped";
+                        return;
+                    }
+                    bool res_changed = (parsed_w != width_ || parsed_h != height_);
+                    width_ = parsed_w;
+                    height_ = parsed_h;
+
+                    if (prefer_vpu_) {
+                        if (v4l2_fd_ < 0) {
+                            if (ProbeAndSetupVpu()) {
+                                LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming dynamically activated at "
+                                         << v4l2_device_path_ << " (" << width_ << "x" << height_ << ")";
+                            }
+                        } else if (is_hardware_ && res_changed &&
+                                   (width_ != negotiated_width_ || height_ != negotiated_height_)) {
+                            LOG_INFO << "[VpuVideoDecoder] Reconfiguring V4L2 queues for new resolution "
+                                     << width_ << "x" << height_ << " (was "
+                                     << negotiated_width_ << "x" << negotiated_height_ << ")";
+                            if (!SetupV4l2Queues()) {
+                                LOG_ERROR << "[PIPELINE][DECODER][RECONFIGURE_FAILED] Dynamic V4L2 resolution change failed; falling back to software";
+                                HandleHardwareFatal();
+                            }
                         }
                     }
-                    uint32_t parsed_w = 0, parsed_h = 0;
-                    if (ParseSpsDimensions(data.data() + nal_start, nal_end - nal_start, parsed_w, parsed_h)) {
-                        width_ = parsed_w;
-                        height_ = parsed_h;
+                    if (!is_hardware_ && !sw_decoder_.IsAvailable() && codec_ != CodecType::UNKNOWN) {
+                        sw_decoder_.Initialize(codec_);
                     }
-                    break;
+                };
+
+                if (codec == CodecType::H265) {
+                    uint8_t nal_type = (data[nal_start] >> 1) & 0x3F;
+                    if (nal_type == 33) { // H.265 SPS
+                        uint32_t parsed_w = 0, parsed_h = 0;
+                        if (Fmp4Muxer::ParseH265SpsDimensions(data.data() + nal_start, nal_end - nal_start, parsed_w, parsed_h)) {
+                            apply_sps_dimensions(parsed_w, parsed_h);
+                        }
+                        break;
+                    }
+                } else if (codec == CodecType::H264) {
+                    uint8_t nal_type = data[nal_start] & 0x1F;
+                    if (nal_type == 7) { // H.264 SPS
+                        uint32_t parsed_w = 0, parsed_h = 0;
+                        if (Fmp4Muxer::ParseSpsDimensions(data.data() + nal_start, nal_end - nal_start, parsed_w, parsed_h)) {
+                            apply_sps_dimensions(parsed_w, parsed_h);
+                        }
+                        break;
+                    }
+                } else {
+                    // Codec UNKNOWN: probe H.265 SPS (type 33) or H.264 SPS (type 7) dynamically
+                    if (nal_end > nal_start + 1 && IsValidH265NalHeader(data[nal_start], data[nal_start + 1])) {
+                        uint8_t nal_type_h265 = (data[nal_start] >> 1) & 0x3F;
+                        if (nal_type_h265 == 33) {
+                            uint32_t parsed_w = 0, parsed_h = 0;
+                            if (Fmp4Muxer::ParseH265SpsDimensions(data.data() + nal_start, nal_end - nal_start, parsed_w, parsed_h)) {
+                                apply_sps_dimensions(parsed_w, parsed_h);
+                                break;
+                            }
+                        }
+                    } else if (((data[nal_start] >> 5) & 0x03) != 0) {
+                        uint8_t nal_type_h264 = data[nal_start] & 0x1F;
+                        if (nal_type_h264 == 7) {
+                            uint32_t parsed_w = 0, parsed_h = 0;
+                            if (Fmp4Muxer::ParseSpsDimensions(data.data() + nal_start, nal_end - nal_start, parsed_w, parsed_h)) {
+                                apply_sps_dimensions(parsed_w, parsed_h);
+                                break;
+                            }
+                        }
+                    }
                 }
                 i = nal_start;
             } else {
@@ -1219,20 +1247,28 @@ private:
     }
 
     uint8_t GetNalType(CodecType codec, uint8_t header) const {
-        return codec == CodecType::H265
-            ? static_cast<uint8_t>((header >> 1) & 0x3F)
-            : static_cast<uint8_t>(header & 0x1F);
+        if (codec == CodecType::H265) {
+            return static_cast<uint8_t>((header >> 1) & 0x3F);
+        } else if (codec == CodecType::H264) {
+            return static_cast<uint8_t>(header & 0x1F);
+        }
+        return 0;
     }
 
-    void CacheParameterSets(const MediaPacketPtr& packet) {
+    void CacheParameterSets(const MediaPacketPtr& packet, CodecType pkt_codec) {
         if (!packet) return;
+
+        if (pkt_codec != codec_ && pkt_codec != CodecType::UNKNOWN) {
+            software_parameter_sets_.clear();
+            codec_ = pkt_codec;
+        }
 
         const auto nals = FindAnnexBNals(packet->data);
         for (const auto& nal : nals) {
             const uint8_t type =
-                GetNalType(packet->codec, packet->data[nal.payload]);
+                GetNalType(pkt_codec, packet->data[nal.payload]);
 
-            if (!IsParameterSet(packet->codec, type)) {
+            if (!IsParameterSet(pkt_codec, type)) {
                 continue;
             }
 
@@ -1248,13 +1284,19 @@ private:
         std::vector<uint8_t>& prepared) {
         if (!packet) return false;
 
-        CacheParameterSets(packet);
+        CodecType pkt_codec = packet->codec;
+        if (pkt_codec == CodecType::UNKNOWN) {
+            pkt_codec = DetectNalCodecFromParamSets(packet->data.data(), packet->data.size());
+            if (pkt_codec == CodecType::UNKNOWN) pkt_codec = codec_;
+        }
+
+        CacheParameterSets(packet, pkt_codec);
 
         bool has_random_access = false;
         for (const auto& nal : FindAnnexBNals(packet->data)) {
             const uint8_t type =
-                GetNalType(packet->codec, packet->data[nal.payload]);
-            if (IsRandomAccessNal(packet->codec, type)) {
+                GetNalType(pkt_codec, packet->data[nal.payload]);
+            if (IsRandomAccessNal(pkt_codec, type)) {
                 has_random_access = true;
                 break;
             }
@@ -1269,10 +1311,17 @@ private:
         const int h264_types[] =
             {7, 8};       // H.264 SPS/PPS
 
-        const int* types = packet->codec == CodecType::H264
-            ? h264_types : required_types;
-        const size_t count = packet->codec == CodecType::H264
-            ? 2 : 3;
+        const int* types = nullptr;
+        size_t count = 0;
+        if (pkt_codec == CodecType::H264) {
+            types = h264_types;
+            count = 2;
+        } else if (pkt_codec == CodecType::H265) {
+            types = required_types;
+            count = 3;
+        } else {
+            return false;
+        }
 
         for (size_t i = 0; i < count; ++i) {
             if (software_parameter_sets_.find(types[i]) ==
@@ -1294,42 +1343,11 @@ private:
         return true;
     }
 
-    void SetIoctlHook(IoctlFn hook, bool simulate_hardware = false) override {
-        ioctl_hook_ = hook;
-        if (simulate_hardware) {
-            v4l2_fd_ = 999;
-            is_hardware_ = true;
-            output_buf_type_ = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-            capture_buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            output_streaming_ = true;
-            capture_streaming_ = true;
-
-            output_buffers_.resize(2);
-            static uint8_t mock_out[2][65536];
-            for (size_t i = 0; i < 2; ++i) {
-                output_buffers_[i].start = mock_out[i];
-                output_buffers_[i].length = sizeof(mock_out[i]);
-                output_buffers_[i].queued = false;
-            }
-
-            capture_buffers_.resize(2);
-            static uint8_t mock_cap[2][65536];
-            for (size_t i = 0; i < 2; ++i) {
-                capture_buffers_[i].start = mock_cap[i];
-                capture_buffers_[i].length = sizeof(mock_cap[i]);
-                capture_buffers_[i].queued = false;
-            }
-        }
-    }
-
     int Ioctl(int fd, unsigned long request, void* arg) {
-        if (ioctl_hook_) {
-            return ioctl_hook_(fd, request, arg);
-        }
         return ::ioctl(fd, request, arg);
     }
 
-    CodecType codec_{CodecType::H264};
+    CodecType codec_{CodecType::UNKNOWN};
     uint32_t width_{0};
     uint32_t height_{0};
     uint32_t negotiated_width_{0};
@@ -1338,8 +1356,8 @@ private:
     bool prefer_vpu_{true};
     bool is_hardware_{false};
     bool software_awaiting_keyframe_{false};
+    bool last_decode_error_{false};
     std::unordered_map<int, std::vector<uint8_t>> software_parameter_sets_;
-    IoctlFn ioctl_hook_{nullptr};
     bool initialized_{false};
     std::string v4l2_device_path_;
     int v4l2_fd_{-1};

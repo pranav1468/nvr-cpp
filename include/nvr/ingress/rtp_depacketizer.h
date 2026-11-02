@@ -14,13 +14,14 @@ using DepacketizedCallback = std::function<void(const MediaPacketPtr&)>;
 
 class RtpDepacketizer {
 public:
-    RtpDepacketizer(int channel_id, StreamType stream_type, CodecType codec, DepacketizedCallback callback, uint32_t clock_rate = 90000);
+    RtpDepacketizer(int channel_id, StreamType stream_type, CodecType codec, DepacketizedCallback callback, uint32_t clock_rate = 90000, uint8_t channels = 1);
     ~RtpDepacketizer() = default;
 
     void ProcessRtpPacket(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num, bool marker_bit);
 
     void Flush();
     void Reset();
+    void SetCodec(CodecType codec);
 
 private:
     struct QueuedRtpPacket {
@@ -50,9 +51,10 @@ private:
 
     int channel_id_{0};
     StreamType stream_type_{StreamType::MAIN};
-    CodecType codec_{CodecType::H264};
+    CodecType codec_{CodecType::UNKNOWN};
     DepacketizedCallback callback_;
     uint32_t clock_rate_{90000};
+    uint8_t channels_{1};
 
     // Sequence reordering / jitter buffer
     bool has_seq_{false};

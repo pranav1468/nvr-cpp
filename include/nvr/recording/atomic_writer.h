@@ -30,9 +30,14 @@ public:
     bool HasIoError() const { return has_io_error_; }
     bool HasAudio() const { return has_audio_; }
     CodecType GetAudioCodec() const { return audio_codec_; }
+    uint32_t GetWidth() const { return width_; }
+    uint32_t GetHeight() const { return height_; }
+    off_t GetAllocatedBytes() const { return allocated_bytes_; }
+    uint64_t GetLastFadviseOffset() const { return last_fadvise_offset_; }
     void ConfigureAudio(CodecType codec, uint32_t sample_rate = 8000, uint8_t channels = 1);
 
     static bool ValidateMp4File(const std::string& path);
+    static bool ExtractMp4Metadata(const std::string& path, SegmentMetadata& out_meta);
     static void CleanOrphanedTmpFiles(const std::string& directory);
 
 private:
@@ -45,6 +50,9 @@ private:
     };
 
     void FlushCurrentFragment();
+
+    bool EnsureDiskPreallocation(size_t additional_bytes);
+    bool WriteBuffer(const void* data, size_t size);
 
     void WriteFtyp();
     void WriteMoov();
@@ -70,6 +78,8 @@ private:
     uint32_t frame_count_{0};
     uint32_t keyframe_count_{0};
     uint64_t total_bytes_written_{0};
+    off_t allocated_bytes_{0};
+    uint64_t last_fadvise_offset_{0};
 
     uint32_t fragment_sequence_{1};
     std::vector<SampleEntry> pending_samples_;
@@ -80,10 +90,16 @@ private:
     std::vector<uint8_t> vps_bytes_;
     bool has_header_written_{false};
 
-    uint32_t width_{1920};
-    uint32_t height_{1080};
+    uint32_t width_{0};
+    uint32_t height_{0};
     uint32_t timescale_{90000};
-    CodecType codec_{CodecType::H264};
+    CodecType codec_{CodecType::UNKNOWN};
+    uint8_t hevc_profile_space_{0};
+    uint8_t hevc_tier_flag_{0};
+    uint8_t hevc_profile_idc_{1};
+    uint32_t hevc_profile_compatibility_flags_{0x60000000};
+    uint8_t hevc_constraint_flags_[6]{0x90, 0, 0, 0, 0, 0};
+    uint8_t hevc_level_idc_{93};
 
     // Audio track support
     bool has_audio_{false};

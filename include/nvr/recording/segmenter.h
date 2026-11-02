@@ -43,6 +43,9 @@ private:
     std::vector<uint8_t> cached_pps_;
     std::vector<uint8_t> cached_vps_;
     CodecType cached_codec_{CodecType::UNKNOWN};
+    uint32_t cached_width_{0};
+    uint32_t cached_height_{0};
+    bool has_audio_configured_{false};
 };
 
 } // namespace nvr

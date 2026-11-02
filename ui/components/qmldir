@@ -1,0 +1,8 @@
+module ui.components
+AppHeader 1.0 AppHeader.qml
+AppSidebar 1.0 AppSidebar.qml
+OnvifDiscoveryModal 1.0 OnvifDiscoveryModal.qml
+CameraEditModal 1.0 CameraEditModal.qml
+AppIcon 1.0 AppIcon.qml
+CameraHardwareModal 1.0 CameraHardwareModal.qml
+ClipExportModal 1.0 ClipExportModal.qml

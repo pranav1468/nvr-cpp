@@ -2,15 +2,16 @@
 #include "nvr/common/logger.h"
 #include "nvr/common/deep_tracer.h"
 #include "nvr/common/time_utils.h"
-#include "nvr/storage/database_manager.h"
-#include "nvr/storage/segment_index.h"
 #include "nvr/storage/retention_manager.h"
 #include "nvr/media/stream_broker.h"
 #include "nvr/recording/atomic_writer.h"
 #include "nvr/recording/recording_scheduler.h"
 #include "nvr/ingress/camera_manager.h"
 #include "nvr/live/live_controller.h"
+#include "nvr/live/qml_video_bridge.h"
+#include "nvr/dispatcher/command_dispatcher.h"
 #include "nvr/api/rest_server.h"
+#include "nvr/common/config_loader.h"
 #include "3rdparty/nlohmann/json.hpp"
 
 #include <csignal>
@@ -32,77 +33,22 @@ void SignalHandler(int signum) {
     }
 }
 
-nvr::NvrConfig LoadConfig(const std::string& config_path) {
-    nvr::NvrConfig config;
-    std::ifstream f(config_path);
-    if (!f.is_open()) {
-        LOG_WARN << "Config file not found at " << config_path << ", using defaults";
-        return config;
-    }
-
-    try {
-        json j;
-        f >> j;
-
-        if (j.contains("system")) {
-            auto& sys = j["system"];
-            if (sys.contains("device_name")) config.system.device_name = sys["device_name"];
-            if (sys.contains("log_level")) config.system.log_level = sys["log_level"];
-            if (sys.contains("max_channels")) config.system.max_channels = sys["max_channels"];
-        }
-
-        if (j.contains("storage")) {
-            auto& st = j["storage"];
-            if (st.contains("recording_path")) config.storage.recording_path = st["recording_path"];
-            if (st.contains("database_path")) config.storage.database_path = st["database_path"];
-            if (st.contains("segment_duration_seconds")) config.storage.segment_duration_seconds = st["segment_duration_seconds"];
-            if (st.contains("min_free_space_mb")) config.storage.min_free_space_mb = st["min_free_space_mb"];
-            if (st.contains("max_retention_days")) config.storage.max_retention_days = st["max_retention_days"];
-        }
-
-        if (j.contains("live")) {
-            auto& lv = j["live"];
-            if (lv.contains("grid_layout")) config.live.grid_layout = lv["grid_layout"];
-            if (lv.contains("max_queue_depth")) config.live.max_queue_depth = lv["max_queue_depth"];
-            if (lv.contains("drop_stale_frames")) config.live.drop_stale_frames = lv["drop_stale_frames"];
-        }
-
-        if (j.contains("api")) {
-            auto& a = j["api"];
-            if (a.contains("enabled")) config.api.enabled = a["enabled"];
-            if (a.contains("port")) config.api.port = a["port"];
-            if (a.contains("web_root")) config.api.web_root = a["web_root"];
-        }
-
-        if (j.contains("cameras") && j["cameras"].is_array()) {
-            for (const auto& item : j["cameras"]) {
-                nvr::CameraConfig cam;
-                cam.id = item.value("id", 1);
-                cam.name = item.value("name", "Camera");
-                cam.rtsp_url = item.value("rtsp_url", "");
-                cam.sub_rtsp_url = item.value("sub_rtsp_url", "");
-                cam.enabled = item.value("enabled", true);
-                cam.record_mode = static_cast<nvr::RecordMode>(item.value("record_mode", 1));
-                config.cameras.push_back(cam);
-            }
-        }
-    } catch (const std::exception& e) {
-        LOG_ERROR << "Error parsing config JSON: " << e.what();
-    }
-
-    return config;
-}
-
 } // namespace
 
 int main(int argc, char* argv[]) {
-#ifdef NVR_ENABLE_DEEP_MONITORING
-    nvr::DeepTracer::Instance().Start("logs/nvr_deep_trace.log");
-#endif
-
     std::string config_path = "config/nvr_config.json";
     if (argc > 1) {
-        config_path = argv[1];
+        std::string arg1 = argv[1];
+        if (arg1 == "--help" || arg1 == "-h") {
+            std::cout << "Usage: " << argv[0] << " [config_file_path]\n"
+                      << "  Default config: config/nvr_config.json\n";
+            return 0;
+        }
+        if (arg1 == "--version" || arg1 == "-v") {
+            std::cout << "NVR Production Core v2.0 (NXP i.MX 95 Target Architecture)\n";
+            return 0;
+        }
+        config_path = arg1;
     }
 
     // Register signals
@@ -110,7 +56,12 @@ int main(int argc, char* argv[]) {
     std::signal(SIGTERM, SignalHandler);
 
     // Load configuration
-    nvr::NvrConfig config = LoadConfig(config_path);
+    nvr::NvrConfig config = nvr::LoadNvrConfig(config_path);
+
+#ifdef NVR_ENABLE_DEEP_MONITORING
+    std::string log_file = config.system.log_dir + "/nvr_deep_trace.log";
+    nvr::DeepTracer::Instance().Start(log_file, config.storage.recording_path);
+#endif
 
     // Configure logger
     nvr::LogLevel log_lvl = nvr::LogLevel::INFO;
@@ -130,24 +81,22 @@ int main(int argc, char* argv[]) {
     nvr::DeepTracer::Instance().SetStoragePath(config.storage.recording_path);
 #endif
 
+    nvr::CommandDispatcher::Instance().SetDeviceName(config.system.device_name);
+
     LOG_INFO << "==========================================================";
     LOG_INFO << "Starting NVR Production Core: " << config.system.device_name;
     LOG_INFO << "Target Storage: " << config.storage.recording_path;
     LOG_INFO << "Segment Duration: " << config.storage.segment_duration_seconds << "s";
-    LOG_INFO << "Database File: " << config.storage.database_path;
     LOG_INFO << "==========================================================";
+
+    // Ensure recording storage directory exists before reconciliation and telemetry
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(config.storage.recording_path, ec);
+    }
 
     // Startup reconciliation: clean orphaned .tmp segments
     nvr::AtomicWriter::CleanOrphanedTmpFiles(config.storage.recording_path);
-
-    // Initialize Database
-    if (!nvr::DatabaseManager::Instance().Initialize(config.storage.database_path)) {
-        LOG_ERROR << "Fatal: Failed to initialize SQLite database. Exiting.";
-        return 1;
-    }
-
-    // Reconcile database against physical disk storage
-    nvr::SegmentIndex::Instance().ReconcileStorage(config.storage.recording_path);
 
     // Initialize Retention Manager
     nvr::RetentionManager::Instance().Configure(config.storage);
@@ -157,10 +106,12 @@ int main(int argc, char* argv[]) {
     nvr::RecordingScheduler::Instance().Configure(config.storage);
 
     // Initialize Camera Manager
+    nvr::CameraManager::Instance().SetMaxChannels(config.system.max_channels);
+    nvr::CameraManager::Instance().SetConfigFilePath(config_path);
     nvr::CameraManager::Instance().Initialize(config.cameras);
 
     // Start Recording and Ingress for configured cameras
-    for (const auto& cam : config.cameras) {
+    for (const auto& cam : nvr::CameraManager::Instance().GetCameras()) {
         if (cam.enabled) {
             nvr::RecordingScheduler::Instance().StartChannelRecording(cam.id, cam.record_mode);
             nvr::CameraManager::Instance().StartCamera(cam.id);
@@ -168,7 +119,10 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Initialize Live View Pipeline
+    // Initialize Live View Pipeline with QmlVideoBridge display backend
+    nvr::LiveController::Instance().SetDisplayBackend(
+        std::shared_ptr<nvr::IDisplayBackend>(&nvr::QmlVideoBridge::Instance(), [](nvr::IDisplayBackend*){})
+    );
     nvr::LiveController::Instance().Configure(config.live);
     if (config.live.grid_layout == 1) {
         nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::SINGLE);
@@ -195,22 +149,18 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         loop_counter++;
 
-        if (loop_counter % 10 == 0) {
-            uint64_t free_mb = nvr::RetentionManager::Instance().GetFreeDiskSpaceBytes(config.storage.recording_path) / (1024 * 1024);
-            int total_segs = nvr::SegmentIndex::Instance().GetTotalSegmentCount();
-            uint64_t total_mb = nvr::SegmentIndex::Instance().GetTotalRecordingSizeBytes() / (1024 * 1024);
-
-            LOG_INFO << "[System Telemetry] Storage Free: " << free_mb << " MB | Indexed Segments: " 
-                     << total_segs << " (" << total_mb << " MB stored)";
-
-            for (const auto& cam : config.cameras) {
+        // Periodic maintenance and health reporting every 60 seconds
+        if (loop_counter >= 60) {
+            loop_counter = 0;
+            auto cameras = nvr::CameraManager::Instance().GetCameras();
+            for (const auto& cam : cameras) {
                 if (cam.enabled) {
                     bool online = nvr::CameraManager::Instance().IsCameraOnline(cam.id);
                     bool rec = nvr::RecordingScheduler::Instance().IsChannelRecording(cam.id);
                     uint32_t frames = nvr::RecordingScheduler::Instance().GetChannelFrameCount(cam.id);
                     uint64_t bytes = nvr::RecordingScheduler::Instance().GetChannelBytesWritten(cam.id);
 
-                    LOG_INFO << "  -> [Cam " << cam.id << ": " << cam.name << "] Online: " 
+                    LOG_INFO << "[Health] Cam " << cam.id << " (" << cam.name << "): Online: "
                              << (online ? "YES" : "NO") << " | REC: " << (rec ? "ACTIVE" : "STANDBY")
                              << " | Frames: " << frames << " | Bytes: " << (bytes / 1024) << " KB";
                 }
@@ -234,9 +184,6 @@ int main(int argc, char* argv[]) {
 
     // 3. Stop Retention Manager
     nvr::RetentionManager::Instance().Stop();
-
-    // 4. Close Database
-    nvr::DatabaseManager::Instance().Close();
 
     LOG_INFO << "NVR Core cleanly terminated. All segments finalized.";
 
