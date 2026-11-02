@@ -59,6 +59,13 @@ public:
             }
         }
 
+        auto get_fallback = [size]() {
+            QImage fallback(320, 180, QImage::Format_RGB32);
+            fallback.fill(QColor(15, 23, 42));
+            if (size) *size = fallback.size();
+            return fallback;
+        };
+
         if (frame && !frame->data.empty() && frame->width > 0 && frame->height > 0) {
             if (size) *size = QSize(frame->width, frame->height);
 
@@ -94,70 +101,94 @@ public:
                     holder
                 );
             } else if (frame->format == nvr::PixelFormat::NV12) {
-                // Fast integer fixed-point YUV->RGB conversion for desktop fallback without G2D
+                // Fast integer fixed-point YUV->RGB32 conversion for desktop fallback without G2D
                 int w = frame->width;
                 int h = frame->height;
+                int stride = frame->stride > 0 ? frame->stride : w;
+                size_t min_req = (static_cast<size_t>(stride) * h * 3) / 2;
+                if (frame->data.size() < min_req) {
+                    return get_fallback();
+                }
                 const uint8_t* y_plane = frame->data.data();
-                const uint8_t* uv_plane = y_plane + (w * h);
-                QImage qimg(w, h, QImage::Format_RGB888);
+                const uint8_t* uv_plane = y_plane + (static_cast<size_t>(stride) * h);
+                QImage qimg(w, h, QImage::Format_RGB32);
 
                 for (int y = 0; y < h; ++y) {
-                    uchar* scanline = qimg.scanLine(y);
-                    const uint8_t* y_row = y_plane + (y * w);
-                    const uint8_t* uv_row = uv_plane + ((y >> 1) * w);
-                    for (int x = 0; x < w; ++x) {
-                        int y_val = y_row[x];
-                        int uv_idx = x & ~1;
-                        int u_val = uv_row[uv_idx] - 128;
-                        int v_val = uv_row[uv_idx + 1] - 128;
+                    uint32_t* scanline = reinterpret_cast<uint32_t*>(qimg.scanLine(y));
+                    const uint8_t* y_row = y_plane + (static_cast<size_t>(y) * stride);
+                    const uint8_t* uv_row = uv_plane + (static_cast<size_t>(y >> 1) * stride);
+                    for (int x = 0; x < w; x += 2) {
+                        int u_val = uv_row[x] - 128;
+                        int v_val = uv_row[x + 1] - 128;
 
-                        int r = y_val + ((1436 * v_val) >> 10);
-                        int g = y_val - ((352 * u_val + 731 * v_val) >> 10);
-                        int b = y_val + ((1815 * u_val) >> 10);
+                        int ruv = (1436 * v_val) >> 10;
+                        int guv = (352 * u_val + 731 * v_val) >> 10;
+                        int buv = (1815 * u_val) >> 10;
 
-                        scanline[x * 3 + 0] = static_cast<uchar>(std::clamp(r, 0, 255));
-                        scanline[x * 3 + 1] = static_cast<uchar>(std::clamp(g, 0, 255));
-                        scanline[x * 3 + 2] = static_cast<uchar>(std::clamp(b, 0, 255));
+                        int y0 = y_row[x];
+                        int r0 = std::clamp(y0 + ruv, 0, 255);
+                        int g0 = std::clamp(y0 - guv, 0, 255);
+                        int b0 = std::clamp(y0 + buv, 0, 255);
+                        scanline[x] = 0xff000000u | (static_cast<uint32_t>(r0) << 16) | (static_cast<uint32_t>(g0) << 8) | static_cast<uint32_t>(b0);
+
+                        if (x + 1 < w) {
+                            int y1 = y_row[x + 1];
+                            int r1 = std::clamp(y1 + ruv, 0, 255);
+                            int g1 = std::clamp(y1 - guv, 0, 255);
+                            int b1 = std::clamp(y1 + buv, 0, 255);
+                            scanline[x + 1] = 0xff000000u | (static_cast<uint32_t>(r1) << 16) | (static_cast<uint32_t>(g1) << 8) | static_cast<uint32_t>(b1);
+                        }
                     }
                 }
                 return qimg;
             } else if (frame->format == nvr::PixelFormat::YUV420P) {
                 int w = frame->width;
                 int h = frame->height;
+                int stride = frame->stride > 0 ? frame->stride : w;
+                int uv_stride = stride / 2;
+                size_t min_req = (static_cast<size_t>(stride) * h) + 2 * (static_cast<size_t>(uv_stride) * (h / 2));
+                if (frame->data.size() < min_req) {
+                    return get_fallback();
+                }
                 const uint8_t* y_plane = frame->data.data();
-                const uint8_t* u_plane = y_plane + (w * h);
-                const uint8_t* v_plane = u_plane + (w * h / 4);
-                QImage qimg(w, h, QImage::Format_RGB888);
+                const uint8_t* u_plane = y_plane + (static_cast<size_t>(stride) * h);
+                const uint8_t* v_plane = u_plane + (static_cast<size_t>(uv_stride) * (h / 2));
+                QImage qimg(w, h, QImage::Format_RGB32);
 
                 for (int y = 0; y < h; ++y) {
-                    uchar* scanline = qimg.scanLine(y);
-                    const uint8_t* y_row = y_plane + (y * w);
-                    const uint8_t* u_row = u_plane + ((y >> 1) * (w >> 1));
-                    const uint8_t* v_row = v_plane + ((y >> 1) * (w >> 1));
-                    for (int x = 0; x < w; ++x) {
-                        int y_val = y_row[x];
+                    uint32_t* scanline = reinterpret_cast<uint32_t*>(qimg.scanLine(y));
+                    const uint8_t* y_row = y_plane + (static_cast<size_t>(y) * stride);
+                    const uint8_t* u_row = u_plane + (static_cast<size_t>(y >> 1) * uv_stride);
+                    const uint8_t* v_row = v_plane + (static_cast<size_t>(y >> 1) * uv_stride);
+                    for (int x = 0; x < w; x += 2) {
                         int uv_idx = x >> 1;
                         int u_val = u_row[uv_idx] - 128;
                         int v_val = v_row[uv_idx] - 128;
 
-                        int r = y_val + ((1436 * v_val) >> 10);
-                        int g = y_val - ((352 * u_val + 731 * v_val) >> 10);
-                        int b = y_val + ((1815 * u_val) >> 10);
+                        int ruv = (1436 * v_val) >> 10;
+                        int guv = (352 * u_val + 731 * v_val) >> 10;
+                        int buv = (1815 * u_val) >> 10;
 
-                        scanline[x * 3 + 0] = static_cast<uchar>(std::clamp(r, 0, 255));
-                        scanline[x * 3 + 1] = static_cast<uchar>(std::clamp(g, 0, 255));
-                        scanline[x * 3 + 2] = static_cast<uchar>(std::clamp(b, 0, 255));
+                        int y0 = y_row[x];
+                        int r0 = std::clamp(y0 + ruv, 0, 255);
+                        int g0 = std::clamp(y0 - guv, 0, 255);
+                        int b0 = std::clamp(y0 + buv, 0, 255);
+                        scanline[x] = 0xff000000u | (static_cast<uint32_t>(r0) << 16) | (static_cast<uint32_t>(g0) << 8) | static_cast<uint32_t>(b0);
+
+                        if (x + 1 < w) {
+                            int y1 = y_row[x + 1];
+                            int r1 = std::clamp(y1 + ruv, 0, 255);
+                            int g1 = std::clamp(y1 - guv, 0, 255);
+                            int b1 = std::clamp(y1 + buv, 0, 255);
+                            scanline[x + 1] = 0xff000000u | (static_cast<uint32_t>(r1) << 16) | (static_cast<uint32_t>(g1) << 8) | static_cast<uint32_t>(b1);
+                        }
                     }
                 }
                 return qimg;
             }
         }
 
-        // Standby background
-        QImage fallback(320, 180, QImage::Format_RGB888);
-        fallback.fill(QColor(15, 23, 42));
-        if (size) *size = fallback.size();
-        return fallback;
+        return get_fallback();
     }
 };
 
@@ -302,66 +333,37 @@ int main(int argc, char *argv[]) {
             std::cout << "Local UI loaded and running successfully." << std::endl;
             QQuickWindow *win = qobject_cast<QQuickWindow*>(obj);
             if (win && captureMode) {
-                QTimer::singleShot(1500, win, [win, obj]() {
+                // Wait for camera streams to establish and initial frames to decode
+                QTimer::singleShot(3000, win, [win, obj]() {
+                    const char* env_dir = std::getenv("UI_CAPTURE_DIR");
+                    std::string out_dir = env_dir ? (std::string(env_dir) + "/") : "artifacts/";
+                    std::filesystem::create_directories(out_dir);
+
                     QImage img = win->grabWindow();
-                    img.save("/home/mantra/.gemini/antigravity-ide/brain/401c5b32-abf8-4a83-aeeb-1c82c438014e/local_ui_live.png");
-                    std::cout << "[UI Capture] Live screenshot saved." << std::endl;
+                    img.save(QString::fromStdString(out_dir + "local_ui_live_4cam.png"));
+                    std::cout << "[UI Capture] 4-CAM grid screenshot saved to " << out_dir << std::endl;
 
-                    obj->setProperty("currentRoute", "playback");
+                    // Trigger Single-Camera Fullscreen for Camera 2 (MAIN stream 1080p)
+                    std::cout << "[UI Capture] Entering fullscreen for Camera 2..." << std::endl;
+                    QMetaObject::invokeMethod(obj, "toggleFullscreen", Q_ARG(QVariant, 2));
 
-                    QTimer::singleShot(1200, win, [win, obj]() {
+                    QTimer::singleShot(2500, win, [win, obj, out_dir]() {
                         QImage img2 = win->grabWindow();
-                        img2.save("/home/mantra/.gemini/antigravity-ide/brain/401c5b32-abf8-4a83-aeeb-1c82c438014e/local_ui_recordings.png");
-                        std::cout << "[UI Capture] Playback screenshot saved." << std::endl;
+                        img2.save(QString::fromStdString(out_dir + "local_ui_fullscreen_ch2.png"));
+                        std::cout << "[UI Capture] Camera 2 Fullscreen screenshot saved to " << out_dir << std::endl;
 
-                        obj->setProperty("currentRoute", "cameras");
+                        // Exit fullscreen back to 4-CAM grid
+                        std::cout << "[UI Capture] Exiting fullscreen back to 4-CAM grid..." << std::endl;
+                        QMetaObject::invokeMethod(obj, "toggleFullscreen", Q_ARG(QVariant, 2));
 
-                        QTimer::singleShot(1200, win, [win, obj]() {
+                        QTimer::singleShot(2000, win, [win, out_dir]() {
                             QImage img3 = win->grabWindow();
-                            img3.save("/home/mantra/.gemini/antigravity-ide/brain/401c5b32-abf8-4a83-aeeb-1c82c438014e/local_ui_cameras.png");
-                            std::cout << "[UI Capture] Cameras screenshot saved." << std::endl;
+                            img3.save(QString::fromStdString(out_dir + "local_ui_live_restored_4cam.png"));
+                            std::cout << "[UI Capture] Restored 4-CAM grid screenshot saved to " << out_dir << std::endl;
 
-                            obj->setProperty("currentRoute", "dashboard");
-
-                            QTimer::singleShot(1200, win, [win, obj]() {
-                                QImage img4 = win->grabWindow();
-                                img4.save("/home/mantra/.gemini/antigravity-ide/brain/401c5b32-abf8-4a83-aeeb-1c82c438014e/local_ui_dashboard.png");
-                                std::cout << "[UI Capture] Dashboard screenshot saved." << std::endl;
-
-                                obj->setProperty("currentRoute", "system");
-
-                                QTimer::singleShot(1200, win, [win, obj]() {
-                                    QImage img5 = win->grabWindow();
-                                    img5.save("/home/mantra/.gemini/antigravity-ide/brain/401c5b32-abf8-4a83-aeeb-1c82c438014e/local_ui_system.png");
-                                    std::cout << "[UI Capture] System screenshot saved." << std::endl;
-
-                                    obj->setProperty("currentRoute", "live");
-                                    std::cout << "[UI Capture] Switched back to Live Matrix. All 5 pages captured." << std::endl;
-
-                                    // Capture 7+1 Mode
-                                    obj->setProperty("liveLayoutMode", "7plus1");
-                                    QTimer::singleShot(1000, win, [win, obj]() {
-                                        QImage img7 = win->grabWindow();
-                                        img7.save("/home/mantra/.gemini/antigravity-ide/brain/401c5b32-abf8-4a83-aeeb-1c82c438014e/local_ui_live_7plus1.png");
-                                        std::cout << "[UI Capture] 7+1 layout screenshot saved." << std::endl;
-
-                                        // Capture 8-CAM Mode
-                                        obj->setProperty("liveLayoutMode", "8");
-                                        QTimer::singleShot(1000, win, [win, obj]() {
-                                            QImage img8 = win->grabWindow();
-                                            img8.save("/home/mantra/.gemini/antigravity-ide/brain/401c5b32-abf8-4a83-aeeb-1c82c438014e/local_ui_live_8cam.png");
-                                            std::cout << "[UI Capture] 8-CAM layout screenshot saved." << std::endl;
-
-                                            // Return to 4-CAM default
-                                            obj->setProperty("liveLayoutMode", "4");
-
-                                            QTimer::singleShot(500, []() {
-                                                std::cout << "[UI Capture] All captures complete. Exiting." << std::endl;
-                                                QCoreApplication::quit();
-                                            });
-                                        });
-                                    });
-                                });
+                            QTimer::singleShot(500, []() {
+                                std::cout << "[UI Capture] All live verification captures complete. Exiting." << std::endl;
+                                QCoreApplication::quit();
                             });
                         });
                     });

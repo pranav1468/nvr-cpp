@@ -20,6 +20,10 @@ ApplicationWindow {
     property string toastText: ""
     property bool toastVisible: false
 
+    function toggleFullscreen(ch) {
+        livePageView.toggleFullscreen(ch);
+    }
+
     function showToast(msg) {
         appWindow.toastText = msg;
         appWindow.toastVisible = true;

@@ -607,7 +607,7 @@ Item {
                 // CH 01 (Master in 7+1 mode, Fullscreen in 1-CAM)
                 VideoTile {
                     id: tile1
-                    tileIndex: tile1.channelId - 1
+                    tileIndex: 0
                     channelId: root.layoutMode === "1" ? root.fullscreenChannel : 1
                     cameraName: matrixWrapper.getCameraName(tile1.channelId)
                     visible: true
