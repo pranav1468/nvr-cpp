@@ -2731,12 +2731,18 @@ function setupEventListeners() {
     }
   });
 
-  // Step backward 1 frame (40ms @ 25fps)
+  function getPlaybackStepSeconds() {
+    const cam = pbActive ? camerasState.find((c) => c.id === pbActive.channel_id) : null;
+    const fps = (cam && cam.fps > 0) ? cam.fps : 25;
+    return 1.0 / fps;
+  }
+
+  // Step backward 1 frame (1/FPS)
   document.getElementById("btn-pb-step-back")?.addEventListener("click", () => {
     const v = document.getElementById("pb-video");
     if (!v) return;
     if (!v.paused) v.pause();
-    v.currentTime = Math.max(0, v.currentTime - 0.04);
+    v.currentTime = Math.max(0, v.currentTime - getPlaybackStepSeconds());
   });
 
   // 1 second skip back
@@ -2762,12 +2768,12 @@ function setupEventListeners() {
     if (v) v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 1);
   });
 
-  // Step forward 1 frame (40ms @ 25fps)
+  // Step forward 1 frame (1/FPS)
   document.getElementById("btn-pb-step-fwd")?.addEventListener("click", () => {
     const v = document.getElementById("pb-video");
     if (!v) return;
     if (!v.paused) v.pause();
-    v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 0.04);
+    v.currentTime = Math.min(v.duration || Infinity, v.currentTime + getPlaybackStepSeconds());
   });
 
   // Auto-advance toggle

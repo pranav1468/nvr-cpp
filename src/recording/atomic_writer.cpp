@@ -1504,9 +1504,11 @@ bool AtomicWriter::WritePacket(const MediaPacketPtr& packet) {
         keyframe_count_++;
     }
 
-    // Emit fragment at GOP boundaries or every ~1 second (30 frames)
-    if ((packet->is_keyframe && pending_samples_.size() >= 25) || 
-        pending_samples_.size() >= 30 || 
+    // Emit fragment at GOP boundaries (>= 500ms elapsed) or safety ceilings
+    bool should_flush_gop = packet->is_keyframe && !pending_samples_.empty() &&
+        (packet->pts_us >= static_cast<int64_t>(pending_samples_.front().pts) + 500000);
+    if (should_flush_gop || 
+        pending_samples_.size() >= 60 || 
         pending_audio_samples_.size() >= 50) {
         FlushCurrentFragment();
     }

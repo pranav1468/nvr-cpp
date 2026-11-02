@@ -51,7 +51,7 @@ struct WsStreamContext {
     std::condition_variable cv;
     std::deque<MediaPacketPtr> queue;
     std::atomic<bool> closed{false};
-    static constexpr size_t kMaxQueueDepth = 120; // 120 frames (~4.8s at 25fps)
+    static constexpr size_t kMaxQueueDepth = 120; // Bounded frame queue (4.0s @ 30fps, 4.8s @ 25fps, 8.0s @ 15fps, 12.0s @ 10fps)
 };
 
 std::string HttpStatusMessage(int code) {
