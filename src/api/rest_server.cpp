@@ -155,6 +155,9 @@ void SendHttpResponse(int client_fd, int status_code, const std::string& content
     oss << "X-Content-Type-Options: nosniff\r\n";
     oss << "X-Frame-Options: SAMEORIGIN\r\n";
     oss << "Referrer-Policy: strict-origin-when-cross-origin\r\n";
+    oss << "Cross-Origin-Opener-Policy: same-origin\r\n";
+    oss << "Cross-Origin-Embedder-Policy: require-corp\r\n";
+    oss << "Cross-Origin-Resource-Policy: cross-origin\r\n";
     if (RestServer::Instance().IsHstsEnabled()) {
         oss << "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n";
     }
@@ -932,6 +935,9 @@ void RestServer::HandleClient(int client_fd) {
                 oss << "X-Content-Type-Options: nosniff\r\n";
                 oss << "X-Frame-Options: SAMEORIGIN\r\n";
                 oss << "Referrer-Policy: strict-origin-when-cross-origin\r\n";
+                oss << "Cross-Origin-Opener-Policy: same-origin\r\n";
+                oss << "Cross-Origin-Embedder-Policy: require-corp\r\n";
+                oss << "Cross-Origin-Resource-Policy: cross-origin\r\n";
                 if (IsHstsEnabled()) {
                     oss << "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n";
                 }
@@ -1276,7 +1282,8 @@ void RestServer::HandleStreamClient(int client_fd, int channel_id, StreamType st
         "Access-Control-Expose-Headers: X-Stream-Codec\r\n"
         "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Pragma: no-cache\r\n"
-        "Expires: 0\r\n" +
+        "Expires: 0\r\n"
+        "Cross-Origin-Resource-Policy: cross-origin\r\n" +
         cors_hdr +
         "Connection: close\r\n\r\n";
 
@@ -1694,6 +1701,9 @@ void RestServer::HandleRecordingVideo(int client_fd, const nlohmann::json& query
                 oss << BuildCorsHeaders(request_origin, false);
                 oss << "X-Content-Type-Options: nosniff\r\n";
                 oss << "Access-Control-Expose-Headers: Content-Range, Accept-Ranges, Content-Length\r\n";
+                oss << "Cross-Origin-Opener-Policy: same-origin\r\n";
+                oss << "Cross-Origin-Embedder-Policy: require-corp\r\n";
+                oss << "Cross-Origin-Resource-Policy: cross-origin\r\n";
                 oss << "Connection: close\r\n\r\n";
 
                 std::string hstr = oss.str();
@@ -1725,6 +1735,9 @@ void RestServer::HandleRecordingVideo(int client_fd, const nlohmann::json& query
     oss << BuildCorsHeaders(request_origin, false);
     oss << "X-Content-Type-Options: nosniff\r\n";
     oss << "Access-Control-Expose-Headers: Content-Range, Accept-Ranges, Content-Length\r\n";
+    oss << "Cross-Origin-Opener-Policy: same-origin\r\n";
+    oss << "Cross-Origin-Embedder-Policy: require-corp\r\n";
+    oss << "Cross-Origin-Resource-Policy: cross-origin\r\n";
     if (!extra_headers.empty()) oss << extra_headers;
     oss << "Connection: close\r\n\r\n";
 
@@ -1920,6 +1933,10 @@ void RestServer::HandleRecordingExportDownload(int client_fd, const nlohmann::js
     oss << "Content-Type: video/mp4\r\n";
     oss << "Content-Length: " << file_size << "\r\n";
     oss << "Content-Disposition: attachment; filename=\"" << fname << "\"\r\n";
+    oss << "X-Content-Type-Options: nosniff\r\n";
+    oss << "Cross-Origin-Opener-Policy: same-origin\r\n";
+    oss << "Cross-Origin-Embedder-Policy: require-corp\r\n";
+    oss << "Cross-Origin-Resource-Policy: cross-origin\r\n";
     oss << BuildCorsHeaders(request_origin, false);
     oss << "Connection: close\r\n\r\n";
 

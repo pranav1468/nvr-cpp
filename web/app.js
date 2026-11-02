@@ -560,8 +560,24 @@ class NvrStreamEngine {
 
   setupWebCodecs(decoderConfig) {
     if (this.decoder) { try { this.decoder.close(); } catch {} }
-    if (!this.ctx && this.canvas) {
-      this.ctx = this.canvas.getContext("2d", { alpha: false, desynchronized: true });
+    if (this.canvas && this.canvas.parentNode) {
+      try {
+        if (!this.ctx) {
+          this.ctx = this.canvas.getContext("2d", { alpha: false, desynchronized: true });
+        }
+      } catch {
+        const freshCanvas = document.createElement("canvas");
+        freshCanvas.className = this.canvas.className;
+        Object.assign(freshCanvas.style, {
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          display: this.canvas.style.display || "none"
+        });
+        this.canvas.parentNode.replaceChild(freshCanvas, this.canvas);
+        this.canvas = freshCanvas;
+        this.ctx = this.canvas.getContext("2d", { alpha: false, desynchronized: true });
+      }
     }
     this.awaitingKeyChunk = true;
     this.decoder = new VideoDecoder({
@@ -647,6 +663,30 @@ class NvrStreamEngine {
         try { this.wasmPlayer.close(); } catch {}
         this.wasmPlayer = null;
       }
+
+      // Ensure canvas has no prior rendering context so transferControlToOffscreen succeeds
+      if (this.canvas && this.canvas.parentNode) {
+        const freshCanvas = document.createElement("canvas");
+        freshCanvas.className = this.canvas.className;
+        Object.assign(freshCanvas.style, {
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          display: this.canvas.style.display || "none"
+        });
+        this.canvas.parentNode.replaceChild(freshCanvas, this.canvas);
+        this.canvas = freshCanvas;
+        this.ctx = null;
+      }
+
+      const canUseThreads = typeof window !== "undefined" &&
+        Boolean(window.crossOriginIsolated) &&
+        typeof SharedArrayBuffer !== "undefined";
+
+      const hardwareThreads = navigator.hardwareConcurrency || 4;
+      const targetThreads = canUseThreads ? Math.min(4, Math.max(2, Math.floor(hardwareThreads / 2))) : 1;
+      const chosenVariant = canUseThreads ? "threads-simd" : "auto";
+
       this.awaitingKeyChunk = true;
       this.wasmPlayer = new HevcPlayer({
         canvas: this.canvas,
@@ -654,9 +694,24 @@ class NvrStreamEngine {
         wasmBaseUrl: "/wasm/",
         workerUrl: "/wasm/wasm-worker.bundle.js",
         wasmWorker: "auto",
+        wasmVariant: chosenVariant,
+        threads: targetThreads,
         renderer: "auto",
-        codec: cfg?.codec_string || "hev1.1.6.L90"
+        codec: cfg?.codec_string || "hev1.1.6.L90",
+        lowLatency: {
+          enabled: true,
+          maxInputFrames: 60,
+          maxInputBytes: 16 * 1024 * 1024,
+          maxDecodeQueue: 8,
+          maxQueueAgeMs: 1200,
+          dropPolicy: "until-key"
+        }
       });
+
+      this.wasmPlayer.on("keyframerequest", () => {
+        this.awaitingKeyChunk = true;
+      });
+
       await this.wasmPlayer.init();
       return true;
     } catch (e) {
@@ -697,6 +752,7 @@ class NvrStreamEngine {
         });
       } catch (err) {
         console.warn(`[Cam ${this.channelId}] WASM frame dispatch error:`, err);
+        this.awaitingKeyChunk = true;
       }
     }
   }

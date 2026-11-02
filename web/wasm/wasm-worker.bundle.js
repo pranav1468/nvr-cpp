@@ -56,14 +56,30 @@ var HevcPlayerError = class extends Error {
 function supportsSimd() {
   return typeof WebAssembly === "object" && WebAssembly.validate(new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 5, 1, 96, 0, 1, 123, 3, 2, 1, 0, 10, 10, 1, 8, 0, 65, 0, 253, 15, 253, 98, 11]));
 }
+function supportsThreads() {
+  try {
+    return typeof MessageChannel !== "undefined" &&
+           typeof SharedArrayBuffer !== "undefined" &&
+           typeof WebAssembly === "object" &&
+           typeof WebAssembly.Memory === "function" &&
+           new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true }) instanceof WebAssembly.Memory;
+  } catch {
+    return false;
+  }
+}
 function selectVariant(requested) {
   if (requested && requested !== "auto")
     return requested;
+  if (supportsThreads() && supportsSimd())
+    return "threads-simd";
   return supportsSimd() ? "simd" : "baseline";
 }
 function getWasmVariantCandidates(requested, selected) {
+  if (requested === "threads-simd" || selected === "threads-simd") {
+    return supportsSimd() ? ["threads-simd", "simd", "baseline"] : ["threads-simd", "baseline"];
+  }
   if (requested && requested !== "auto") {
-    return [requested];
+    return [requested, "baseline"];
   }
   return selected === "simd" ? ["simd", "baseline"] : ["baseline"];
 }
