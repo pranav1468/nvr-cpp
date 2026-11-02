@@ -1108,6 +1108,7 @@ var init_wasm_worker = __esm({
             frameDuration: this.options.frameDuration,
             renderer: this.options.renderer,
             frameOutput: this.options.workerFrameOutput,
+            lowLatency: this.options.lowLatency,
             ...this.options.wasmBaseUrl === void 0 ? {} : { wasmBaseUrl: new URL(this.options.wasmBaseUrl, globalThis.document?.baseURI ?? import.meta.url).href },
             ...this.options.wasmVariant === void 0 ? {} : { wasmVariant: this.options.wasmVariant },
             ...this.options.threads === void 0 ? {} : { threads: this.options.threads }
@@ -1722,6 +1723,10 @@ var init_player = __esm({
       }
       #handleFrame(frame) {
         this.decodedFrames += 1;
+        if (this.decoder?.handlesRendering) {
+          frame.close();
+          return;
+        }
         if (this.options.lowLatency.enabled && this.rendering && this.pendingFrames.length) {
           const dropped = this.pendingFrames.pop();
           this.droppedRenderFrames += 1;

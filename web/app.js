@@ -698,12 +698,13 @@ class NvrStreamEngine {
         threads: targetThreads,
         renderer: "auto",
         codec: cfg?.codec_string || "hev1.1.6.L90",
+        workerFrameOutput: "metadata",
         lowLatency: {
           enabled: true,
-          maxInputFrames: 60,
-          maxInputBytes: 16 * 1024 * 1024,
-          maxDecodeQueue: 8,
-          maxQueueAgeMs: 1200,
+          maxInputFrames: 120,
+          maxInputBytes: 32 * 1024 * 1024,
+          maxDecodeQueue: 30,
+          maxQueueAgeMs: 3000,
           dropPolicy: "until-key"
         }
       });

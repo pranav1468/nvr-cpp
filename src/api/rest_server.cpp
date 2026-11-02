@@ -51,7 +51,7 @@ struct WsStreamContext {
     std::condition_variable cv;
     std::deque<MediaPacketPtr> queue;
     std::atomic<bool> closed{false};
-    static constexpr size_t kMaxQueueDepth = 10; // Bounded head-drop (~300ms @ 30fps)
+    static constexpr size_t kMaxQueueDepth = 120; // 120 frames (~4.8s at 25fps)
 };
 
 std::string HttpStatusMessage(int code) {
@@ -2034,6 +2034,8 @@ std::vector<uint8_t> RestServer::BuildWebSocketFrame(const uint8_t* payload, siz
 void RestServer::HandleWebSocketStream(int client_fd, int channel_id, StreamType stream_type) {
     int nodelay = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+    int sndbuf = 512 * 1024;
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
     struct timeval snd_tv{1, 0};
     setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
     struct timeval rcv_tv{0, 0};
@@ -2055,7 +2057,12 @@ void RestServer::HandleWebSocketStream(int client_fd, int channel_id, StreamType
             }
             std::lock_guard<std::mutex> lock(ctx->mtx);
             if (ctx->queue.size() >= WsStreamContext::kMaxQueueDepth) {
-                ctx->queue.pop_front(); // Head-drop oldest frame to bound latency
+                while (ctx->queue.size() > (WsStreamContext::kMaxQueueDepth / 2)) {
+                    ctx->queue.pop_front();
+                }
+                while (!ctx->queue.empty() && !ctx->queue.front()->is_keyframe) {
+                    ctx->queue.pop_front();
+                }
             }
             ctx->queue.push_back(pkt);
             ctx->cv.notify_one();

@@ -681,6 +681,10 @@ function respond(id, action) {
   });
 }
 function postFrame(frame) {
+  if (renderer) {
+    frame.close();
+    return;
+  }
   const serialized = {
     timestamp: frame.timestamp,
     codedWidth: frame.codedWidth,
@@ -735,13 +739,13 @@ async function initialize(options) {
     render: true,
     wasmWorker: "disabled",
     renderer: options.renderer,
-    workerFrameOutput: options.frameOutput,
-    lowLatency: {
+    workerFrameOutput: options.frameOutput || "metadata",
+    lowLatency: options.lowLatency || {
       enabled: true,
-      maxInputFrames: 12,
-      maxInputBytes: 8 * 1024 * 1024,
-      maxDecodeQueue: 4,
-      maxQueueAgeMs: 250,
+      maxInputFrames: 120,
+      maxInputBytes: 32 * 1024 * 1024,
+      maxDecodeQueue: 30,
+      maxQueueAgeMs: 3000,
       dropPolicy: "until-key"
     },
     ...options.wasmBaseUrl === void 0 ? {} : { wasmBaseUrl: options.wasmBaseUrl },
@@ -756,7 +760,7 @@ async function initialize(options) {
   };
   decoder = new WasmBackend(backendOptions, {
     onFrameView: (frame) => renderer?.render(frame),
-    shouldCopyFrames: () => !(renderer && initOptions?.frameOutput === "metadata")
+    shouldCopyFrames: () => !renderer && initOptions?.frameOutput !== "metadata"
   });
   await decoder.init();
 }
