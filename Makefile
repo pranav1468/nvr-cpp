@@ -105,7 +105,7 @@ clean:
 	rm -rf build
 	rm -f bin/nvr_server bin/nvr_gui
 
-IMX_SDK_ENV ?= /home/mantra/Desktop/NVR_1/imx-sdk/environment-setup-armv8a-poky-linux
+IMX_SDK_ENV ?= $(firstword $(wildcard /opt/fsl-imx-xwayland/*/environment-setup-armv8a-poky-linux $(HOME)/imx-sdk/environment-setup-armv8a-poky-linux $(HOME)/Desktop/NVR_1/imx-sdk/environment-setup-armv8a-poky-linux))
 
 cross:
 	@if [ ! -f $(IMX_SDK_ENV) ]; then \
