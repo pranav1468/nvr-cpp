@@ -69,7 +69,7 @@
   ],
   "live": {
     "drop_stale_frames": true,
-    "grid_layout": 6,
+    "grid_layout": 8,
     "max_queue_depth": 2
   },
   "storage": {

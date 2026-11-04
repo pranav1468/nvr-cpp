@@ -51,7 +51,7 @@ struct WsStreamContext {
     std::condition_variable cv;
     std::deque<MediaPacketPtr> queue;
     std::atomic<bool> closed{false};
-    static constexpr size_t kMaxQueueDepth = 120; // Bounded frame queue (4.0s @ 30fps, 4.8s @ 25fps, 8.0s @ 15fps, 12.0s @ 10fps)
+    static constexpr size_t kMaxQueueDepth = 15; // Freshness-first bounded queue (~500ms @ 30fps)
 };
 
 std::string HttpStatusMessage(int code) {
@@ -535,7 +535,6 @@ bool RestServer::Start() {
     is_running_.store(true);
     size_t pool_size = std::clamp<size_t>(std::thread::hardware_concurrency(), 2, 4);
     worker_pool_ = std::make_unique<ThreadPool>(pool_size);
-    media_pool_ = std::make_unique<ThreadPool>(pool_size);
     listener_thread_ = std::thread(&RestServer::ListenerLoop, this);
 
     LOG_INFO << "[RestServer] HTTP REST Control Plane listening on " 
@@ -560,11 +559,6 @@ void RestServer::Stop() {
 
     if (listener_thread_.joinable()) {
         listener_thread_.join();
-    }
-
-    if (media_pool_) {
-        media_pool_->Shutdown();
-        media_pool_.reset();
     }
 
     if (worker_pool_) {
@@ -1020,21 +1014,14 @@ void RestServer::HandleClient(int client_fd) {
                 active_media_streams_.fetch_add(1);
                 guard.released = true;
                 active_connections_.fetch_sub(1, std::memory_order_relaxed);
-                if (media_pool_) {
-                    media_pool_->Enqueue([this, client_fd, channel_id, stream_type]() {
-                        HandleWebSocketStream(client_fd, channel_id, stream_type);
-                        active_media_streams_.fetch_sub(1);
-                    });
-                } else {
-                    std::thread([this, client_fd, channel_id, stream_type]() {
-                        HandleWebSocketStream(client_fd, channel_id, stream_type);
-                        active_media_streams_.fetch_sub(1);
-                    }).detach();
-                }
+                std::thread([this, client_fd, channel_id, stream_type]() {
+                    HandleWebSocketStream(client_fd, channel_id, stream_type);
+                    active_media_streams_.fetch_sub(1);
+                }).detach();
                 return;
             } catch (const std::exception& e) {
                 active_media_streams_.fetch_sub(1);
-                LOG_WARN << "Failed to enqueue WebSocket stream: " << e.what();
+                LOG_WARN << "Failed to spawn WebSocket stream thread: " << e.what();
                 close(client_fd);
                 return;
             }
@@ -1067,21 +1054,14 @@ void RestServer::HandleClient(int client_fd) {
             active_media_streams_.fetch_add(1);
             guard.released = true;
             active_connections_.fetch_sub(1, std::memory_order_relaxed);
-            if (media_pool_) {
-                media_pool_->Enqueue([this, client_fd, channel_id, stream_type, request_origin]() {
-                    HandleStreamClient(client_fd, channel_id, stream_type, request_origin);
-                    active_media_streams_.fetch_sub(1);
-                });
-            } else {
-                std::thread([this, client_fd, channel_id, stream_type, request_origin]() {
-                    HandleStreamClient(client_fd, channel_id, stream_type, request_origin);
-                    active_media_streams_.fetch_sub(1);
-                }).detach();
-            }
+            std::thread([this, client_fd, channel_id, stream_type, request_origin]() {
+                HandleStreamClient(client_fd, channel_id, stream_type, request_origin);
+                active_media_streams_.fetch_sub(1);
+            }).detach();
             return;
         } catch (const std::exception& e) {
             active_media_streams_.fetch_sub(1);
-            LOG_WARN << "Failed to enqueue fMP4 stream: " << e.what();
+            LOG_WARN << "Failed to spawn fMP4 stream thread: " << e.what();
             close(client_fd);
             return;
         }
@@ -2149,7 +2129,7 @@ void RestServer::HandleWebSocketStream(int client_fd, int channel_id, StreamType
             }
             std::lock_guard<std::mutex> lock(ctx->mtx);
             if (ctx->queue.size() >= WsStreamContext::kMaxQueueDepth) {
-                while (ctx->queue.size() > (WsStreamContext::kMaxQueueDepth / 2)) {
+                while (ctx->queue.size() > 2) {
                     ctx->queue.pop_front();
                 }
                 while (!ctx->queue.empty() && !ctx->queue.front()->is_keyframe) {

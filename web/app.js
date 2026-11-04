@@ -311,6 +311,9 @@ async function loadCameras() {
             snapshot_key: `cam${((id - 1) % 8) + 1}`,
           };
         });
+        if (cameras.length > 4 && liveLayout === 4) {
+          liveLayout = 8;
+        }
         localStorage.setItem("nvr_cameras", JSON.stringify(cameras));
         return;
       }
@@ -322,6 +325,9 @@ async function loadCameras() {
     const local = localStorage.getItem("nvr_cameras");
     if (local) {
       cameras = JSON.parse(local);
+      if (cameras.length > 4 && liveLayout === 4) {
+        liveLayout = 8;
+      }
       return;
     }
   } catch {}
@@ -391,31 +397,27 @@ class NvrStreamEngine {
         overflow: "hidden",
       });
       this.container.appendChild(stage);
-    } else {
-      stage.innerHTML = "";
     }
 
-    this.video = document.createElement("video");
-    this.video.autoplay = true;
-    this.video.muted = true;
-    this.video.playsInline = true;
-    Object.assign(this.video.style, { width: "100%", height: "100%", objectFit: "cover", display: "none" });
-    this.video.addEventListener("loadedmetadata", () => {
-      if (this.video && this.video.videoHeight > 0) {
-        this.updateDynamicResolutionBadge(this.video.videoWidth, this.video.videoHeight);
-      }
-    });
-    this.video.addEventListener("resize", () => {
-      if (this.video && this.video.videoHeight > 0) {
-        this.updateDynamicResolutionBadge(this.video.videoWidth, this.video.videoHeight);
-      }
-    });
-    stage.appendChild(this.video);
+    let vid = stage.querySelector("video");
+    if (!vid) {
+      vid = document.createElement("video");
+      vid.autoplay = true;
+      vid.muted = true;
+      vid.playsInline = true;
+      Object.assign(vid.style, { width: "100%", height: "100%", objectFit: "cover", display: "none" });
+      stage.appendChild(vid);
+    }
+    this.video = vid;
 
-    this.canvas = document.createElement("canvas");
-    Object.assign(this.canvas.style, { width: "100%", height: "100%", objectFit: "cover", display: "none" });
+    let cvs = stage.querySelector("canvas");
+    if (!cvs) {
+      cvs = document.createElement("canvas");
+      Object.assign(cvs.style, { width: "100%", height: "100%", objectFit: "cover", display: "none" });
+      stage.appendChild(cvs);
+    }
+    this.canvas = cvs;
     this.ctx = null;
-    stage.appendChild(this.canvas);
   }
 
   static base64ToUint8Array(b64) {
@@ -514,7 +516,7 @@ class NvrStreamEngine {
       this.ws.onclose = () => {
         if (!this.isDestroyed && this.activeTier !== "MSE") {
           if (this.activeTier === "NONE") this.setOfflineStatus("Reconnecting stream…");
-          this.reconnectTimer = setTimeout(() => this.start(), 5000);
+          this.reconnectTimer = setTimeout(() => this.start(), 1000);
         }
       };
     } catch (e) {
@@ -788,7 +790,10 @@ class NvrStreamEngine {
         if (!isKeyframe) return;
         this.awaitingKeyChunk = false;
       }
-      if (this.decoder.decodeQueueSize > 8 && !isKeyframe) return;
+      if (this.decoder.decodeQueueSize > 8 && !isKeyframe) {
+        this.awaitingKeyChunk = true;
+        return;
+      }
       try {
         const chunk = this.webcodecsMode === "avcc" ? NvrStreamEngine.annexBToLengthPrefixed(nalData, isH265) : nalData;
         if (chunk.byteLength === 0) return;
@@ -1053,8 +1058,9 @@ function renderLiveMatrix() {
       // If existing engine already matches targetStream: DO NOTHING.
       // Stream continues playing without a single dropped frame!
     } else {
+      // Only tear down engine if camera was explicitly disabled or removed
       const existing = liveStreamEngines.get(ch);
-      if (existing) {
+      if (existing && !isEnabled) {
         try { existing.destroy(); } catch {}
         liveStreamEngines.delete(ch);
       }
