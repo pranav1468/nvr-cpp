@@ -10,25 +10,25 @@
       "enabled": true,
       "id": 1,
       "name": "Camera 01",
-      "onvif_password": "Admin$123",
+      "onvif_password": "Admin@123",
       "onvif_username": "admin",
-      "onvif_xaddr": "http://172.24.103.221/onvif/device_service",
+      "onvif_xaddr": "http://172.24.103.201:8090/onvif/device_service",
       "reconnect_delay_sec": 3,
       "record_mode": 1,
-      "rtsp_url": "rtsp://admin:Admin$123@172.24.103.221:554/video/live?channel=1&subtype=0",
-      "sub_rtsp_url": "rtsp://admin:Admin$123@172.24.103.221:554/video/live?channel=1&subtype=1"
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.201:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.201:554/substream"
     },
     {
       "enabled": true,
       "id": 2,
       "name": "Camera 02",
-      "onvif_password": "Admin$123",
+      "onvif_password": "Admin@123",
       "onvif_username": "admin",
-      "onvif_xaddr": "http://172.24.103.172/onvif/device_service",
+      "onvif_xaddr": "http://172.24.103.202:8090/onvif/device_service",
       "reconnect_delay_sec": 3,
       "record_mode": 1,
-      "rtsp_url": "rtsp://admin:Admin$123@172.24.103.172:554/video/live?channel=1&subtype=0",
-      "sub_rtsp_url": "rtsp://admin:Admin$123@172.24.103.172:554/video/live?channel=1&subtype=1"
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.202:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.202:554/substream"
     },
     {
       "enabled": true,
@@ -48,16 +48,28 @@
       "name": "Camera 04",
       "onvif_password": "Admin@123",
       "onvif_username": "admin",
-      "onvif_xaddr": "http://172.24.103.210:8090/onvif/device_service",
+      "onvif_xaddr": "http://172.24.103.203:8090/onvif/device_service",
       "reconnect_delay_sec": 3,
       "record_mode": 1,
-      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.210:554/mainstream",
-      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.210:554/substream"
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.203:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.203:554/substream"
+    },
+    {
+      "enabled": true,
+      "id": 5,
+      "name": "Camera 05",
+      "onvif_password": "Admin@123",
+      "onvif_username": "admin",
+      "onvif_xaddr": "http://172.24.103.205:8090/onvif/device_service",
+      "reconnect_delay_sec": 3,
+      "record_mode": 1,
+      "rtsp_url": "rtsp://admin:Admin@123@172.24.103.205:554/mainstream",
+      "sub_rtsp_url": "rtsp://admin:Admin@123@172.24.103.205:554/substream"
     }
   ],
   "live": {
     "drop_stale_frames": true,
-    "grid_layout": 4,
+    "grid_layout": 6,
     "max_queue_depth": 2
   },
   "storage": {

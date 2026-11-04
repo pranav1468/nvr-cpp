@@ -25,33 +25,36 @@ CameraManager::~CameraManager() {
 }
 
 void CameraManager::Initialize(const std::vector<CameraConfig>& configs) {
+    if (!configs.empty()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        cameras_.clear();
+        for (const auto& cfg : configs) {
+            CameraEntry entry;
+            entry.config = cfg;
+            cameras_[cfg.id] = std::move(entry);
+
+            CameraRecord rec;
+            rec.channel_id = cfg.id;
+            rec.name = cfg.name;
+            rec.rtsp_main_url = cfg.rtsp_url;
+            rec.rtsp_sub_url = cfg.sub_rtsp_url;
+            rec.onvif_xaddr = cfg.onvif_xaddr;
+            rec.onvif_username = cfg.onvif_username;
+            rec.onvif_password = cfg.onvif_password;
+            rec.enabled = cfg.enabled;
+            rec.record_mode = static_cast<int>(cfg.record_mode);
+            rec.updated_at = time_utils::WallTimeMs();
+            DatabaseManager::Instance().UpsertCamera(rec);
+        }
+        LOG_INFO << "CameraManager initialized with " << cameras_.size() << " configured cameras from nvr_config.json (synced to SQLite)";
+        return;
+    }
+
     if (LoadCamerasFromDb()) {
         std::lock_guard<std::mutex> lock(mutex_);
         LOG_INFO << "CameraManager initialized with " << cameras_.size() << " cameras from SQLite database";
         return;
     }
-
-    std::lock_guard<std::mutex> lock(mutex_);
-    cameras_.clear();
-    for (const auto& cfg : configs) {
-        CameraEntry entry;
-        entry.config = cfg;
-        cameras_[cfg.id] = std::move(entry);
-
-        CameraRecord rec;
-        rec.channel_id = cfg.id;
-        rec.name = cfg.name;
-        rec.rtsp_main_url = cfg.rtsp_url;
-        rec.rtsp_sub_url = cfg.sub_rtsp_url;
-        rec.onvif_xaddr = cfg.onvif_xaddr;
-        rec.onvif_username = cfg.onvif_username;
-        rec.onvif_password = cfg.onvif_password;
-        rec.enabled = cfg.enabled;
-        rec.record_mode = static_cast<int>(cfg.record_mode);
-        rec.updated_at = time_utils::WallTimeMs();
-        DatabaseManager::Instance().UpsertCamera(rec);
-    }
-    LOG_INFO << "CameraManager initialized with " << cameras_.size() << " configured cameras (synced to SQLite)";
 }
 
 bool CameraManager::LoadCamerasFromDb() {
