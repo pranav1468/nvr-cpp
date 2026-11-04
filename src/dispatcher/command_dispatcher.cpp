@@ -217,6 +217,46 @@ void CommandDispatcher::RegisterDefaultHandlers() {
             resp["cpu_load_5m"] = loadavg[1];
         }
 
+        resp["cpu_cores"] = static_cast<int>(std::thread::hardware_concurrency());
+
+        static unsigned long long prev_user = 0, prev_nice = 0, prev_system = 0, prev_idle = 0;
+        static unsigned long long prev_iowait = 0, prev_irq = 0, prev_softirq = 0, prev_steal = 0;
+        static double cached_cpu_pct = 0.0;
+        static std::chrono::steady_clock::time_point last_stat_read{};
+
+        auto now_stat = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_stat - last_stat_read).count() >= 500) {
+            std::ifstream stat_file("/proc/stat");
+            if (stat_file.is_open()) {
+                std::string line;
+                if (std::getline(stat_file, line) && line.rfind("cpu ", 0) == 0) {
+                    unsigned long long u = 0, n = 0, s = 0, id = 0, io = 0, ir = 0, sir = 0, st = 0;
+                    if (sscanf(line.c_str(), "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                               &u, &n, &s, &id, &io, &ir, &sir, &st) >= 4) {
+                        unsigned long long prev_idle_all = prev_idle + prev_iowait;
+                        unsigned long long idle_all = id + io;
+                        unsigned long long prev_non_idle = prev_user + prev_nice + prev_system + prev_irq + prev_softirq + prev_steal;
+                        unsigned long long non_idle = u + n + s + ir + sir + st;
+                        unsigned long long prev_total = prev_idle_all + prev_non_idle;
+                        unsigned long long total = idle_all + non_idle;
+
+                        if (total > prev_total) {
+                            unsigned long long total_d = total - prev_total;
+                            unsigned long long idle_d = idle_all - prev_idle_all;
+                            cached_cpu_pct = 100.0 * static_cast<double>(total_d - idle_d) / static_cast<double>(total_d);
+                            if (cached_cpu_pct < 0.0) cached_cpu_pct = 0.0;
+                            if (cached_cpu_pct > 100.0) cached_cpu_pct = 100.0;
+                        }
+
+                        prev_user = u; prev_nice = n; prev_system = s; prev_idle = id;
+                        prev_iowait = io; prev_irq = ir; prev_softirq = sir; prev_steal = st;
+                        last_stat_read = now_stat;
+                    }
+                }
+            }
+        }
+        resp["cpu_percent"] = cached_cpu_pct;
+
         return CommandResult::Success(resp);
     }, "Query system hardware and storage telemetry");
 

@@ -228,7 +228,10 @@ async function fetchTelemetry() {
       const totalMb = d.total_storage_bytes ? Math.round(d.total_storage_bytes / (1024 * 1024)) : 0;
       const freeMb = d.free_storage_bytes ? Math.round(d.free_storage_bytes / (1024 * 1024)) : 0;
       const ramFreeMb = d.ram_free_bytes ? Math.round(d.ram_free_bytes / (1024 * 1024)) : 0;
-      const cpuPct = typeof d.cpu_load_1m === "number" ? Math.min(100, (d.cpu_load_1m / 6.0) * 100) : 0;
+      const cores = typeof d.cpu_cores === "number" && d.cpu_cores > 0 ? d.cpu_cores : (navigator.hardwareConcurrency || 12);
+      const cpuPct = typeof d.cpu_percent === "number"
+        ? Math.min(100, Math.max(0, d.cpu_percent))
+        : (typeof d.cpu_load_1m === "number" ? Math.min(100, (d.cpu_load_1m / cores) * 100) : 0);
 
       telemetry = {
         status: d.status || "ONLINE",

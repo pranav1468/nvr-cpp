@@ -938,6 +938,14 @@ void LiveController::ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline
                      << ") resynchronized to keyframe; resumed decoding";
         }
 
+        auto backend = GetDisplayBackend();
+        bool is_headless = (!backend || (backend->GetBackendName() && 
+            std::string(backend->GetBackendName()).find("Headless") != std::string::npos));
+
+        if (is_headless && !pkt->is_keyframe) {
+            continue;
+        }
+
         DecodedFramePtr frame;
         if (pipeline->decoder) {
             bool decode_ok = pipeline->decoder->Decode(pkt, frame);
