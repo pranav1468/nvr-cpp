@@ -83,14 +83,6 @@ function formatUptime(seconds) {
   return `${h}h ${m}m`;
 }
 
-function formatSecondsOfDay(total) {
-  const s = Math.max(0, Math.floor(total));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  return `${pad2(h)}:${pad2(m)}:${pad2(sec)}`;
-}
-
 function formatIsoDate(d8) {
   if (typeof d8 === "string" && d8.length === 8 && !d8.includes("-")) {
     return `${d8.slice(0, 4)}-${d8.slice(4, 6)}-${d8.slice(6, 8)}`;
@@ -585,8 +577,10 @@ class NvrStreamEngine {
       }
     }
 
-    // Tier 2: MSE (fMP4)
-    if (typeof MediaSource !== "undefined") {
+    // Tier 2: MSE (fMP4) - strictly for H.264 streams.
+    // H.265 in browser MSE suffers from B-frame reference stalls and macroblock ghosting
+    // because standard IP camera RTSP streams lack client-side composition time reordering.
+    if (!isH265 && typeof MediaSource !== "undefined") {
       const mime = candidateCodecs.map((c) => `video/mp4; codecs="${c}"`).find((m) => MediaSource.isTypeSupported(m));
       if (mime) {
         if (this.ws) { this.ws.onclose = null; this.ws.close(); this.ws = null; }
@@ -972,8 +966,11 @@ function renderLiveMatrix() {
 
     const cam = cameras.find((c) => c.id === ch);
     const online = cam ? isCamOnline(cam) : false;
-    const isMain = (fullscreenCh !== null || isMaster || liveLayout === 1);
-    const targetStream = isMain ? "main" : "sub";
+    // To preserve zero-latency switching and avoid Wasm 1080p decode bottlenecks,
+    // live grid and fullscreen operate on the high-definition SUB stream (720p).
+    // The MAIN stream remains dedicated to zero-transcode high-bitrate recording.
+    const isMain = false;
+    const targetStream = "sub";
     const isEnabled = cam && (cam.enabled !== false);
 
     // Update HUD elements
