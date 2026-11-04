@@ -254,6 +254,72 @@ Item {
                 ctx.beginPath();
                 ctx.arc(12, 8, 0.8, 0, Math.PI * 2);
                 ctx.fill();
+            } else if (root.name === "users" || root.name === "user") {
+                // User / Users icon
+                ctx.arc(12, 8, 3.5, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(6, 20);
+                ctx.bezierCurveTo(6, 16, 9, 14.5, 12, 14.5);
+                ctx.bezierCurveTo(15, 14.5, 18, 16, 18, 20);
+                ctx.stroke();
+            } else if (root.name === "key") {
+                // Key icon
+                ctx.arc(9, 10, 4, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(13, 10); ctx.lineTo(20, 10);
+                ctx.moveTo(17, 10); ctx.lineTo(17, 13);
+                ctx.moveTo(20, 10); ctx.lineTo(20, 13);
+                ctx.stroke();
+            } else if (root.name === "trash" || root.name === "delete") {
+                // Trash can icon
+                ctx.moveTo(5, 7); ctx.lineTo(19, 7);
+                ctx.moveTo(9, 7); ctx.lineTo(9, 4); ctx.lineTo(15, 4); ctx.lineTo(15, 7);
+                ctx.moveTo(6, 7); ctx.lineTo(7.5, 20); ctx.lineTo(16.5, 20); ctx.lineTo(18, 7);
+                ctx.moveTo(10, 10); ctx.lineTo(10, 17);
+                ctx.moveTo(14, 10); ctx.lineTo(14, 17);
+                ctx.stroke();
+            } else if (root.name === "eye") {
+                // Eye open
+                ctx.moveTo(3, 12);
+                ctx.bezierCurveTo(7, 6, 17, 6, 21, 12);
+                ctx.bezierCurveTo(17, 18, 7, 18, 3, 12);
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(12, 12, 2.5, 0, Math.PI * 2);
+                ctx.stroke();
+            } else if (root.name === "eye_off") {
+                // Eye slashed
+                ctx.moveTo(3, 12);
+                ctx.bezierCurveTo(7, 6, 17, 6, 21, 12);
+                ctx.bezierCurveTo(17, 18, 7, 18, 3, 12);
+                ctx.moveTo(4, 4); ctx.lineTo(20, 20);
+                ctx.stroke();
+            } else if (root.name === "arrow_left" || root.name === "back") {
+                // Back arrow
+                ctx.moveTo(19, 12); ctx.lineTo(5, 12);
+                ctx.moveTo(12, 19); ctx.lineTo(5, 12); ctx.lineTo(12, 5);
+                ctx.stroke();
+            } else if (root.name === "volume" || root.name === "audio") {
+                // Speaker on
+                ctx.moveTo(11, 5); ctx.lineTo(6, 9); ctx.lineTo(2, 9);
+                ctx.lineTo(2, 15); ctx.lineTo(6, 15); ctx.lineTo(11, 19);
+                ctx.closePath();
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(11, 12, 6, -Math.PI / 4, Math.PI / 4, false);
+                ctx.stroke();
+            } else if (root.name === "volume_mute" || root.name === "audio_off") {
+                // Speaker muted
+                ctx.moveTo(11, 5); ctx.lineTo(6, 9); ctx.lineTo(2, 9);
+                ctx.lineTo(2, 15); ctx.lineTo(6, 15); ctx.lineTo(11, 19);
+                ctx.closePath();
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.moveTo(23, 9); ctx.lineTo(17, 15);
+                ctx.moveTo(17, 9); ctx.lineTo(23, 15);
+                ctx.stroke();
             } else {
                 // Default dot
                 ctx.arc(12, 12, 4, 0, Math.PI * 2);

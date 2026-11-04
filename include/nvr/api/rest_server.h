@@ -42,6 +42,7 @@ private:
     void HandleSnapshotClient(int client_fd, int channel_id);
     void HandleRecordingsList(int client_fd, const nlohmann::json& query_params, const std::string& request_origin);
     void HandleRecordingsDates(int client_fd, const std::string& request_origin);
+    void HandleRecordingsPlaylist(int client_fd, const nlohmann::json& query_params, const std::string& request_origin);
     void HandleRecordingVideo(int client_fd, const nlohmann::json& query_params, const std::unordered_map<std::string, std::string>& headers, const std::string& request_origin);
     void HandleRecordingLock(int client_fd, const std::string& method, const std::string& path, const std::string& body, const std::string& request_origin);
     void HandleRecordingExport(int client_fd, const std::string& method, const std::string& path, const std::string& body, const std::string& request_origin);

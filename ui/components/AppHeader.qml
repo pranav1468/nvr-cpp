@@ -334,6 +334,53 @@ Rectangle {
                     }
                 }
             }
+
+            // User Session Profile Pill
+            Rectangle {
+                color: Theme.bgCard
+                border.color: Theme.borderSubtle
+                border.width: 1
+                radius: 8
+                Layout.preferredHeight: 32
+                Layout.preferredWidth: userProfileRow.implicitWidth + 18
+
+                RowLayout {
+                    id: userProfileRow
+                    anchors.centerIn: parent
+                    spacing: 8
+
+                    AppIcon {
+                        name: "users"
+                        size: 14
+                        color: Theme.accentPrimary
+                        strokeWidth: 2
+                    }
+
+                    Text {
+                        text: "admin"
+                        color: Theme.textPrimary
+                        font.bold: true
+                        font.pixelSize: 11
+                        font.family: Theme.fontMono
+                    }
+
+                    Rectangle {
+                        height: 18
+                        radius: 4
+                        color: Theme.bgBadgeBlue
+                        width: roleText.implicitWidth + 8
+
+                        Text {
+                            id: roleText
+                            anchors.centerIn: parent
+                            text: "ADMIN"
+                            color: Theme.accentPrimary
+                            font.pixelSize: 9
+                            font.bold: true
+                        }
+                    }
+                }
+            }
         }
     }
 }

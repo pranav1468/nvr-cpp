@@ -85,6 +85,8 @@ std::string GetMimeType(const std::string& path) {
     if (ext == ".jpg" || ext == ".jpeg") return "image/jpeg";
     if (ext == ".svg") return "image/svg+xml";
     if (ext == ".ico") return "image/x-icon";
+    if (ext == ".m3u8") return "application/vnd.apple.mpegurl; charset=utf-8";
+    if (ext == ".mp4") return "video/mp4";
     return "application/octet-stream";
 }
 
@@ -837,6 +839,7 @@ void RestServer::HandleClient(int client_fd) {
     bool is_media_endpoint = (path == "/api/v1/ws/stream" || 
                               path == "/api/v1/stream" ||
                               path.rfind("/snapshot") != std::string::npos ||
+                              path.rfind("/recordings/playlist.m3u8") != std::string::npos ||
                               path.rfind("/recordings/video") != std::string::npos ||
                               path.rfind("/recordings/stream") != std::string::npos ||
                               path.rfind("/recordings/file") != std::string::npos);
@@ -932,6 +935,9 @@ void RestServer::HandleClient(int client_fd) {
                 oss << "Content-Type: " << mime << "\r\n";
                 oss << "Content-Length: " << file_size << "\r\n";
                 oss << BuildCorsHeaders(request_origin, false);
+                oss << "Cache-Control: no-cache, no-store, must-revalidate\r\n";
+                oss << "Pragma: no-cache\r\n";
+                oss << "Expires: 0\r\n";
                 oss << "X-Content-Type-Options: nosniff\r\n";
                 oss << "X-Frame-Options: SAMEORIGIN\r\n";
                 oss << "Referrer-Policy: strict-origin-when-cross-origin\r\n";
@@ -1098,31 +1104,35 @@ void RestServer::HandleClient(int client_fd) {
     }
 
     // 5. Media Plane: Recordings Query, Video Streaming & Clip Export
-    if (method == "GET" && (path == "/api/v1/recordings/dates" || path == "/api/v1/playback/dates")) {
+    if (method == "GET" && path == "/api/v1/recordings/dates") {
         HandleRecordingsDates(client_fd, request_origin);
         return;
     }
-    if (method == "GET" && (path == "/api/v1/recordings" || path == "/api/v1/playback/query")) {
+    if (method == "GET" && path == "/api/v1/recordings/playlist.m3u8") {
+        HandleRecordingsPlaylist(client_fd, query_params, request_origin);
+        return;
+    }
+    if (method == "GET" && path == "/api/v1/recordings") {
         HandleRecordingsList(client_fd, query_params, request_origin);
         return;
     }
-    if (method == "GET" && (path == "/api/v1/recordings/export/status" || path == "/api/v1/playback/export/status")) {
+    if (method == "GET" && path == "/api/v1/recordings/export/status") {
         HandleRecordingExportStatus(client_fd, query_params, request_origin);
         return;
     }
-    if (method == "GET" && (path == "/api/v1/recordings/export/download" || path == "/api/v1/playback/export/download")) {
+    if (method == "GET" && path == "/api/v1/recordings/export/download") {
         HandleRecordingExportDownload(client_fd, query_params, headers, request_origin);
         return;
     }
-    if (method == "POST" && (path == "/api/v1/recordings/export" || path == "/api/v1/playback/export")) {
+    if (method == "POST" && path == "/api/v1/recordings/export") {
         HandleRecordingExport(client_fd, method, path, body, request_origin);
         return;
     }
-    if (method == "GET" && (path == "/api/v1/recordings/video" || path == "/api/v1/recordings/stream" || path == "/api/v1/recordings/file" || path == "/api/v1/recordings/thumbnail" || path == "/api/v1/playback/video")) {
+    if (method == "GET" && (path == "/api/v1/recordings/video" || path == "/api/v1/recordings/stream" || path == "/api/v1/recordings/file" || path == "/api/v1/recordings/thumbnail")) {
         HandleRecordingVideo(client_fd, query_params, headers, request_origin);
         return;
     }
-    if (method == "POST" && (path == "/api/v1/recordings/lock" || path == "/api/v1/playback/lock" || (path.rfind("/api/v1/recordings/", 0) == 0 && path.rfind("/lock") == path.size() - 5))) {
+    if (method == "POST" && (path == "/api/v1/recordings/lock" || (path.rfind("/api/v1/recordings/", 0) == 0 && path.rfind("/lock") == path.size() - 5))) {
         HandleRecordingLock(client_fd, method, path, body, request_origin);
         return;
     }
@@ -1213,6 +1223,43 @@ void RestServer::HandleClient(int client_fd) {
         if (path == "/api/v1/layout/exit-fullscreen") {
             payload["exit"] = true;
         }
+
+    // Storage Management Endpoints
+    } else if (method == "GET" && (path == "/api/v1/storage" || path == "/api/v1/storage/status")) {
+        target_action = "storage.get";
+        payload = nlohmann::json::object();
+    } else if (method == "POST" && (path == "/api/v1/storage/path" || path == "/api/v1/storage")) {
+        target_action = "storage.set_path";
+        payload = body_json;
+
+    // Authentication & User Management Endpoints
+    } else if (method == "POST" && path == "/api/v1/auth/login") {
+        target_action = "auth.login";
+        payload = body_json;
+    } else if (method == "POST" && path == "/api/v1/auth/logout") {
+        target_action = "auth.logout";
+        payload = body_json;
+    } else if (method == "GET" && path == "/api/v1/auth/me") {
+        target_action = "auth.me";
+        payload = nlohmann::json::object();
+    } else if (method == "GET" && path == "/api/v1/users") {
+        target_action = "user.list";
+        payload = nlohmann::json::object();
+    } else if (method == "POST" && path == "/api/v1/users") {
+        target_action = "user.add";
+        payload = body_json;
+    } else if (method == "DELETE" && path.rfind("/api/v1/users/", 0) == 0 && path.find('/', 14) == std::string::npos) {
+        std::string target_user = path.substr(14);
+        target_action = "user.delete";
+        payload = nlohmann::json::object();
+        payload["username"] = target_user;
+    } else if (method == "POST" && (path == "/api/v1/users/change_password" || path == "/api/v1/users/password")) {
+        target_action = "user.change_password";
+        payload = body_json;
+    } else if (method == "POST" && path == "/api/v1/users/reset_password") {
+        target_action = "user.reset_password";
+        payload = body_json;
+
     } else if (method == "GET" && path == "/api/v1/commands") {
         // Discovery endpoint: list all registered command schemas
         auto cmds = CommandDispatcher::Instance().GetRegisteredCommands();
@@ -1611,10 +1658,64 @@ void RestServer::HandleRecordingsDates(int client_fd, const std::string& request
     close(client_fd);
 }
 
+void RestServer::HandleRecordingsPlaylist(int client_fd, const nlohmann::json& query_params, const std::string& request_origin) {
+    auto res = PlaybackEngine::Instance().QueryRecordings(query_params);
+    nlohmann::json segments = res.value("segments", nlohmann::json::array());
+
+    std::ostringstream oss;
+    oss << "#EXTM3U\n";
+    oss << "#EXT-X-VERSION:7\n";
+
+    double max_dur = 10.0;
+    for (const auto& seg : segments) {
+        double d = seg.value("duration_seconds", 60.0);
+        if (d > max_dur) max_dur = d;
+    }
+    int target_duration = static_cast<int>(std::ceil(max_dur));
+    if (target_duration < 1) target_duration = 10;
+
+    oss << "#EXT-X-TARGETDURATION:" << target_duration << "\n";
+    oss << "#EXT-X-MEDIA-SEQUENCE:0\n";
+    oss << "#EXT-X-PLAYLIST-TYPE:VOD\n\n";
+
+    std::string token_val = "";
+    if (query_params.contains("token") && query_params["token"].is_string()) {
+        token_val = query_params["token"].get<std::string>();
+    }
+
+    for (size_t i = 0; i < segments.size(); ++i) {
+        const auto& seg = segments[i];
+        double dur = seg.value("duration_seconds", 60.0);
+        std::string video_url = seg.value("video_url", "");
+        if (video_url.empty()) {
+            video_url = "/api/v1/recordings/video?path=" + seg.value("file_path", "");
+        }
+        if (!token_val.empty() && video_url.find("token=") == std::string::npos) {
+            video_url += (video_url.find('?') == std::string::npos ? "?token=" : "&token=") + token_val;
+        }
+
+        if (i > 0) {
+            oss << "#EXT-X-DISCONTINUITY\n";
+        }
+        char dur_buf[32]{0};
+        snprintf(dur_buf, sizeof(dur_buf), "%.3f", dur);
+        oss << "#EXTINF:" << dur_buf << ",\n";
+        oss << video_url << "\n";
+    }
+
+    oss << "#EXT-X-ENDLIST\n";
+
+    SendHttpResponse(client_fd, 200, "application/vnd.apple.mpegurl; charset=utf-8", oss.str(), "Cache-Control: no-cache\r\n", request_origin);
+    close(client_fd);
+}
+
 void RestServer::HandleRecordingVideo(int client_fd, const nlohmann::json& query_params, const std::unordered_map<std::string, std::string>& headers, const std::string& request_origin) {
     std::string req_path = "";
     if (query_params.contains("path") && query_params["path"].is_string()) {
         req_path = query_params["path"].get<std::string>();
+    } else if (query_params.contains("id")) {
+        if (query_params["id"].is_string()) req_path = query_params["id"].get<std::string>();
+        else if (query_params["id"].is_number()) req_path = std::to_string(query_params["id"].get<int64_t>());
     }
 
     if (req_path.empty() || req_path.find('\0') != std::string::npos || req_path.find("..") != std::string::npos) {
@@ -1623,21 +1724,12 @@ void RestServer::HandleRecordingVideo(int client_fd, const nlohmann::json& query
         return;
     }
 
+    // Canonical path resolution via PlaybackEngine
+    std::string target_str = PlaybackEngine::Instance().GetSegmentLocalPath(req_path);
     std::error_code ec;
-    std::filesystem::path root_path = std::filesystem::weakly_canonical(RetentionManager::Instance().GetRecordingPath(), ec);
-    std::filesystem::path target_path = (root_path / std::filesystem::path(req_path).relative_path()).lexically_normal();
+    std::filesystem::path target_path(target_str);
 
-    std::string root_str = root_path.lexically_normal().string();
-    if (!root_str.empty() && root_str.back() != '/') root_str += '/';
-    std::string target_str = target_path.string();
-
-    if (target_str.rfind(root_str, 0) != 0 && target_str != root_path.lexically_normal().string()) {
-        SendHttpResponse(client_fd, 403, "text/plain", "Forbidden", "", request_origin);
-        close(client_fd);
-        return;
-    }
-
-    if (!std::filesystem::is_regular_file(target_path, ec)) {
+    if (target_str.empty() || !std::filesystem::is_regular_file(target_path, ec)) {
         SendHttpResponse(client_fd, 404, "text/plain", "Recording Not Found", "", request_origin);
         close(client_fd);
         return;
@@ -2135,6 +2227,13 @@ void RestServer::HandleWebSocketStream(int client_fd, int channel_id, StreamType
     CodecType initial_codec = StreamBroker::Instance().GetCachedCodec(channel_id, stream_type);
     if (!send_config_if_ready(initial_codec)) {
         ctx->closed.store(true);
+    }
+
+    // Instant Keyframe Burst: immediately dispatch latest cached IDR to start client decoding in <30ms
+    auto initial_kf = StreamBroker::Instance().GetLatestKeyframe(channel_id, stream_type);
+    if (initial_kf) {
+        std::lock_guard<std::mutex> lock(ctx->mtx);
+        ctx->queue.push_back(initial_kf);
     }
 
     while (is_running_.load() && !ctx->closed.load()) {

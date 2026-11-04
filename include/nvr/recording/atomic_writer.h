@@ -14,6 +14,8 @@ public:
     AtomicWriter(int channel_id, const std::string& output_directory);
     ~AtomicWriter();
 
+    void SetOutputDirectory(const std::string& output_directory);
+
     bool StartSegment(int64_t start_wall_time_ms);
 
     bool WritePacket(const MediaPacketPtr& packet);
@@ -37,7 +39,6 @@ public:
     void ConfigureAudio(CodecType codec, uint32_t sample_rate = 8000, uint8_t channels = 1);
 
     static bool ValidateMp4File(const std::string& path);
-    static bool ExtractMp4Metadata(const std::string& path, SegmentMetadata& out_meta);
     static void CleanOrphanedTmpFiles(const std::string& directory);
 
 private:

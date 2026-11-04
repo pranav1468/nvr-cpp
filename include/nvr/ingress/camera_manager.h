@@ -32,10 +32,6 @@ public:
 
     bool EnsureMainStream(int channel_id);
 
-    bool StartEventWorker(int channel_id);
-    void StopEventWorker(int channel_id);
-    bool IsEventWorkerOnline(int channel_id) const;
-
     void StopAll();
 
     bool IsCameraOnline(int channel_id) const;
@@ -53,7 +49,6 @@ private:
     CameraManager(const CameraManager&) = delete;
     CameraManager& operator=(const CameraManager&) = delete;
 
-    void EventWorkerLoop(int channel_id, std::shared_ptr<std::atomic<bool>> running, CameraConfig config);
 
     struct CameraEntry {
         CameraConfig config;

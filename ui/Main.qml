@@ -40,6 +40,7 @@ ApplicationWindow {
     // Main Application Console
     Item {
         anchors.fill: parent
+        visible: true
 
         ColumnLayout {
             anchors.fill: parent
@@ -82,8 +83,9 @@ ApplicationWindow {
                             if (appWindow.currentRoute === "live") return 0;
                             if (appWindow.currentRoute === "playback") return 1;
                             if (appWindow.currentRoute === "cameras") return 2;
-                            if (appWindow.currentRoute === "dashboard") return 3;
-                            if (appWindow.currentRoute === "system") return 4;
+                            if (appWindow.currentRoute === "users") return 3;
+                            if (appWindow.currentRoute === "dashboard") return 4;
+                            if (appWindow.currentRoute === "system") return 5;
                             return 0;
                         }
 
@@ -102,7 +104,12 @@ ApplicationWindow {
                             id: camerasPageView
                         }
 
-                        // Index 3: Telemetry, Hardware & Channel Health Dashboard
+                        // Index 3: User Accounts & RBAC Access Control
+                        UsersPage {
+                            id: usersPageView
+                        }
+
+                        // Index 4: Telemetry, Hardware & Channel Health Dashboard
                         DashboardPage {
                             id: dashboardPageView
                             onNavigateTo: function(route) {
@@ -111,7 +118,7 @@ ApplicationWindow {
                             }
                         }
 
-                        // Index 4: Diagnostics, Storage Allocation & User Access Control
+                        // Index 5: Diagnostics & Storage Allocation
                         SystemPage {
                             id: systemPageView
                         }

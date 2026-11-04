@@ -2,6 +2,7 @@
 #include "nvr/common/logger.h"
 #include "nvr/common/deep_tracer.h"
 #include "nvr/common/time_utils.h"
+#include "nvr/database/database_manager.h"
 #include "nvr/storage/retention_manager.h"
 #include "nvr/media/stream_broker.h"
 #include "nvr/recording/atomic_writer.h"
@@ -54,6 +55,7 @@ int main(int argc, char* argv[]) {
     // Register signals
     std::signal(SIGINT, SignalHandler);
     std::signal(SIGTERM, SignalHandler);
+    std::signal(SIGPIPE, SIG_IGN);
 
     // Load configuration
     nvr::NvrConfig config = nvr::LoadNvrConfig(config_path);
@@ -97,6 +99,25 @@ int main(int argc, char* argv[]) {
 
     // Startup reconciliation: clean orphaned .tmp segments
     nvr::AtomicWriter::CleanOrphanedTmpFiles(config.storage.recording_path);
+
+    // Initialize SQLite Database Engine
+    {
+        std::error_code ec;
+        std::filesystem::create_directories("config", ec);
+    }
+    std::string db_path = "config/nvr.db";
+    if (!nvr::DatabaseManager::Instance().Initialize(db_path)) {
+        LOG_ERROR << "Failed to initialize SQLite database at " << db_path;
+    }
+
+    // Load persisted user-defined storage path if configured in SQLite
+    std::string saved_storage_path = nvr::DatabaseManager::Instance().GetSetting("storage_recording_path");
+    if (!saved_storage_path.empty()) {
+        config.storage.recording_path = saved_storage_path;
+        LOG_INFO << "Loaded user-configured recording storage path from database: " << saved_storage_path;
+    } else {
+        nvr::DatabaseManager::Instance().SetSetting("storage_recording_path", config.storage.recording_path);
+    }
 
     // Initialize Retention Manager
     nvr::RetentionManager::Instance().Configure(config.storage);
@@ -184,6 +205,9 @@ int main(int argc, char* argv[]) {
 
     // 3. Stop Retention Manager
     nvr::RetentionManager::Instance().Stop();
+
+    // 4. Close SQLite Database Engine
+    nvr::DatabaseManager::Instance().Close();
 
     LOG_INFO << "NVR Core cleanly terminated. All segments finalized.";
 

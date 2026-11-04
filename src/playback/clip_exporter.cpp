@@ -230,7 +230,8 @@ bool ClipExporter::StitchMp4Segments(const std::vector<std::string>& input_files
 
     bool has_written_init = false;
     uint32_t current_seq = 1;
-    uint64_t cumulative_decode_time = 0;
+    uint64_t cumulative_video_decode_time = 0;
+    uint64_t cumulative_audio_decode_time = 0;
     std::vector<uint8_t> io_buf(65536);
 
     for (size_t file_idx = 0; file_idx < input_files.size(); ++file_idx) {
@@ -252,7 +253,8 @@ bool ClipExporter::StitchMp4Segments(const std::vector<std::string>& input_files
         uint64_t file_size = static_cast<uint64_t>(in_file.tellg());
         in_file.seekg(0, std::ios::beg);
 
-        uint64_t file_max_duration = 0;
+        uint64_t file_video_duration = 0;
+        uint64_t file_audio_duration = 0;
 
         while (in_file.good() && static_cast<uint64_t>(in_file.tellg()) < file_size) {
             uint64_t box_start = static_cast<uint64_t>(in_file.tellg());
@@ -299,65 +301,84 @@ bool ClipExporter::StitchMp4Segments(const std::vector<std::string>& input_files
                     in_file.seekg(box_start + box_size, std::ios::beg);
                 }
             } else if (type_str == "moof") {
-                // Read moof into memory to rewrite sequence number and base decode time
+                // Read moof into memory to rewrite sequence number and base decode times
                 in_file.seekg(box_start, std::ios::beg);
                 std::vector<uint8_t> moof_buf(box_size);
                 in_file.read(reinterpret_cast<char*>(moof_buf.data()), box_size);
 
-                // 1. Rewrite mfhd sequence number
-                for (size_t i = 8; i + 16 <= moof_buf.size(); ++i) {
-                    if (std::memcmp(&moof_buf[i], "mfhd", 4) == 0) {
-                        WriteU32BE(&moof_buf[i + 8], current_seq++);
-                        break;
-                    }
-                }
+                size_t pos = 8;
+                while (pos + 8 <= moof_buf.size()) {
+                    uint32_t c_size = ReadU32BE(&moof_buf[pos]);
+                    if (c_size < 8 || pos + c_size > moof_buf.size()) break;
 
-                // 2. Adjust tfdt base media decode time
-                for (size_t i = 8; i + 16 <= moof_buf.size(); ++i) {
-                    if (std::memcmp(&moof_buf[i], "tfdt", 4) == 0) {
-                        uint8_t ver = moof_buf[i + 4];
-                        if (ver == 0 && i + 12 <= moof_buf.size()) {
-                            uint32_t orig_val = ReadU32BE(&moof_buf[i + 8]);
-                            uint32_t adjusted = orig_val + static_cast<uint32_t>(cumulative_decode_time);
-                            WriteU32BE(&moof_buf[i + 8], adjusted);
-                        } else if (ver == 1 && i + 16 <= moof_buf.size()) {
-                            uint64_t orig_val = ReadU64BE(&moof_buf[i + 8]);
-                            uint64_t adjusted = orig_val + cumulative_decode_time;
-                            WriteU64BE(&moof_buf[i + 8], adjusted);
+                    if (std::memcmp(&moof_buf[pos + 4], "mfhd", 4) == 0) {
+                        if (pos + 12 <= moof_buf.size()) {
+                            WriteU32BE(&moof_buf[pos + 8], current_seq++);
                         }
-                        break;
-                    }
-                }
+                    } else if (std::memcmp(&moof_buf[pos + 4], "traf", 4) == 0) {
+                        size_t t_pos = pos + 8;
+                        size_t t_end = pos + c_size;
+                        uint32_t track_id = 1;
 
-                // 3. Scan trun sample durations to advance cumulative decode time
-                for (size_t i = 8; i + 20 <= moof_buf.size(); ++i) {
-                    if (std::memcmp(&moof_buf[i], "trun", 4) == 0) {
-                        uint32_t flags = ReadU32BE(&moof_buf[i + 4]) & 0x00FFFFFF;
-                        uint32_t sample_count = ReadU32BE(&moof_buf[i + 8]);
-                        size_t sample_offset = i + 12;
-                        if (flags & 0x000001) sample_offset += 4; // data_offset
-                        if (flags & 0x000004) sample_offset += 4; // first_sample_flags
+                        // Scan tfhd for track_ID
+                        size_t scan = t_pos;
+                        while (scan + 8 <= t_end) {
+                            uint32_t b_size = ReadU32BE(&moof_buf[scan]);
+                            if (b_size < 8 || scan + b_size > t_end) break;
+                            if (std::memcmp(&moof_buf[scan + 4], "tfhd", 4) == 0 && scan + 12 <= t_end) {
+                                track_id = ReadU32BE(&moof_buf[scan + 8]);
+                                break;
+                            }
+                            scan += b_size;
+                        }
 
-                        bool has_duration = (flags & 0x000100) != 0;
-                        bool has_size = (flags & 0x000200) != 0;
-                        bool has_flags = (flags & 0x000400) != 0;
-                        bool has_cto = (flags & 0x000800) != 0;
+                        // Process tfdt and trun
+                        scan = t_pos;
+                        while (scan + 8 <= t_end) {
+                            uint32_t b_size = ReadU32BE(&moof_buf[scan]);
+                            if (b_size < 8 || scan + b_size > t_end) break;
 
-                        size_t entry_size = (has_duration ? 4 : 0) + (has_size ? 4 : 0) +
-                                            (has_flags ? 4 : 0) + (has_cto ? 4 : 0);
+                            if (std::memcmp(&moof_buf[scan + 4], "tfdt", 4) == 0) {
+                                uint8_t ver = moof_buf[scan + 8];
+                                uint64_t cum_time = (track_id == 2) ? cumulative_audio_decode_time : cumulative_video_decode_time;
+                                if (ver == 0 && scan + 16 <= t_end) {
+                                    uint32_t orig_val = ReadU32BE(&moof_buf[scan + 12]);
+                                    WriteU32BE(&moof_buf[scan + 12], orig_val + static_cast<uint32_t>(cum_time));
+                                } else if (ver == 1 && scan + 20 <= t_end) {
+                                    uint64_t orig_val = ReadU64BE(&moof_buf[scan + 12]);
+                                    WriteU64BE(&moof_buf[scan + 12], orig_val + cum_time);
+                                }
+                            } else if (std::memcmp(&moof_buf[scan + 4], "trun", 4) == 0 && scan + 16 <= t_end) {
+                                uint32_t flags = ReadU32BE(&moof_buf[scan + 8]) & 0x00FFFFFF;
+                                uint32_t sample_count = ReadU32BE(&moof_buf[scan + 12]);
+                                size_t sample_offset = scan + 16;
+                                if (flags & 0x000001) sample_offset += 4;
+                                if (flags & 0x000004) sample_offset += 4;
 
-                        if (entry_size > 0 && sample_offset + (sample_count * entry_size) <= moof_buf.size()) {
-                            for (uint32_t s = 0; s < sample_count; ++s) {
-                                size_t ep = sample_offset + (s * entry_size);
-                                if (has_duration) {
-                                    file_max_duration += ReadU32BE(&moof_buf[ep]);
-                                } else {
-                                    file_max_duration += 3000; // default timescale 90000 / 30fps
+                                bool has_duration = (flags & 0x000100) != 0;
+                                bool has_size = (flags & 0x000200) != 0;
+                                bool has_flags = (flags & 0x000400) != 0;
+                                bool has_cto = (flags & 0x000800) != 0;
+
+                                size_t entry_size = (has_duration ? 4 : 0) + (has_size ? 4 : 0) +
+                                                    (has_flags ? 4 : 0) + (has_cto ? 4 : 0);
+
+                                if (entry_size > 0 && sample_offset + (sample_count * entry_size) <= t_end) {
+                                    for (uint32_t s = 0; s < sample_count; ++s) {
+                                        size_t ep = sample_offset + (s * entry_size);
+                                        uint32_t dur = has_duration ? ReadU32BE(&moof_buf[ep]) : (track_id == 2 ? 1024 : 3600);
+                                        if (track_id == 2) {
+                                            file_audio_duration += dur;
+                                        } else {
+                                            file_video_duration += dur;
+                                        }
+                                    }
                                 }
                             }
+                            scan += b_size;
                         }
-                        break;
                     }
+                    pos += c_size;
                 }
 
                 WriteAllBytes(out_fd, moof_buf.data(), moof_buf.size());
@@ -379,7 +400,8 @@ bool ClipExporter::StitchMp4Segments(const std::vector<std::string>& input_files
             }
         }
 
-        cumulative_decode_time += (file_max_duration > 0 ? file_max_duration : 5400000ULL); // ~60 sec @ 90kHz
+        cumulative_video_decode_time += (file_video_duration > 0 ? file_video_duration : 5400000ULL);
+        cumulative_audio_decode_time += (file_audio_duration > 0 ? file_audio_duration : 480000ULL);
         progress_percent = static_cast<int>((file_idx + 1) * 100 / input_files.size());
     }
 

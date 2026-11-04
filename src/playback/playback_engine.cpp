@@ -1,5 +1,6 @@
 #include "nvr/playback/playback_engine.h"
 #include "nvr/storage/retention_manager.h"
+#include "nvr/database/database_manager.h"
 #include "nvr/common/logger.h"
 #include "nvr/common/time_utils.h"
 
@@ -7,6 +8,7 @@
 #include <fstream>
 #include <map>
 #include <ctime>
+#include <set>
 
 namespace nvr {
 
@@ -39,14 +41,103 @@ PlaybackEngine::PlaybackEngine() {
 }
 
 void PlaybackEngine::Initialize(const std::string& recording_root_path) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!recording_root_path.empty()) {
-        recording_root_ = recording_root_path;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!recording_root_path.empty()) {
+            recording_root_ = recording_root_path;
+        }
+        std::error_code ec;
+        std::filesystem::create_directories(recording_root_, ec);
+        ClipExporter::Instance().Configure(recording_root_ + "/exports");
+        LOG_INFO << "[PlaybackEngine] Initialized with storage root: " << recording_root_;
     }
+
+    // Spawn non-blocking background task to sync any unindexed disk segments to SQLite on boot
+    std::thread([this]() {
+        SyncDiskRecordings();
+    }).detach();
+}
+
+void PlaybackEngine::SyncDiskRecordings() {
     std::error_code ec;
-    std::filesystem::create_directories(recording_root_, ec);
-    ClipExporter::Instance().Configure(recording_root_ + "/exports");
-    LOG_INFO << "[PlaybackEngine] Initialized with storage root: " << recording_root_;
+    std::filesystem::path root = GetStorageRoot();
+    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) return;
+
+    LOG_INFO << "[PlaybackEngine] Starting background disk-to-database synchronization...";
+    size_t synced_count = 0;
+
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root, ec)) {
+        if (entry.is_regular_file(ec) && entry.path().extension() == ".mp4") {
+            std::string fname = entry.path().stem().string();
+            int ch_id = 1;
+            std::string date_part = "";
+            std::string time_part = "";
+
+            if (fname.rfind("cam", 0) == 0) {
+                size_t under = fname.find('_');
+                if (under != std::string::npos) {
+                    try { ch_id = std::stoi(fname.substr(3, under - 3)); } catch (...) {}
+                    size_t next_under = fname.find('_', under + 1);
+                    if (next_under != std::string::npos) {
+                        date_part = fname.substr(under + 1, next_under - (under + 1));
+                        time_part = fname.substr(next_under + 1);
+                    } else {
+                        time_part = fname.substr(under + 1);
+                    }
+                }
+            }
+
+            std::string trigger_type = "continuous";
+            if (fname.find("_motion") != std::string::npos) trigger_type = "motion";
+            else if (fname.find("_ai") != std::string::npos) trigger_type = "ai";
+            else if (fname.find("_event") != std::string::npos) trigger_type = "event";
+
+            uint64_t fsize = entry.file_size(ec);
+            double duration_sec = 60.0;
+
+            std::string d_digits;
+            for (char c : date_part) if (std::isdigit(c)) d_digits.push_back(c);
+            std::string iso_start = "2026-01-01T00:00:00Z";
+            if (d_digits.size() >= 8) {
+                iso_start = d_digits.substr(0, 4) + "-" + d_digits.substr(4, 2) + "-" + d_digits.substr(6, 2) + "T";
+                if (time_part.size() >= 6) {
+                    iso_start += time_part.substr(0, 2) + ":" + time_part.substr(2, 2) + ":" + time_part.substr(4, 2) + "Z";
+                } else {
+                    iso_start += "00:00:00Z";
+                }
+            }
+
+            struct tm tm_start{};
+            time_t t_start = 0;
+            if (strptime(iso_start.c_str(), "%Y-%m-%dT%H:%M:%SZ", &tm_start)) {
+                t_start = timegm(&tm_start);
+            }
+            time_t t_end = t_start + static_cast<time_t>(duration_sec);
+
+            auto lock_path = entry.path().parent_path() / (entry.path().stem().string() + ".locked");
+            bool is_locked = std::filesystem::exists(lock_path, ec);
+
+            std::filesystem::path rel_path = std::filesystem::relative(entry.path(), root, ec);
+            std::string rel_path_str = rel_path.string();
+
+            RecordingSegmentRecord dbrec;
+            dbrec.channel_id = ch_id;
+            dbrec.start_time_ms = static_cast<int64_t>(t_start) * 1000LL;
+            dbrec.end_time_ms = static_cast<int64_t>(t_end) * 1000LL;
+            dbrec.duration_sec = static_cast<int>(duration_sec);
+            dbrec.file_path = rel_path_str;
+            dbrec.file_size_bytes = fsize;
+            dbrec.codec = "H264";
+            dbrec.trigger_type = trigger_type;
+            dbrec.is_locked = is_locked;
+            dbrec.created_at_ms = dbrec.start_time_ms;
+
+            if (DatabaseManager::Instance().InsertRecordingSegment(dbrec)) {
+                synced_count++;
+            }
+        }
+    }
+    LOG_INFO << "[PlaybackEngine] Disk-to-database synchronization complete (" << synced_count << " segments indexed)";
 }
 
 std::filesystem::path PlaybackEngine::GetStorageRoot() const {
@@ -57,21 +148,26 @@ std::filesystem::path PlaybackEngine::GetStorageRoot() const {
 }
 
 std::vector<std::string> PlaybackEngine::GetRecordingDates() {
+    auto db_dates = DatabaseManager::Instance().GetRecordingDates(0);
+    std::set<std::string> unique_dates(db_dates.begin(), db_dates.end());
+
     std::error_code ec;
     std::filesystem::path root = GetStorageRoot();
-    std::vector<std::string> dates;
 
     if (std::filesystem::exists(root, ec) && std::filesystem::is_directory(root, ec)) {
         for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
             if (entry.is_directory(ec)) {
                 std::string fname = entry.path().filename().string();
-                if (fname.size() == 8 && std::all_of(fname.begin(), fname.end(), ::isdigit)) {
-                    dates.push_back(fname);
+                if (fname.size() == 10 && fname[4] == '-' && fname[7] == '-') {
+                    unique_dates.insert(fname);
+                } else if (fname.size() == 8 && std::all_of(fname.begin(), fname.end(), ::isdigit)) {
+                    unique_dates.insert(fname.substr(0, 4) + "-" + fname.substr(4, 2) + "-" + fname.substr(6, 2));
                 }
             }
         }
     }
 
+    std::vector<std::string> dates(unique_dates.begin(), unique_dates.end());
     std::sort(dates.begin(), dates.end(), std::greater<std::string>());
     return dates;
 }
@@ -83,19 +179,37 @@ nlohmann::json PlaybackEngine::QueryRecordings(const nlohmann::json& filter_json
         else if (filter_json["channel_id"].is_string()) {
             try { filter.channel_id = std::stoi(filter_json["channel_id"].get<std::string>()); } catch (...) {}
         }
+    } else if (filter_json.contains("channel")) {
+        if (filter_json["channel"].is_number()) filter.channel_id = filter_json["channel"].get<int>();
+        else if (filter_json["channel"].is_string()) {
+            try { filter.channel_id = std::stoi(filter_json["channel"].get<std::string>()); } catch (...) {}
+        }
     }
+
     if (filter_json.contains("date") && filter_json["date"].is_string()) {
         filter.date = filter_json["date"].get<std::string>();
+    } else if (filter_json.contains("day") && filter_json["day"].is_string()) {
+        filter.date = filter_json["day"].get<std::string>();
     }
+
     if (filter_json.contains("trigger_type") && filter_json["trigger_type"].is_string()) {
         filter.trigger_type = filter_json["trigger_type"].get<std::string>();
+    } else if (filter_json.contains("trigger") && filter_json["trigger"].is_string()) {
+        filter.trigger_type = filter_json["trigger"].get<std::string>();
     }
+
     if (filter_json.contains("from_time") && filter_json["from_time"].is_string()) {
         filter.from_time = filter_json["from_time"].get<std::string>();
+    } else if (filter_json.contains("from") && filter_json["from"].is_string()) {
+        filter.from_time = filter_json["from"].get<std::string>();
     }
+
     if (filter_json.contains("to_time") && filter_json["to_time"].is_string()) {
         filter.to_time = filter_json["to_time"].get<std::string>();
+    } else if (filter_json.contains("to") && filter_json["to"].is_string()) {
+        filter.to_time = filter_json["to"].get<std::string>();
     }
+
     if (filter_json.contains("limit") && filter_json["limit"].is_number()) {
         filter.limit = filter_json["limit"].get<int>();
     }
@@ -114,138 +228,69 @@ nlohmann::json PlaybackEngine::QueryRecordings(const RecordingQueryFilter& filte
         return empty_res;
     }
 
-    std::vector<std::string> target_dates;
+    int64_t from_ms = 0;
+    int64_t to_ms = 0;
     if (!filter.date.empty()) {
         std::string d_clean;
         for (char c : filter.date) if (std::isdigit(c)) d_clean.push_back(c);
-        if (!d_clean.empty()) target_dates.push_back(d_clean);
-    } else {
-        target_dates = GetRecordingDates();
+        if (d_clean.size() == 8) {
+            try {
+                int yr = std::stoi(d_clean.substr(0, 4));
+                int mo = std::stoi(d_clean.substr(4, 2));
+                int da = std::stoi(d_clean.substr(6, 2));
+                struct tm tm_d{};
+                tm_d.tm_year = yr - 1900;
+                tm_d.tm_mon = mo - 1;
+                tm_d.tm_mday = da;
+                time_t t_day = mktime(&tm_d);
+                if (t_day != -1) {
+                    from_ms = static_cast<int64_t>(t_day) * 1000LL;
+                    to_ms = from_ms + 86400000LL;
+                }
+            } catch (...) {}
+        }
     }
 
-    for (const auto& d_str : target_dates) {
-        std::filesystem::path d_path = root / d_str;
-        if (!std::filesystem::exists(d_path, ec) || !std::filesystem::is_directory(d_path, ec)) continue;
+    auto db_segments = DatabaseManager::Instance().QueryRecordings(
+        filter.channel_id, from_ms, to_ms, filter.trigger_type, filter.limit > 0 ? filter.limit : 200);
 
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(d_path, ec)) {
-            if (entry.is_regular_file(ec) && entry.path().extension() == ".mp4") {
-                std::string fname = entry.path().stem().string();
+    for (const auto& seg : db_segments) {
+        time_t t_start = static_cast<time_t>(seg.start_time_ms / 1000LL);
+        time_t t_end = static_cast<time_t>(seg.end_time_ms / 1000LL);
+        struct tm tm_start{}, tm_end{};
+        gmtime_r(&t_start, &tm_start);
+        gmtime_r(&t_end, &tm_end);
+        char start_buf[32]{0}, end_buf[32]{0};
+        strftime(start_buf, sizeof(start_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_start);
+        strftime(end_buf, sizeof(end_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_end);
 
-                int ch_id = 1;
-                std::string date_part = d_str;
-                std::string time_part = "";
+        nlohmann::json item;
+        item["id"] = seg.id;
+        item["channel_id"] = seg.channel_id;
+        item["start_time"] = std::string(start_buf);
+        item["end_time"] = std::string(end_buf);
+        item["start_time_ms"] = seg.start_time_ms;
+        item["end_time_ms"] = seg.end_time_ms;
+        item["duration_seconds"] = seg.duration_sec > 0 ? static_cast<double>(seg.duration_sec) : 60.0;
+        item["file_size_bytes"] = seg.file_size_bytes;
+        item["trigger_type"] = seg.trigger_type;
+        item["is_locked"] = seg.is_locked;
+        item["created_at"] = std::string(start_buf);
+        item["file_path"] = seg.file_path;
+        item["video_url"] = "/api/v1/recordings/video?path=" + seg.file_path;
 
-                if (fname.rfind("cam", 0) == 0) {
-                    size_t under = fname.find('_');
-                    if (under != std::string::npos) {
-                        try {
-                            ch_id = std::stoi(fname.substr(3, under - 3));
-                        } catch (...) {}
-                        size_t next_under = fname.find('_', under + 1);
-                        if (next_under != std::string::npos) {
-                            date_part = fname.substr(under + 1, next_under - (under + 1));
-                            time_part = fname.substr(next_under + 1);
-                        } else {
-                            time_part = fname.substr(under + 1);
-                        }
-                    }
-                } else {
-                    size_t under = fname.find('_');
-                    if (under != std::string::npos) {
-                        date_part = fname.substr(0, under);
-                        time_part = fname.substr(under + 1);
-                    }
-                }
-
-                if (filter.channel_id > 0 && ch_id != filter.channel_id) {
-                    continue;
-                }
-
-                std::string trigger_type = "continuous";
-                if (fname.find("_motion") != std::string::npos) trigger_type = "motion";
-                else if (fname.find("_ai") != std::string::npos) trigger_type = "ai";
-                else if (fname.find("_event") != std::string::npos) trigger_type = "event";
-
-                if (!filter.trigger_type.empty() && filter.trigger_type != "all" && filter.trigger_type != trigger_type) {
-                    continue;
-                }
-
-                uint64_t fsize = entry.file_size(ec);
-                double duration_sec = 60.0;
-                if (fsize > 0 && fsize < 100000000) {
-                    duration_sec = 60.0;
-                }
-
-                std::string iso_start = date_part.substr(0, 4) + "-" + date_part.substr(4, 2) + "-" + date_part.substr(6, 2) + "T";
-                if (time_part.size() >= 6) {
-                    iso_start += time_part.substr(0, 2) + ":" + time_part.substr(2, 2) + ":" + time_part.substr(4, 2) + "Z";
-                } else {
-                    iso_start += "00:00:00Z";
-                }
-
-                struct tm tm_start{};
-                time_t t_start = 0;
-                if (strptime(iso_start.c_str(), "%Y-%m-%dT%H:%M:%SZ", &tm_start)) {
-                    t_start = timegm(&tm_start);
-                }
-                time_t t_end = t_start + static_cast<time_t>(duration_sec);
-                struct tm tm_end{};
-                gmtime_r(&t_end, &tm_end);
-                char end_buf[32]{0};
-                strftime(end_buf, sizeof(end_buf), "%Y-%m-%dT%H:%M:%SZ", &tm_end);
-                std::string iso_end(end_buf);
-
-                if (!filter.from_time.empty() && time_part.size() >= 4) {
-                    std::string f_clean;
-                    for (char c : filter.from_time) if (std::isdigit(c)) f_clean.push_back(c);
-                    if (!f_clean.empty() && time_part.substr(0, f_clean.size()) < f_clean) continue;
-                }
-                if (!filter.to_time.empty() && time_part.size() >= 4) {
-                    std::string t_clean;
-                    for (char c : filter.to_time) if (std::isdigit(c)) t_clean.push_back(c);
-                    if (!t_clean.empty() && time_part.substr(0, t_clean.size()) > t_clean) continue;
-                }
-
-                auto lock_path = entry.path().parent_path() / (entry.path().stem().string() + ".locked");
-                bool is_locked = std::filesystem::exists(lock_path, ec);
-
-                std::filesystem::path rel_path = std::filesystem::relative(entry.path(), root, ec);
-                std::string rel_path_str = rel_path.string();
-
-                int64_t seg_id = static_cast<int64_t>(ch_id) * 10000000000LL;
-                try {
-                    if (date_part.size() >= 8 && time_part.size() >= 6) {
-                        seg_id += std::stoll(date_part + time_part);
-                    } else {
-                        seg_id += std::hash<std::string>{}(rel_path_str) % 10000000000LL;
-                    }
-                } catch (...) {
-                    seg_id += std::hash<std::string>{}(rel_path_str) % 10000000000LL;
-                }
-
-                nlohmann::json item;
-                item["id"] = seg_id;
-                item["channel_id"] = ch_id;
-                item["start_time"] = iso_start;
-                item["end_time"] = iso_end;
-                item["duration_seconds"] = duration_sec;
-                item["file_size_bytes"] = fsize;
-                item["trigger_type"] = trigger_type;
-                item["is_locked"] = is_locked;
-                item["created_at"] = iso_start;
-                item["file_path"] = rel_path_str;
-                item["video_url"] = "/api/v1/recordings/video?path=" + rel_path_str;
-
-                std::filesystem::path thumb_p = entry.path();
-                thumb_p.replace_extension(".bmp");
-                if (std::filesystem::exists(thumb_p, ec)) {
-                    std::string rel_thumb = std::filesystem::relative(thumb_p, root, ec).string();
-                    item["thumbnail_url"] = "/api/v1/recordings/thumbnail?path=" + rel_thumb;
-                }
-
-                items.push_back(item);
-            }
+        std::filesystem::path seg_path = root / seg.file_path;
+        std::filesystem::path thumb_p = seg_path;
+        thumb_p.replace_extension(".jpg");
+        if (!std::filesystem::exists(thumb_p, ec)) {
+            thumb_p.replace_extension(".bmp");
         }
+        if (std::filesystem::exists(thumb_p, ec)) {
+            std::string rel_thumb = std::filesystem::relative(thumb_p, root, ec).string();
+            item["thumbnail_url"] = "/api/v1/recordings/thumbnail?path=" + rel_thumb;
+        }
+
+        items.push_back(item);
     }
 
     std::sort(items.begin(), items.end(), [](const nlohmann::json& a, const nlohmann::json& b) {
@@ -366,32 +411,72 @@ bool PlaybackEngine::SetSegmentLock(const std::string& file_path, bool locked) {
     } else {
         std::filesystem::remove(lock_p, ec);
     }
+
+    // Persist lock state to SQLite database
+    DatabaseManager::Instance().SetRecordingLockedByPath(file_path, locked);
+
     return true;
 }
 
-std::string PlaybackEngine::GetSegmentLocalPath(const std::string& relative_path) {
-    if (relative_path.empty() || relative_path.find('\0') != std::string::npos ||
-        relative_path.find("..") != std::string::npos) {
+std::string PlaybackEngine::GetSegmentLocalPath(const std::string& input_path) {
+    if (input_path.empty() || input_path.find('\0') != std::string::npos ||
+        input_path.find("..") != std::string::npos) {
         return "";
     }
 
     std::error_code ec;
-    std::filesystem::path root_path = GetStorageRoot();
-    std::filesystem::path target_path = (root_path / std::filesystem::path(relative_path).relative_path()).lexically_normal();
+    std::filesystem::path root_path = std::filesystem::weakly_canonical(GetStorageRoot(), ec);
 
-    std::string root_str = root_path.lexically_normal().string();
+    // 1. Direct absolute path check
+    if (std::filesystem::path(input_path).is_absolute()) {
+        std::filesystem::path abs_cand = std::filesystem::weakly_canonical(input_path, ec);
+        std::string abs_str = abs_cand.string();
+        std::string root_str = root_path.string();
+        if (!root_str.empty() && root_str.back() != '/') root_str += '/';
+        if ((abs_str.rfind(root_str, 0) == 0 || abs_str == root_path.string()) &&
+            std::filesystem::is_regular_file(abs_cand, ec)) {
+            return abs_str;
+        }
+    }
+
+    // 2. Normalized relative path stripping redundant prefixes (e.g. "./recordings/", "recordings/")
+    std::string clean_rel = input_path;
+    while (clean_rel.rfind("./", 0) == 0) {
+        clean_rel = clean_rel.substr(2);
+    }
+    if (clean_rel.rfind("recordings/", 0) == 0) {
+        clean_rel = clean_rel.substr(11);
+    } else if (clean_rel.rfind("/recordings/", 0) == 0) {
+        clean_rel = clean_rel.substr(12);
+    }
+
+    std::filesystem::path target_path = (root_path / std::filesystem::path(clean_rel).relative_path()).lexically_normal();
+    std::string root_str = root_path.string();
     if (!root_str.empty() && root_str.back() != '/') root_str += '/';
     std::string target_str = target_path.string();
 
-    if (target_str.rfind(root_str, 0) != 0 && target_str != root_path.lexically_normal().string()) {
-        return "";
+    if ((target_str.rfind(root_str, 0) == 0 || target_str == root_path.string()) &&
+        std::filesystem::is_regular_file(target_path, ec)) {
+        return target_str;
     }
 
-    if (!std::filesystem::exists(target_path, ec) || !std::filesystem::is_regular_file(target_path, ec)) {
-        return "";
+    // 3. Fallback: Search directory by segment ID if input is an integer ID
+    char* end_ptr = nullptr;
+    long long seg_id = std::strtoll(input_path.c_str(), &end_ptr, 10);
+    if (end_ptr != input_path.c_str() && *end_ptr == '\0' && seg_id > 0) {
+        std::string id_sub = "_" + std::to_string(seg_id) + ".mp4";
+        for (auto it = std::filesystem::recursive_directory_iterator(root_path, std::filesystem::directory_options::skip_permission_denied, ec);
+             it != std::filesystem::recursive_directory_iterator(); ++it) {
+            if (it->is_regular_file(ec)) {
+                std::string fname = it->path().filename().string();
+                if (fname.size() >= id_sub.size() && fname.rfind(id_sub) == fname.size() - id_sub.size()) {
+                    return it->path().string();
+                }
+            }
+        }
     }
 
-    return target_str;
+    return "";
 }
 
 std::string PlaybackEngine::StartExport(int channel_id, int64_t start_time_ms, int64_t end_time_ms,

@@ -4,20 +4,42 @@
 #include "nvr/api/fmp4_muxer.h"
 #include "nvr/live/live_controller.h"
 #include "nvr/media/image_utils.h"
+#include "nvr/database/database_manager.h"
 
 namespace nvr {
 
 namespace {
 
-inline void CaptureSegmentThumbnail(int channel_id, SegmentMetadata& meta) {
+inline void CaptureSegmentThumbnail(int channel_id, SegmentMetadata& meta, const DecodedFramePtr& keyframe = nullptr) {
     if (meta.file_path.size() <= 4) return;
-    auto frame = LiveController::Instance().GetLatestFrame(channel_id);
+    auto frame = keyframe ? keyframe : LiveController::Instance().GetLatestFrame(channel_id);
     if (frame && !frame->data.empty() && frame->width > 0 && frame->height > 0) {
-        std::string thumb_path = meta.file_path.substr(0, meta.file_path.size() - 4) + ".bmp";
-        if (SaveFrameToBmp(frame, thumb_path, 320)) {
+        std::string thumb_path = meta.file_path.substr(0, meta.file_path.size() - 4) + ".jpg";
+        if (SaveFrameToJpeg(frame, thumb_path, 80)) {
             meta.thumbnail_path = thumb_path;
             LOG_DEBUG << "[Channel " << channel_id << "] Saved companion thumbnail: " << thumb_path;
         }
+    }
+}
+
+inline void IndexSegmentInDatabase(int channel_id, const SegmentMetadata& meta) {
+    if (meta.file_path.empty()) return;
+    RecordingSegmentRecord record;
+    record.channel_id = channel_id;
+    record.start_time_ms = meta.start_time_ms > 0 ? meta.start_time_ms : time_utils::WallTimeMs();
+    record.end_time_ms = meta.end_time_ms > 0 ? meta.end_time_ms : (record.start_time_ms + meta.duration_ms);
+    record.duration_sec = meta.duration_ms > 0 ? static_cast<int>(meta.duration_ms / 1000) : 60;
+    record.file_path = meta.file_path;
+    record.file_size_bytes = static_cast<int64_t>(meta.file_size_bytes);
+    record.codec = (meta.codec == CodecType::H265) ? "H265" : "H264";
+    record.trigger_type = "continuous";
+    record.is_locked = meta.is_locked;
+    record.created_at_ms = record.start_time_ms;
+
+    if (!DatabaseManager::Instance().InsertRecordingSegment(record)) {
+        LOG_WARN << "[Channel " << channel_id << "] Failed to index recording segment in database: " << meta.file_path;
+    } else {
+        LOG_DEBUG << "[Channel " << channel_id << "] Indexed segment in database: " << meta.file_path;
     }
 }
 
@@ -32,6 +54,14 @@ Segmenter::Segmenter(int channel_id, const std::string& output_directory, int se
 
 Segmenter::~Segmenter() {
     FlushAndStop();
+}
+
+void Segmenter::SetOutputDirectory(const std::string& new_dir) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!new_dir.empty()) {
+        output_dir_ = new_dir;
+        writer_.SetOutputDirectory(new_dir);
+    }
 }
 
 void Segmenter::PushPacket(const MediaPacketPtr& packet) {
@@ -64,11 +94,31 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
         if (!packet->is_keyframe) {
             return;
         }
+
+        if (!has_audio_configured_) {
+            CodecType acodec = CodecType::UNKNOWN;
+            uint32_t asrate = 8000;
+            uint8_t ach = 1;
+            if (StreamBroker::Instance().GetCachedAudioParams(channel_id_, StreamType::MAIN, acodec, asrate, ach) &&
+                acodec != CodecType::UNKNOWN) {
+                writer_.ConfigureAudio(acodec, asrate, ach);
+                has_audio_configured_ = true;
+            }
+        }
+
         int64_t now_ms = (packet->wall_time_ms > 0) ? packet->wall_time_ms : time_utils::WallTimeMs();
         if (writer_.StartSegment(now_ms)) {
             is_recording_ = true;
             waiting_for_first_keyframe_ = false;
             InjectCachedParameterSets();
+
+            // Decode initial keyframe for companion thumbnail
+            if (!thumbnail_decoder_ && cached_codec_ != CodecType::UNKNOWN) {
+                thumbnail_decoder_ = VideoDecoderFactory::Create(cached_codec_, cached_width_, cached_height_, false);
+            }
+            if (thumbnail_decoder_) {
+                thumbnail_decoder_->Decode(packet, latest_segment_thumbnail_);
+            }
         } else {
             return;
         }
@@ -113,8 +163,10 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
                  << (2 * segment_duration_ms_) << " ms ceiling). Force-finalizing segment.";
         SegmentMetadata meta;
         if (writer_.FinalizeSegment(meta)) {
-            CaptureSegmentThumbnail(channel_id_, meta);
+            CaptureSegmentThumbnail(channel_id_, meta, latest_segment_thumbnail_);
+            IndexSegmentInDatabase(channel_id_, meta);
         }
+        latest_segment_thumbnail_.reset();
         waiting_for_first_keyframe_ = true;
         is_recording_ = false;
         return;
@@ -126,14 +178,25 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
 void Segmenter::RotateSegment(const MediaPacketPtr& next_keyframe_packet) {
     SegmentMetadata meta;
     if (writer_.FinalizeSegment(meta)) {
-        CaptureSegmentThumbnail(channel_id_, meta);
+        CaptureSegmentThumbnail(channel_id_, meta, latest_segment_thumbnail_);
+        IndexSegmentInDatabase(channel_id_, meta);
     }
+    latest_segment_thumbnail_.reset();
 
     // Immediately start new segment with the incoming keyframe
     int64_t now_ms = (next_keyframe_packet->wall_time_ms > 0) ? 
                      next_keyframe_packet->wall_time_ms : time_utils::WallTimeMs();
     if (writer_.StartSegment(now_ms)) {
         InjectCachedParameterSets();
+
+        // Decode incoming keyframe for next companion thumbnail
+        if (!thumbnail_decoder_ && cached_codec_ != CodecType::UNKNOWN) {
+            thumbnail_decoder_ = VideoDecoderFactory::Create(cached_codec_, cached_width_, cached_height_, false);
+        }
+        if (thumbnail_decoder_ && next_keyframe_packet) {
+            thumbnail_decoder_->Decode(next_keyframe_packet, latest_segment_thumbnail_);
+        }
+
         writer_.WritePacket(next_keyframe_packet);
     } else {
         waiting_for_first_keyframe_ = true;
@@ -146,8 +209,10 @@ void Segmenter::FlushAndStop() {
     if (is_recording_) {
         SegmentMetadata meta;
         if (writer_.FinalizeSegment(meta)) {
-            CaptureSegmentThumbnail(channel_id_, meta);
+            CaptureSegmentThumbnail(channel_id_, meta, latest_segment_thumbnail_);
+            IndexSegmentInDatabase(channel_id_, meta);
         }
+        latest_segment_thumbnail_.reset();
         is_recording_ = false;
         waiting_for_first_keyframe_ = true;
         LOG_INFO << "[Channel " << channel_id_ << "] Flushed and stopped segmenter";

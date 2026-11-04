@@ -1,10 +1,134 @@
 #include "nvr/media/image_utils.h"
+#include "3rdparty/jo_jpeg.h"
 #include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <vector>
 
 namespace nvr {
+
+namespace {
+
+static void StringWriter(void* context, void* data, int size) {
+    auto* s = static_cast<std::string*>(context);
+    s->append(static_cast<const char*>(data), size);
+}
+
+} // namespace
+
+bool ConvertFrameToJpeg(const DecodedFramePtr& frame, std::string& out_jpeg, int quality, uint32_t target_width) {
+    if (!frame || frame->data.empty() || frame->width == 0 || frame->height == 0) {
+        return false;
+    }
+
+    uint32_t w = frame->width;
+    uint32_t h = frame->height;
+    uint32_t scale = 1;
+    if (target_width > 0 && w > target_width) {
+        scale = (w + target_width - 1) / target_width;
+        if (scale < 1) scale = 1;
+    }
+    uint32_t out_w = w / scale;
+    uint32_t out_h = h / scale;
+    if (out_w == 0 || out_h == 0) return false;
+
+    std::vector<uint8_t> rgb_buffer(out_w * out_h * 3);
+
+    if (frame->format == PixelFormat::NV12) {
+        const uint8_t* y_plane = frame->data.data();
+        uint32_t stride = (frame->stride > 0) ? frame->stride : w;
+        const uint8_t* uv_plane = frame->data.data() + (stride * h);
+
+        for (uint32_t r = 0; r < out_h; ++r) {
+            uint8_t* row_out = rgb_buffer.data() + (static_cast<size_t>(r) * out_w * 3);
+            uint32_t src_r = r * scale;
+            const uint8_t* y_row = y_plane + (src_r * stride);
+            const uint8_t* uv_row = uv_plane + ((src_r / 2) * stride);
+            for (uint32_t c = 0; c < out_w; ++c) {
+                uint32_t src_c = c * scale;
+                int y = y_row[src_c];
+                int u = uv_row[(src_c & ~1)] - 128;
+                int v = uv_row[(src_c & ~1) + 1] - 128;
+
+                row_out[c * 3 + 0] = static_cast<uint8_t>(std::clamp(y + ((359 * v) >> 8), 0, 255));
+                row_out[c * 3 + 1] = static_cast<uint8_t>(std::clamp(y - ((88 * u + 183 * v) >> 8), 0, 255));
+                row_out[c * 3 + 2] = static_cast<uint8_t>(std::clamp(y + ((454 * u) >> 8), 0, 255));
+            }
+        }
+    } else if (frame->format == PixelFormat::YUV420P) {
+        const uint8_t* y_plane = frame->data.data();
+        uint32_t y_stride = (frame->stride > 0) ? frame->stride : w;
+        uint32_t uv_stride = y_stride / 2;
+        const uint8_t* u_plane = y_plane + (y_stride * h);
+        const uint8_t* v_plane = u_plane + (uv_stride * (h / 2));
+
+        for (uint32_t r = 0; r < out_h; ++r) {
+            uint8_t* row_out = rgb_buffer.data() + (static_cast<size_t>(r) * out_w * 3);
+            uint32_t src_r = r * scale;
+            const uint8_t* y_row = y_plane + (src_r * y_stride);
+            const uint8_t* u_row = u_plane + ((src_r / 2) * uv_stride);
+            const uint8_t* v_row = v_plane + ((src_r / 2) * uv_stride);
+            for (uint32_t c = 0; c < out_w; ++c) {
+                uint32_t src_c = c * scale;
+                int y = y_row[src_c];
+                int u = u_row[src_c / 2] - 128;
+                int v = v_row[src_c / 2] - 128;
+
+                row_out[c * 3 + 0] = static_cast<uint8_t>(std::clamp(y + ((359 * v) >> 8), 0, 255));
+                row_out[c * 3 + 1] = static_cast<uint8_t>(std::clamp(y - ((88 * u + 183 * v) >> 8), 0, 255));
+                row_out[c * 3 + 2] = static_cast<uint8_t>(std::clamp(y + ((454 * u) >> 8), 0, 255));
+            }
+        }
+    } else if (frame->format == PixelFormat::RGB24) {
+        uint32_t stride = (frame->stride > 0) ? frame->stride : (w * 3);
+        for (uint32_t r = 0; r < out_h; ++r) {
+            uint8_t* row_out = rgb_buffer.data() + (static_cast<size_t>(r) * out_w * 3);
+            uint32_t src_r = r * scale;
+            const uint8_t* src_row = frame->data.data() + (src_r * stride);
+            for (uint32_t c = 0; c < out_w; ++c) {
+                uint32_t src_c = c * scale;
+                row_out[c * 3 + 0] = src_row[src_c * 3 + 0];
+                row_out[c * 3 + 1] = src_row[src_c * 3 + 1];
+                row_out[c * 3 + 2] = src_row[src_c * 3 + 2];
+            }
+        }
+    } else if (frame->format == PixelFormat::RGBA32) {
+        uint32_t stride = (frame->stride > 0) ? frame->stride : (w * 4);
+        for (uint32_t r = 0; r < out_h; ++r) {
+            uint8_t* row_out = rgb_buffer.data() + (static_cast<size_t>(r) * out_w * 3);
+            uint32_t src_r = r * scale;
+            const uint8_t* src_row = frame->data.data() + (src_r * stride);
+            for (uint32_t c = 0; c < out_w; ++c) {
+                uint32_t src_c = c * scale;
+                row_out[c * 3 + 0] = src_row[src_c * 4 + 0];
+                row_out[c * 3 + 1] = src_row[src_c * 4 + 1];
+                row_out[c * 3 + 2] = src_row[src_c * 4 + 2];
+            }
+        }
+    } else {
+        return false;
+    }
+
+    out_jpeg.clear();
+    out_jpeg.reserve(32768);
+    return jo_write_jpg_custom(&out_jpeg, StringWriter, rgb_buffer.data(), out_w, out_h, 3, quality) != 0;
+}
+
+bool SaveFrameToJpeg(const DecodedFramePtr& frame, const std::string& file_path, int quality, uint32_t target_width) {
+    std::string jpeg;
+    if (!ConvertFrameToJpeg(frame, jpeg, quality, target_width)) {
+        return false;
+    }
+    std::string tmp_path = file_path + ".tmp";
+    std::ofstream ofs(tmp_path, std::ios::binary);
+    if (!ofs) return false;
+    ofs.write(jpeg.data(), jpeg.size());
+    ofs.close();
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, file_path, ec);
+    return !ec;
+}
 
 bool ConvertFrameToBmp(const DecodedFramePtr& frame, std::string& out_bmp, uint32_t target_width) {
     if (!frame || frame->data.empty() || frame->width == 0 || frame->height == 0) {

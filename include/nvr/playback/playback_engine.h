@@ -29,6 +29,9 @@ public:
 
     void Initialize(const std::string& recording_root_path);
 
+    // Synchronize disk recording files with SQLite in a non-blocking background task
+    void SyncDiskRecordings();
+
     // List available recording dates (sorted descending, e.g. ["20261102", "20261101"])
     std::vector<std::string> GetRecordingDates();
 

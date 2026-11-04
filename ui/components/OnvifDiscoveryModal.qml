@@ -208,7 +208,7 @@ Rectangle {
                                         font.bold: true
                                     }
                                     Text {
-                                        text: "IP: " + (modelData.ip || "192.168.1.x") + " • MAC: " + (modelData.mac || "N/A")
+                                        text: "IP: " + (modelData.ip || "Unassigned") + " • MAC: " + (modelData.mac || "N/A")
                                         color: Theme.textMuted
                                         font.family: Theme.fontMono
                                         font.pixelSize: 11

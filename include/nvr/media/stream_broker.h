@@ -50,6 +50,7 @@ public:
                                 std::vector<uint8_t>& vps,
                                 std::vector<uint8_t>& sps,
                                 std::vector<uint8_t>& pps) const;
+    MediaPacketPtr GetLatestKeyframe(int channel_id, StreamType stream_type) const;
     size_t GetClientBufferMemoryBytes() const;
 
 private:
@@ -75,6 +76,7 @@ private:
         CodecType audio_codec{CodecType::UNKNOWN};
         uint32_t audio_sample_rate{0};
         uint8_t audio_channels{0};
+        MediaPacketPtr last_keyframe;
     };
 
     struct RingBufferEntry {

@@ -32,7 +32,7 @@ Item {
     property string activeVideoUrl: ""
     property double playbackRate: 1.0
     property bool isPlaying: false
-    property bool autoNext: true
+    property bool autoNext: false
     property bool loopCurrent: false
     property double currentPositionSec: 0.0
     property double totalDurationSec: 60.0
@@ -132,20 +132,60 @@ Item {
         return hrs + "h " + (remM > 0 ? (remM < 10 ? "0" : "") + remM + "m" : "00m");
     }
 
-    function secondsOfDayUtc(iso) {
-        if (!iso) return 0;
-        var d = new Date(iso);
-        if (isNaN(d.getTime())) return 0;
-        return d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds();
+    function getEpochMs(isoOrMs) {
+        if (typeof isoOrMs === "number" && !isNaN(isoOrMs)) return isoOrMs;
+        if (!isoOrMs) return 0;
+        var d = new Date(isoOrMs);
+        return isNaN(d.getTime()) ? 0 : d.getTime();
     }
 
-    function formatTimeHMS(sec) {
-        var s = Math.floor(sec || 0);
+    function formatTimeMSS(sec, forceHours) {
+        var s = Math.max(0, Math.floor(sec || 0));
         var hrs = Math.floor(s / 3600);
         var mins = Math.floor((s % 3600) / 60);
         var rem = s % 60;
         var pad = function(n) { return (n < 10 ? "0" : "") + n; };
-        return pad(hrs) + ":" + pad(mins) + ":" + pad(rem);
+        if (hrs > 0 || forceHours) {
+            return pad(hrs) + ":" + pad(mins) + ":" + pad(rem);
+        }
+        return pad(mins) + ":" + pad(rem);
+    }
+
+    function formatLocalDate(iso) {
+        if (!iso) return "";
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return iso.substr(0, 10);
+        return d.toLocaleDateString();
+    }
+
+    function formatLocalTimeRange(startIso, endIso) {
+        if (!startIso) return "00:00 ~ 00:00";
+        var d1 = new Date(startIso);
+        var d2 = new Date(endIso);
+        if (isNaN(d1.getTime())) return (startIso.substr(11, 5) + " ~ " + (endIso ? endIso.substr(11, 5) : ""));
+        var pad = function(n) { return (n < 10 ? "0" : "") + n; };
+        var t1 = pad(d1.getHours()) + ":" + pad(d1.getMinutes());
+        var t2 = isNaN(d2.getTime()) ? "" : (pad(d2.getHours()) + ":" + pad(d2.getMinutes()));
+        return t1 + (t2 ? " – " + t2 : "");
+    }
+
+    function getActiveItemTitle() {
+        if (!root.activeItem) return "No Footage Selected";
+        var ch = root.activeItem.channel_id || 1;
+        var startIso = root.activeItem.start_time || "";
+        var d = new Date(startIso);
+        var timeStr = "";
+        if (!isNaN(d.getTime())) {
+            var pad = function(n) { return (n < 10 ? "0" : "") + n; };
+            timeStr = pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds());
+        } else {
+            timeStr = startIso.length >= 19 ? startIso.substr(11, 8) : startIso;
+        }
+        return "Camera " + (ch < 10 ? "0" : "") + ch + " · " + timeStr + " (" + formatDurationCompact(root.totalDurationSec) + ")";
+    }
+
+    function formatTimeHMS(sec) {
+        return formatTimeMSS(sec);
     }
 
     function formatFileSize(bytes) {
@@ -159,11 +199,17 @@ Item {
     MediaPlayer {
         id: mediaPlayer
         videoOutput: playerVideoOutput
+        audioOutput: AudioOutput { id: playerAudioOutput }
         playbackRate: root.playbackRate
         loops: root.loopCurrent ? MediaPlayer.Infinite : MediaPlayer.Once
 
         onPositionChanged: {
             root.currentPositionSec = mediaPlayer.position / 1000.0;
+            // Bounded clip playback: stop cleanly when clip finishes
+            if (root.totalDurationSec > 0 && !root.autoNext && !root.loopCurrent && root.currentPositionSec >= root.totalDurationSec) {
+                mediaPlayer.pause();
+                root.isPlaying = false;
+            }
         }
 
         onDurationChanged: {
@@ -174,8 +220,12 @@ Item {
 
         onPlaybackStateChanged: {
             root.isPlaying = (mediaPlayer.playbackState === MediaPlayer.PlayingState);
-            if (mediaPlayer.playbackState === MediaPlayer.StoppedState && root.autoNext && !root.loopCurrent) {
-                root.advanceToNextSequentialSegment();
+            if (mediaPlayer.playbackState === MediaPlayer.StoppedState) {
+                if (root.autoNext && !root.loopCurrent) {
+                    root.advanceToNextSequentialSegment();
+                } else {
+                    root.isPlaying = false;
+                }
             }
         }
     }
@@ -897,7 +947,7 @@ Item {
                                             Layout.fillWidth: true
 
                                             Text {
-                                                text: (cardDelegate.modelData.start_time || "00:00:00") + " ~ " + (cardDelegate.modelData.end_time || "")
+                                                text: root.formatLocalDate(cardDelegate.modelData.start_time) + " · " + root.formatLocalTimeRange(cardDelegate.modelData.start_time, cardDelegate.modelData.end_time)
                                                 color: Theme.textPrimary
                                                 font.pixelSize: 11
                                                 font.bold: true
@@ -1007,7 +1057,7 @@ Item {
                     anchors.margins: 14
                     spacing: 12
 
-                    // 16:9 Dedicated Video Surface
+                    // 16:9 Dedicated Video Surface with Top "You're Watching" Overlay
                     Rectangle {
                         Layout.fillWidth: true
                         Layout.fillHeight: true
@@ -1021,60 +1071,116 @@ Item {
                             fillMode: VideoOutput.PreserveAspectFit
                         }
 
-                        // Top-Left HUD Info Overlay
+                        // Top "You're Watching" Overlay Header
                         Rectangle {
                             anchors.top: parent.top
                             anchors.left: parent.left
-                            anchors.margins: 12
-                            height: 26
-                            width: hudRow.implicitWidth + 16
-                            radius: Theme.radiusSm
-                            color: Qt.rgba(0, 0, 0, 0.7)
+                            anchors.right: parent.right
+                            height: 52
+                            color: Qt.rgba(0, 0, 0, 0.75)
+                            z: 20
+                            visible: root.activeItem !== null
 
                             RowLayout {
-                                id: hudRow
-                                anchors.centerIn: parent
-                                spacing: 8
+                                anchors.fill: parent
+                                anchors.leftMargin: 16
+                                anchors.rightMargin: 16
+                                spacing: 12
 
-                                Text {
-                                    text: "CH " + (root.activeItem ? (root.activeItem.channel_id || 1) : 1)
-                                    color: "#ffffff"
-                                    font.pixelSize: 11
-                                    font.bold: true
-                                    font.family: Theme.fontMono
-                                }
-                                Text {
-                                    text: "·"
-                                    color: "#94a3b8"
-                                    font.bold: true
-                                }
-                                Text {
-                                    text: "Zero-Transcode Direct StreamCopy"
-                                    color: "#38bdf8"
-                                    font.pixelSize: 10
-                                    font.family: Theme.fontSans
-                                }
-                            }
-                        }
+                                // Back button to activity cards
+                                Rectangle {
+                                    Layout.preferredHeight: 30
+                                    Layout.preferredWidth: backBtnRow.implicitWidth + 18
+                                    radius: 6
+                                    color: Qt.rgba(1, 1, 1, 0.15)
+                                    border.color: Qt.rgba(1, 1, 1, 0.2)
+                                    border.width: 1
 
-                        // Top-Right Status Badge
-                        Rectangle {
-                            anchors.top: parent.top
-                            anchors.right: parent.right
-                            anchors.margins: 12
-                            height: 24
-                            width: statusBadgeText.implicitWidth + 14
-                            radius: Theme.radiusSm
-                            color: root.isPlaying ? Theme.statusOnline : Theme.bgSecondary
+                                    RowLayout {
+                                        id: backBtnRow
+                                        anchors.centerIn: parent
+                                        spacing: 6
+                                        AppIcon {
+                                            name: "back"
+                                            size: 13
+                                            color: "#ffffff"
+                                            strokeWidth: 2
+                                        }
+                                        Text {
+                                            text: "Back"
+                                            color: "#ffffff"
+                                            font.pixelSize: 12
+                                            font.weight: Font.Medium
+                                            font.family: Theme.fontSans
+                                        }
+                                    }
 
-                            Text {
-                                id: statusBadgeText
-                                anchors.centerIn: parent
-                                text: root.isPlaying ? "PLAYING" : "PAUSED"
-                                color: root.isPlaying ? "#ffffff" : Theme.textSecondary
-                                font.pixelSize: 10
-                                font.bold: true
-                                font.family: Theme.fontSans
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: {
+                                            mediaPlayer.pause();
+                                            root.isPlaying = false;
+                                            root.viewMode = "cards";
+                                        }
+                                    }
+                                }
+
+                                Item { Layout.fillWidth: true }
+
+                                // Center "You're Watching" Title
+                                ColumnLayout {
+                                    spacing: 1
+                                    Text {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        text: "YOU'RE WATCHING"
+                                        color: "#94a3b8"
+                                        font.pixelSize: 10
+                                        font.bold: true
+                                        font.letterSpacing: 1.0
+                                        font.family: Theme.fontSans
+                                    }
+                                    Text {
+                                        Layout.alignment: Qt.AlignHCenter
+                                        text: root.getActiveItemTitle()
+                                        color: "#ffffff"
+                                        font.pixelSize: 13
+                                        font.bold: true
+                                        font.family: Theme.fontSans
+                                    }
+                                }
+
+                                Item { Layout.fillWidth: true }
+
+                                // Right Playing / Paused badge
+                                Rectangle {
+                                    Layout.preferredHeight: 24
+                                    Layout.preferredWidth: playBadgeRow.implicitWidth + 14
+                                    radius: 6
+                                    color: root.isPlaying ? Qt.rgba(0.85, 0.2, 0.2, 0.95) : Qt.rgba(0, 0, 0, 0.6)
+                                    border.color: root.isPlaying ? "transparent" : Qt.rgba(1, 1, 1, 0.2)
+                                    border.width: 1
+
+                                    RowLayout {
+                                        id: playBadgeRow
+                                        anchors.centerIn: parent
+                                        spacing: 5
+                                        Rectangle {
+                                            width: 6
+                                            height: 6
+                                            radius: 3
+                                            color: "#ffffff"
+                                            visible: root.isPlaying
+                                        }
+                                        Text {
+                                            text: root.isPlaying ? "PLAYING" : "PAUSED"
+                                            color: "#ffffff"
+                                            font.pixelSize: 10
+                                            font.bold: true
+                                            font.family: Theme.fontMono
+                                        }
+                                    }
+                                }
                             }
                         }
 
@@ -1093,10 +1199,10 @@ Item {
                         }
                     }
 
-                    // 24-Hour Interactive Timeline Scrubber
+                    // Modern Full-Width Scrubber & Transport Controls
                     Rectangle {
                         Layout.fillWidth: true
-                        height: 58
+                        height: 76
                         color: Theme.bgSecondary
                         border.color: Theme.borderSubtle
                         border.width: 1
@@ -1104,363 +1210,286 @@ Item {
 
                         ColumnLayout {
                             anchors.fill: parent
-                            anchors.margins: 6
-                            spacing: 2
+                            anchors.leftMargin: 16
+                            anchors.rightMargin: 16
+                            anchors.topMargin: 8
+                            anchors.bottomMargin: 8
+                            spacing: 6
 
-                            // 24h Ruler Hours
-                            RowLayout {
+                            // Full-Width Modern Scrubber Track
+                            Item {
+                                id: modernScrubTrack
                                 Layout.fillWidth: true
-                                Repeater {
-                                    model: ["00:00", "03:00", "06:00", "09:00", "12:00", "15:00", "18:00", "21:00", "24:00"]
-                                    Text {
-                                        required property var modelData
-                                        Layout.fillWidth: true
-                                        text: modelData
-                                        color: Theme.textMuted
-                                        font.pixelSize: 9
-                                        font.family: Theme.fontMono
-                                        horizontalAlignment: Text.AlignHCenter
-                                    }
-                                }
-                            }
+                                height: 18
 
-                            // Interactive 24-Hour Timeline Bar
-                            Rectangle {
-                                id: timelineTrack
-                                Layout.fillWidth: true
-                                height: 26
-                                color: Theme.bgCard
-                                border.color: Theme.borderSubtle
-                                border.width: 1
-                                radius: 4
-                                clip: true
-
-                                // Multi-segment timeline blocks (Continuous = blue, Motion = amber, Event = red)
-                                Repeater {
-                                    model: root.rawSegments
-                                    delegate: Rectangle {
-                                        required property var modelData
-                                        property real startSod: root.secondsOfDayUtc(modelData.start_time)
-                                        property real segDur: modelData.duration_seconds || 60
-                                        x: Math.max(0, (startSod / 86400.0) * timelineTrack.width)
-                                        width: Math.max(4, (segDur / 86400.0) * timelineTrack.width)
-                                        anchors.top: parent.top
-                                        anchors.bottom: parent.bottom
-                                        anchors.topMargin: 2
-                                        anchors.bottomMargin: 2
-                                        radius: 2
-                                        color: modelData.trigger_type === "motion" ? Theme.statusWarning :
-                                               (modelData.trigger_type === "event" ? Theme.statusDanger : Theme.accentPrimary)
-                                        opacity: (root.activeItem && (root.activeItem.id === modelData.id || root.activeItem.file_path === modelData.file_path)) ? 1.0 : 0.75
-
-                                        MouseArea {
-                                            anchors.fill: parent
-                                            cursorShape: Qt.PointingHandCursor
-                                            onClicked: {
-                                                root.playItem(modelData);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // 24-Hour Playhead Red Needle
+                                // Background track
                                 Rectangle {
-                                    id: playheadNeedle
-                                    property real activeStartSod: root.activeItem ? root.secondsOfDayUtc(root.activeItem.start_time) : 0
-                                    property real currentSod: activeStartSod + root.currentPositionSec
-                                    x: root.activeItem ? Math.max(0, Math.min(timelineTrack.width - 2, (currentSod / 86400.0) * timelineTrack.width)) : 0
-                                    visible: root.activeItem !== null
-                                    anchors.top: parent.top
-                                    anchors.bottom: parent.bottom
-                                    width: 2
-                                    color: Theme.statusRec
-                                    z: 10
-                                }
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    anchors.left: parent.left
+                                    anchors.right: parent.right
+                                    height: 6
+                                    radius: 3
+                                    color: Qt.rgba(1, 1, 1, 0.2)
 
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: function(mouse) {
-                                        if (timelineTrack.width <= 0) return;
-                                        var ratio = Math.max(0.0, Math.min(1.0, mouse.x / timelineTrack.width));
-                                        var clickedSod = ratio * 86400.0;
-
-                                        var hit = null;
-                                        var bestDist = 9999999;
-                                        var nearest = null;
-
-                                        for (var i = 0; i < root.rawSegments.length; ++i) {
-                                            var seg = root.rawSegments[i];
-                                            var s = root.secondsOfDayUtc(seg.start_time);
-                                            var e = s + (seg.duration_seconds || 60);
-                                            if (clickedSod >= s && clickedSod <= e) {
-                                                hit = seg;
-                                                break;
-                                            }
-                                            var dist = Math.abs(clickedSod - s);
-                                            if (dist < bestDist) {
-                                                bestDist = dist;
-                                                nearest = seg;
-                                            }
-                                        }
-
-                                        var targetSeg = hit || nearest;
-                                        if (targetSeg) {
-                                            var segStart = root.secondsOfDayUtc(targetSeg.start_time);
-                                            var offsetSec = hit ? Math.max(0.0, clickedSod - segStart) : 0.0;
-                                            if (!root.activeItem || root.activeItem.id !== targetSeg.id) {
-                                                root.playItem(targetSeg);
-                                                if (offsetSec > 0) {
-                                                    mediaPlayer.position = offsetSec * 1000.0;
-                                                }
-                                            } else {
-                                                mediaPlayer.position = offsetSec * 1000.0;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Transport Control Bar
-                    Rectangle {
-                        Layout.fillWidth: true
-                        height: 48
-                        color: Theme.bgSurface
-                        border.color: Theme.borderSubtle
-                        border.width: 1
-                        radius: Theme.radiusMd
-
-                        RowLayout {
-                            anchors.fill: parent
-                            anchors.leftMargin: 12
-                            anchors.rightMargin: 12
-                            spacing: 8
-
-                            // Step -1s
-                            Rectangle {
-                                Layout.preferredWidth: 38
-                                Layout.preferredHeight: 30
-                                radius: Theme.radiusSm
-                                color: Theme.bgSecondary
-
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "-1s"
-                                    color: Theme.textSecondary
-                                    font.pixelSize: 11
-                                    font.bold: true
-                                    font.family: Theme.fontMono
-                                }
-
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: mediaPlayer.position = Math.max(0, mediaPlayer.position - 1000)
-                                }
-                            }
-
-                            // Play / Pause Button
-                            Rectangle {
-                                Layout.preferredHeight: 32
-                                Layout.preferredWidth: playBtnRow.implicitWidth + 24
-                                radius: Theme.radiusMd
-                                color: Theme.accentPrimary
-
-                                RowLayout {
-                                    id: playBtnRow
-                                    anchors.centerIn: parent
-                                    spacing: 6
-
-                                    Text {
-                                        text: root.isPlaying ? "❚❚" : "▶"
-                                        color: Theme.accentPrimaryFg
-                                        font.pixelSize: 12
-                                    }
-                                    Text {
-                                        text: root.isPlaying ? "Pause" : "Play"
-                                        color: Theme.accentPrimaryFg
-                                        font.pixelSize: 11
-                                        font.bold: true
-                                        font.family: Theme.fontSans
-                                    }
-                                }
-
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: {
-                                        if (root.isPlaying) {
-                                            mediaPlayer.pause();
-                                        } else {
-                                            mediaPlayer.play();
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Step +1s
-                            Rectangle {
-                                Layout.preferredWidth: 38
-                                Layout.preferredHeight: 30
-                                radius: Theme.radiusSm
-                                color: Theme.bgSecondary
-
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "+1s"
-                                    color: Theme.textSecondary
-                                    font.pixelSize: 11
-                                    font.bold: true
-                                    font.family: Theme.fontMono
-                                }
-
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: mediaPlayer.position = Math.min(mediaPlayer.duration, mediaPlayer.position + 1000)
-                                }
-                            }
-
-                            // Speed Pills
-                            RowLayout {
-                                spacing: 2
-                                Repeater {
-                                    model: [0.5, 1.0, 2.0, 4.0, 8.0]
+                                    // Fill progress
                                     Rectangle {
-                                        id: rateBtn
-                                        required property var modelData
-                                        Layout.preferredHeight: 28
-                                        Layout.preferredWidth: 36
-                                        radius: Theme.radiusSm
-                                        color: root.playbackRate === rateBtn.modelData ? Theme.accentPrimary : Theme.bgSecondary
+                                        height: parent.height
+                                        radius: 3
+                                        color: Theme.accentPrimary
+                                        width: Math.max(0, Math.min(parent.width, (root.currentPositionSec / Math.max(1, root.totalDurationSec)) * parent.width))
+                                    }
+                                }
+
+                                // Circular Scrubber Knob
+                                Rectangle {
+                                    id: scrubKnob
+                                    width: 14
+                                    height: 14
+                                    radius: 7
+                                    color: "#ffffff"
+                                    border.color: Qt.rgba(0, 0, 0, 0.3)
+                                    border.width: 1
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    x: Math.max(0, Math.min(modernScrubTrack.width - width, (root.currentPositionSec / Math.max(1, root.totalDurationSec)) * modernScrubTrack.width - width / 2))
+                                }
+
+                                MouseArea {
+                                    id: scrubMouseArea
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    preventStealing: true
+
+                                    function updateSeek(mouseX) {
+                                        if (modernScrubTrack.width <= 0) return;
+                                        var ratio = Math.max(0.0, Math.min(1.0, mouseX / modernScrubTrack.width));
+                                        var targetSec = ratio * root.totalDurationSec;
+                                        mediaPlayer.position = targetSec * 1000.0;
+                                        root.currentPositionSec = targetSec;
+                                    }
+
+                                    onClicked: function(mouse) {
+                                        updateSeek(mouse.x);
+                                    }
+                                    onPositionChanged: function(mouse) {
+                                        if (pressed) {
+                                            updateSeek(mouse.x);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Transport Controls Row
+                            RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 12
+
+                                // Left Controls
+                                RowLayout {
+                                    spacing: 8
+
+                                    // Play/Pause circular button
+                                    Rectangle {
+                                        width: 34
+                                        height: 34
+                                        radius: 17
+                                        color: "#ffffff"
 
                                         Text {
                                             anchors.centerIn: parent
-                                            text: rateBtn.modelData + "x"
-                                            color: root.playbackRate === rateBtn.modelData ? Theme.accentPrimaryFg : Theme.textSecondary
-                                            font.pixelSize: 10
-                                            font.bold: true
-                                            font.family: Theme.fontMono
+                                            text: root.isPlaying ? "❚❚" : "▶"
+                                            color: "#000000"
+                                            font.pixelSize: 13
+                                            leftPadding: root.isPlaying ? 0 : 2
                                         }
 
                                         MouseArea {
                                             anchors.fill: parent
                                             cursorShape: Qt.PointingHandCursor
                                             onClicked: {
-                                                root.playbackRate = rateBtn.modelData;
-                                                mediaPlayer.playbackRate = rateBtn.modelData;
+                                                if (root.isPlaying) {
+                                                    mediaPlayer.pause();
+                                                } else {
+                                                    mediaPlayer.play();
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            }
 
-                            // Auto-Next Toggle
-                            Rectangle {
-                                Layout.preferredHeight: 28
-                                Layout.preferredWidth: autoNextRow.implicitWidth + 14
-                                radius: Theme.radiusSm
-                                color: root.autoNext ? Theme.bgAccent : Theme.bgSecondary
-                                border.color: root.autoNext ? Theme.accentPrimary : Theme.borderSubtle
-                                border.width: 1
-
-                                RowLayout {
-                                    id: autoNextRow
-                                    anchors.centerIn: parent
-                                    spacing: 4
-
+                                    // -10s Skip button
                                     Rectangle {
-                                        width: 6
-                                        height: 6
-                                        radius: 3
-                                        color: root.autoNext ? Theme.statusOnline : Theme.textMuted
+                                        width: 32
+                                        height: 32
+                                        radius: 16
+                                        color: Qt.rgba(1, 1, 1, 0.1)
+
+                                        RowLayout {
+                                            anchors.centerIn: parent
+                                            spacing: 1
+                                            Text {
+                                                text: "⟲"
+                                                color: "#ffffff"
+                                                font.pixelSize: 13
+                                            }
+                                            Text {
+                                                text: "10"
+                                                color: "#ffffff"
+                                                font.pixelSize: 9
+                                                font.bold: true
+                                                font.family: Theme.fontMono
+                                            }
+                                        }
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: mediaPlayer.position = Math.max(0, mediaPlayer.position - 10000)
+                                        }
                                     }
-                                    Text {
-                                        text: "Auto-Next"
-                                        color: root.autoNext ? Theme.textAccent : Theme.textSecondary
-                                        font.pixelSize: 10
-                                        font.family: Theme.fontSans
+
+                                    // +10s Skip button
+                                    Rectangle {
+                                        width: 32
+                                        height: 32
+                                        radius: 16
+                                        color: Qt.rgba(1, 1, 1, 0.1)
+
+                                        RowLayout {
+                                            anchors.centerIn: parent
+                                            spacing: 1
+                                            Text {
+                                                text: "10"
+                                                color: "#ffffff"
+                                                font.pixelSize: 9
+                                                font.bold: true
+                                                font.family: Theme.fontMono
+                                            }
+                                            Text {
+                                                text: "⟳"
+                                                color: "#ffffff"
+                                                font.pixelSize: 13
+                                            }
+                                        }
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: mediaPlayer.position = Math.min(mediaPlayer.duration, mediaPlayer.position + 10000)
+                                        }
                                     }
-                                }
 
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: root.autoNext = !root.autoNext
-                                }
-                            }
+                                    // Audio Mute / Unmute
+                                    Rectangle {
+                                        width: 32
+                                        height: 32
+                                        radius: 16
+                                        color: Qt.rgba(1, 1, 1, 0.1)
 
-                            // Loop Toggle
-                            Rectangle {
-                                Layout.preferredHeight: 28
-                                Layout.preferredWidth: 46
-                                radius: Theme.radiusSm
-                                color: root.loopCurrent ? Theme.bgAccent : Theme.bgSecondary
-                                border.color: root.loopCurrent ? Theme.accentPrimary : Theme.borderSubtle
-                                border.width: 1
+                                        AppIcon {
+                                            anchors.centerIn: parent
+                                            name: playerAudioOutput.muted ? "volume_mute" : "volume"
+                                            size: 14
+                                            color: "#ffffff"
+                                            strokeWidth: 2
+                                        }
 
-                                Text {
-                                    anchors.centerIn: parent
-                                    text: "Loop"
-                                    color: root.loopCurrent ? Theme.textAccent : Theme.textSecondary
-                                    font.pixelSize: 10
-                                    font.family: Theme.fontSans
-                                }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: playerAudioOutput.muted = !playerAudioOutput.muted
+                                        }
+                                    }
 
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: root.loopCurrent = !root.loopCurrent
-                                }
-                            }
-
-                            // Export Clip Button
-                            Rectangle {
-                                Layout.preferredHeight: 28
-                                Layout.preferredWidth: exportBtnRow.implicitWidth + 16
-                                radius: Theme.radiusSm
-                                color: Theme.bgSecondary
-                                border.color: Theme.accentPrimary
-                                border.width: 1
-
-                                RowLayout {
-                                    id: exportBtnRow
-                                    anchors.centerIn: parent
-                                    spacing: 4
-
+                                    // Clean Duration Counter: 00:04 / 01:00
                                     Text {
-                                        text: "⤓"
-                                        color: Theme.textAccent
+                                        text: {
+                                            var hasH = root.totalDurationSec >= 3600;
+                                            return root.formatTimeMSS(root.currentPositionSec, hasH) + " / " + root.formatTimeMSS(root.totalDurationSec, hasH);
+                                        }
+                                        color: "#ffffff"
                                         font.pixelSize: 12
                                         font.bold: true
-                                    }
-                                    Text {
-                                        text: "Export Clip"
-                                        color: Theme.textAccent
-                                        font.pixelSize: 10
-                                        font.bold: true
-                                        font.family: Theme.fontSans
+                                        font.family: Theme.fontMono
+                                        leftPadding: 6
                                     }
                                 }
 
-                                MouseArea {
-                                    anchors.fill: parent
-                                    cursorShape: Qt.PointingHandCursor
-                                    onClicked: root.openExportDialog(root.activeItem)
+                                Item { Layout.fillWidth: true }
+
+                                // Right Controls
+                                RowLayout {
+                                    spacing: 8
+
+                                    // Speed Pills
+                                    RowLayout {
+                                        spacing: 2
+                                        Repeater {
+                                            model: [0.5, 1.0, 2.0, 4.0]
+                                            Rectangle {
+                                                id: rateBtn
+                                                required property var modelData
+                                                Layout.preferredHeight: 26
+                                                Layout.preferredWidth: 34
+                                                radius: 6
+                                                color: root.playbackRate === rateBtn.modelData ? "#ffffff" : Qt.rgba(0, 0, 0, 0.4)
+                                                border.color: Qt.rgba(1, 1, 1, 0.15)
+                                                border.width: 1
+
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    text: rateBtn.modelData + "x"
+                                                    color: root.playbackRate === rateBtn.modelData ? "#000000" : "#ffffff"
+                                                    font.pixelSize: 10
+                                                    font.bold: true
+                                                    font.family: Theme.fontMono
+                                                }
+
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: {
+                                                        root.playbackRate = rateBtn.modelData;
+                                                        mediaPlayer.playbackRate = rateBtn.modelData;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // Export Clip Button
+                                    Rectangle {
+                                        Layout.preferredHeight: 28
+                                        Layout.preferredWidth: exportBtnRow.implicitWidth + 16
+                                        radius: 6
+                                        color: Qt.rgba(1, 1, 1, 0.1)
+                                        border.color: Qt.rgba(1, 1, 1, 0.2)
+                                        border.width: 1
+
+                                        RowLayout {
+                                            id: exportBtnRow
+                                            anchors.centerIn: parent
+                                            spacing: 5
+                                            Text {
+                                                text: "⤓"
+                                                color: "#ffffff"
+                                                font.pixelSize: 12
+                                                font.bold: true
+                                            }
+                                            Text {
+                                                text: "Export Clip"
+                                                color: "#ffffff"
+                                                font.pixelSize: 11
+                                                font.weight: Font.Medium
+                                                font.family: Theme.fontSans
+                                            }
+                                        }
+
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            cursorShape: Qt.PointingHandCursor
+                                            onClicked: root.openExportDialog(root.activeItem)
+                                        }
+                                    }
                                 }
-                            }
-
-                            Item { Layout.fillWidth: true }
-
-                            // Time Counter
-                            Text {
-                                text: root.formatTimeHMS(root.currentPositionSec) + " / " + root.formatTimeHMS(root.totalDurationSec)
-                                color: Theme.textPrimary
-                                font.pixelSize: 12
-                                font.bold: true
-                                font.family: Theme.fontMono
                             }
                         }
                     }

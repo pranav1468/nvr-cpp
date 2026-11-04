@@ -42,6 +42,18 @@ public:
     Q_INVOKABLE QString getExportStatus(const QString& jobId);
     Q_INVOKABLE QString listExportJobs();
     Q_INVOKABLE bool cancelExportJob(const QString& jobId);
+
+    // Authentication session state
+    Q_INVOKABLE void setAuthToken(const QString& token) { authToken_ = token; }
+    Q_INVOKABLE QString getAuthToken() const { return authToken_; }
+
+    // Automated regression capture mode
+    Q_INVOKABLE bool isCaptureMode() const { return captureMode_; }
+    void setCaptureMode(bool c) { captureMode_ = c; }
+
+private:
+    QString authToken_;
+    bool captureMode_ = false;
 };
 
 } // namespace nvr

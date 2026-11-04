@@ -22,6 +22,7 @@ public:
     uint64_t GetFreeDiskSpaceBytes(const std::string& path);
     uint64_t GetTotalDiskSpaceBytes(const std::string& path);
     std::string GetRecordingPath();
+    void SetRecordingPath(const std::string& new_path);
 
 private:
     RetentionManager() = default;

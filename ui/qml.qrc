@@ -4,7 +4,6 @@
         <file>Main.qml</file>
         <file>Theme.qml</file>
         <file>ApiClient.qml</file>
-        <file>LiveGrid.qml</file>
         <file>VideoTile.qml</file>
         <file>components/qmldir</file>
         <file>components/AppHeader.qml</file>
@@ -19,8 +18,10 @@
         <file>pages/LivePage.qml</file>
         <file>pages/PlaybackPage.qml</file>
         <file>pages/CamerasPage.qml</file>
+        <file>pages/UsersPage.qml</file>
         <file>pages/DashboardPage.qml</file>
         <file>pages/SystemPage.qml</file>
+        <file>pages/LoginPage.qml</file>
         <file>assets/images/logo.png</file>
         <file>assets/images/live_icon.png</file>
         <file>assets/images/calendar.png</file>

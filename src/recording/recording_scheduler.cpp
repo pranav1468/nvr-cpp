@@ -18,6 +18,25 @@ void RecordingScheduler::Configure(const StorageConfig& storage_config) {
     storage_config_ = storage_config;
 }
 
+void RecordingScheduler::SetStoragePath(const std::string& new_path) {
+    if (new_path.empty()) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    storage_config_.recording_path = new_path;
+    std::error_code ec;
+    std::filesystem::create_directories(new_path, ec);
+    for (auto& pair : channels_) {
+        if (pair.second && pair.second->segmenter) {
+            pair.second->segmenter->SetOutputDirectory(new_path);
+        }
+    }
+    LOG_INFO << "RecordingScheduler: Storage path updated to " << new_path << " across all active channels";
+}
+
+std::string RecordingScheduler::GetStoragePath() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return storage_config_.recording_path.empty() ? "./recordings" : storage_config_.recording_path;
+}
+
 bool RecordingScheduler::StartChannelRecording(int channel_id, RecordMode mode) {
     std::shared_ptr<ChannelRecordState> state;
     {
@@ -58,6 +77,15 @@ bool RecordingScheduler::StartChannelRecording(int channel_id, RecordMode mode) 
     // Enable rolling in-memory ring buffer in StreamBroker for pre-alarm buffering
     StreamBroker::Instance().EnablePreRollBuffer(channel_id, StreamType::MAIN, true);
     StreamBroker::Instance().SetPreRollBufferDuration(channel_id, StreamType::MAIN, state->preroll_seconds);
+
+    // Check if audio parameters are cached from stream broker and configure segmenter
+    CodecType cached_acodec = CodecType::UNKNOWN;
+    uint32_t cached_asrate = 8000;
+    uint8_t cached_ach = 1;
+    if (StreamBroker::Instance().GetCachedAudioParams(channel_id, StreamType::MAIN, cached_acodec, cached_asrate, cached_ach) &&
+        cached_acodec != CodecType::UNKNOWN) {
+        state->segmenter->ConfigureAudio(cached_acodec, cached_asrate, cached_ach);
+    }
 
     // Start dedicated recording worker thread (isolated from network ingress)
     state->worker_thread = std::thread(&RecordingScheduler::ChannelWorkerLoop, this, state);

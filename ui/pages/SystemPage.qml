@@ -9,6 +9,12 @@ Item {
 
     property string traceLogText: "Connecting to in-process diagnostics tracer..."
     property bool autoTail: true
+    property string storageMountPoint: "./recordings"
+    property string storageStatusText: "Ready"
+    property bool storageWritable: true
+    property string storageDiskHealth: "OK (write throttling ready)"
+    property bool isAdmin: ApiClient.currentUserRole === "ADMIN"
+    property var usersList: []
 
     Component.onCompleted: {
         loadAll();
@@ -24,6 +30,35 @@ Item {
 
     function loadAll() {
         fetchTrace();
+        fetchStorage();
+        if (root.isAdmin) {
+            fetchUsers();
+        }
+    }
+
+    function fetchUsers() {
+        ApiClient.get("/api/v1/users", function(res) {
+            var data = (res && res.data) ? res.data : res;
+            if (data && Array.isArray(data)) {
+                root.usersList = data;
+            }
+        });
+    }
+
+    function fetchStorage() {
+        ApiClient.get("/api/v1/storage", function(res) {
+            var data = (res && res.data) ? res.data : res;
+            if (data && data.recording_path) {
+                root.storageMountPoint = data.recording_path;
+                root.storageWritable = (data.is_writable !== false);
+                root.storageStatusText = root.storageWritable ? "Ready (Writable)" : "Read-Only / Error";
+                if (data.free_storage_bytes !== undefined && data.total_storage_bytes !== undefined) {
+                    var freeGb = (data.free_storage_bytes / (1024 * 1024 * 1024)).toFixed(1);
+                    var totalGb = (data.total_storage_bytes / (1024 * 1024 * 1024)).toFixed(1);
+                    root.storageDiskHealth = freeGb + " GB Free / " + totalGb + " GB (" + (root.storageWritable ? "Writable" : "Read-Only") + ")";
+                }
+            }
+        });
     }
 
     function fetchTrace() {
@@ -222,7 +257,7 @@ Item {
                     }
                 }
 
-                // Dedicated Media Storage & Retention Card
+                // Dedicated Media Storage & Retention Card (Exact Parity with Target Platform Architecture Card)
                 Rectangle {
                     Layout.fillWidth: true
                     Layout.preferredWidth: 1
@@ -238,13 +273,52 @@ Item {
                         anchors.margins: 18
                         spacing: 10
 
-                        Text {
-                            text: "Dedicated media storage & filesystem retention"
-                            color: Theme.textPrimary
-                            font.pixelSize: 14
-                            font.bold: true
-                            font.family: Theme.fontSans
+                        RowLayout {
                             Layout.fillWidth: true
+                            Text {
+                                text: "Dedicated media storage & filesystem retention"
+                                color: Theme.textPrimary
+                                font.pixelSize: 14
+                                font.bold: true
+                                font.family: Theme.fontSans
+                                Layout.fillWidth: true
+                            }
+
+                            Rectangle {
+                                id: btnChangeStoragePath
+                                Layout.preferredHeight: 28
+                                Layout.preferredWidth: changeStorageRow.implicitWidth + 20
+                                color: Theme.bgSecondary
+                                border.color: Theme.borderSubtle
+                                radius: 6
+
+                                RowLayout {
+                                    id: changeStorageRow
+                                    anchors.centerIn: parent
+                                    spacing: 5
+
+                                    AppIcon {
+                                        name: "edit"
+                                        size: 12
+                                        color: Theme.textSecondary
+                                        strokeWidth: 2
+                                    }
+
+                                    Text {
+                                        text: "Change Path"
+                                        color: Theme.textSecondary
+                                        font.pixelSize: 11
+                                        font.weight: Font.Medium
+                                        font.family: Theme.fontSans
+                                    }
+                                }
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: storagePathModal.openModal()
+                                }
+                            }
                         }
 
                         Rectangle {
@@ -263,7 +337,7 @@ Item {
                                 Layout.fillWidth: true
                                 spacing: 2
                                 Text { text: "Storage mount point"; color: Theme.textMuted; font.pixelSize: 11; font.family: Theme.fontSans }
-                                Text { text: "/recordings (dedicated disk)"; color: Theme.textPrimary; font.bold: true; font.family: Theme.fontMono; font.pixelSize: 12; elide: Text.ElideRight; Layout.fillWidth: true }
+                                Text { text: root.storageMountPoint + " (dedicated disk)"; color: Theme.textPrimary; font.bold: true; font.family: Theme.fontMono; font.pixelSize: 12; elide: Text.ElideRight; Layout.fillWidth: true }
                             }
                             ColumnLayout {
                                 Layout.fillWidth: true
@@ -293,7 +367,7 @@ Item {
                                 Layout.fillWidth: true
                                 spacing: 2
                                 Text { text: "Disk health"; color: Theme.textMuted; font.pixelSize: 11; font.family: Theme.fontSans }
-                                Text { text: "OK (write throttling ready)"; color: Theme.statusOnline; font.bold: true; font.family: Theme.fontMono; font.pixelSize: 12; elide: Text.ElideRight; Layout.fillWidth: true }
+                                Text { text: root.storageDiskHealth; color: Theme.statusOnline; font.bold: true; font.family: Theme.fontMono; font.pixelSize: 12; elide: Text.ElideRight; Layout.fillWidth: true }
                             }
                         }
                     }
@@ -422,6 +496,257 @@ Item {
                         color: Theme.textMuted
                         font.pixelSize: 11
                         font.family: Theme.fontSans
+                    }
+                }
+            }
+        }
+    }
+
+    // Recording Storage Location Modal Dialog (Exact Parity with Web modal-change-storage)
+    Rectangle {
+        id: storagePathModal
+        anchors.fill: parent
+        color: "#000000bb"
+        visible: false
+        z: 9999
+
+        property string errorText: ""
+
+        function openModal() {
+            errorText = "";
+            newPathInput.text = root.storageMountPoint;
+            visible = true;
+            newPathInput.forceActiveFocus();
+        }
+
+        function closeModal() {
+            visible = false;
+        }
+
+        function applyPath() {
+            var newP = newPathInput.text.trim();
+            if (!newP) {
+                storagePathModal.errorText = "Please enter a valid storage path";
+                return;
+            }
+            ApiClient.post("/api/v1/storage/path", {path: newP}, function(res) {
+                var d = (res && res.data) ? res.data : res;
+                root.storageMountPoint = (d && d.recording_path) || d.path || newP;
+                root.storageWritable = true;
+                root.storageStatusText = "Ready (Writable)";
+                storagePathModal.closeModal();
+                root.loadAll();
+            }, function(err) {
+                storagePathModal.errorText = "Failed: " + String(err);
+                root.storageWritable = false;
+            });
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: {} // Prevents clicking through modal backdrop
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: 480
+            implicitHeight: storageModalCol.implicitHeight + 40
+            color: Theme.bgSurface
+            border.color: Theme.borderSubtle
+            radius: Theme.radiusLg
+            clip: true
+
+            ColumnLayout {
+                id: storageModalCol
+                anchors.fill: parent
+                anchors.margins: 20
+                spacing: 14
+
+                // Header
+                RowLayout {
+                    Layout.fillWidth: true
+                    ColumnLayout {
+                        Layout.fillWidth: true
+                        spacing: 2
+                        Text {
+                            text: "Recording Storage Location"
+                            color: Theme.textPrimary
+                            font.pixelSize: 16
+                            font.bold: true
+                            font.family: Theme.fontDisplay
+                        }
+                        Text {
+                            text: "Set the active drive partition or folder for camera recordings."
+                            color: Theme.textMuted
+                            font.pixelSize: 12
+                            font.family: Theme.fontSans
+                        }
+                    }
+
+                    Rectangle {
+                        width: 28
+                        height: 28
+                        color: Theme.bgInput
+                        radius: 6
+                        Text {
+                            anchors.centerIn: parent
+                            text: "✕"
+                            color: Theme.textSecondary
+                            font.pixelSize: 12
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: storagePathModal.closeModal()
+                        }
+                    }
+                }
+
+                // Error Banner
+                Rectangle {
+                    Layout.fillWidth: true
+                    height: 32
+                    radius: 6
+                    color: "#2a1515"
+                    border.color: "#ef4444"
+                    visible: storagePathModal.errorText.length > 0
+
+                    Text {
+                        anchors.fill: parent
+                        anchors.margins: 8
+                        text: storagePathModal.errorText
+                        color: "#ef4444"
+                        font.pixelSize: 11
+                        font.family: Theme.fontSans
+                        elide: Text.ElideRight
+                    }
+                }
+
+                // Current Active Path
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Text {
+                        text: "Current Active Path"
+                        color: Theme.textSecondary
+                        font.pixelSize: 11
+                        font.bold: true
+                        font.family: Theme.fontSans
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        height: 36
+                        color: Theme.bgInput
+                        border.color: Theme.borderSubtle
+                        radius: 6
+
+                        Text {
+                            anchors.fill: parent
+                            anchors.margins: 10
+                            text: root.storageMountPoint
+                            color: Theme.textMuted
+                            font.family: Theme.fontMono
+                            font.pixelSize: 12
+                            elide: Text.ElideRight
+                        }
+                    }
+                }
+
+                // New Storage Mount Directory
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+
+                    Text {
+                        text: "New Storage Mount Directory"
+                        color: Theme.textSecondary
+                        font.pixelSize: 11
+                        font.bold: true
+                        font.family: Theme.fontSans
+                    }
+
+                    Rectangle {
+                        Layout.fillWidth: true
+                        height: 36
+                        color: Theme.bgSecondary
+                        border.color: Theme.borderLight
+                        radius: 6
+
+                        TextInput {
+                            id: newPathInput
+                            anchors.fill: parent
+                            anchors.margins: 10
+                            color: Theme.textPrimary
+                            font.family: Theme.fontMono
+                            font.pixelSize: 12
+                            selectByMouse: true
+                            clip: true
+                            onAccepted: storagePathModal.applyPath()
+                        }
+                    }
+
+                    Text {
+                        Layout.fillWidth: true
+                        text: "Point camera recordings to an attached SATA HDD, NVMe SSD, or external USB drive. Path will be verified for write permissions before applying."
+                        color: Theme.textMuted
+                        font.pixelSize: 11
+                        wrapMode: Text.Wrap
+                        font.family: Theme.fontSans
+                    }
+                }
+
+                // Actions
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 10
+
+                    Item { Layout.fillWidth: true }
+
+                    Rectangle {
+                        width: 80
+                        height: 34
+                        color: Theme.bgSecondary
+                        radius: 6
+                        border.color: Theme.borderSubtle
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Cancel"
+                            color: Theme.textSecondary
+                            font.pixelSize: 12
+                            font.bold: true
+                            font.family: Theme.fontSans
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: storagePathModal.closeModal()
+                        }
+                    }
+
+                    Rectangle {
+                        width: 100
+                        height: 34
+                        color: Theme.accentPrimary
+                        radius: 6
+
+                        Text {
+                            anchors.centerIn: parent
+                            text: "Apply Path"
+                            color: "#ffffff"
+                            font.pixelSize: 12
+                            font.bold: true
+                            font.family: Theme.fontSans
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: storagePathModal.applyPath()
+                        }
                     }
                 }
             }

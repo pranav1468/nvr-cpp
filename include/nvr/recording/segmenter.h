@@ -2,10 +2,10 @@
 
 #include "nvr/common/types.h"
 #include "nvr/recording/atomic_writer.h"
+#include "nvr/media/video_decoder.h"
 #include <string>
 #include <memory>
 #include <mutex>
-
 #include <vector>
 
 namespace nvr {
@@ -20,6 +20,8 @@ public:
     void FlushAndStop();
 
     void ConfigureAudio(CodecType codec, uint32_t sample_rate = 8000, uint8_t channels = 1);
+
+    void SetOutputDirectory(const std::string& new_dir);
 
     bool IsRecording() const;
     uint32_t GetCurrentFrameCount() const;
@@ -46,6 +48,10 @@ private:
     uint32_t cached_width_{0};
     uint32_t cached_height_{0};
     bool has_audio_configured_{false};
+
+    // Dedicated keyframe decoder for background companion snapshots
+    VideoDecoderPtr thumbnail_decoder_;
+    DecodedFramePtr latest_segment_thumbnail_;
 };
 
 } // namespace nvr

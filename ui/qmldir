@@ -2,5 +2,4 @@ module ui
 singleton Theme 1.0 Theme.qml
 singleton ApiClient 1.0 ApiClient.qml
 VideoTile 1.0 VideoTile.qml
-LiveGrid 1.0 LiveGrid.qml
 Main 1.0 Main.qml

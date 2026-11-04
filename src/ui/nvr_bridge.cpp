@@ -15,6 +15,9 @@ QString NvrBridge::dispatch(const QString& action, const QString& payloadJson) {
     env.action = action.toStdString();
     env.client_id = "local_qml_ui";
     env.source = CommandSource::UI_QML;
+    if (!authToken_.isEmpty()) {
+        env.auth_token = authToken_.toStdString();
+    }
     
     std::string pStr = payloadJson.toStdString();
     if (!pStr.empty() && pStr != "{}") {

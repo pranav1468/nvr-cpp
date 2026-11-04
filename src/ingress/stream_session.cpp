@@ -473,6 +473,9 @@ void StreamSession::DisconnectSocket() {
     if (depacketizer_) {
         depacketizer_->Reset();
     }
+    if (audio_transcoder_) {
+        audio_transcoder_->Reset();
+    }
     if (audio_depacketizer_) {
         audio_depacketizer_->Reset();
     }
@@ -811,17 +814,28 @@ bool StreamSession::SendRtspDescribe() {
     );
 
     if (has_audio_track_ && audio_codec_ != CodecType::UNKNOWN) {
-        audio_depacketizer_ = std::make_unique<RtpDepacketizer>(
-            channel_id_, stream_type_, audio_codec_,
+        audio_transcoder_ = std::make_unique<AudioTranscoder>(
+            channel_id_, stream_type_,
             [](const MediaPacketPtr& pkt) {
                 StreamBroker::Instance().Publish(pkt);
+            }
+        );
+
+        audio_depacketizer_ = std::make_unique<RtpDepacketizer>(
+            channel_id_, stream_type_, audio_codec_,
+            [this](const MediaPacketPtr& pkt) {
+                if (audio_transcoder_) {
+                    audio_transcoder_->ProcessPacket(pkt);
+                } else {
+                    StreamBroker::Instance().Publish(pkt);
+                }
             },
             audio_clock_rate_,
             audio_channels_
         );
         LOG_INFO << "[Channel " << channel_id_ << "] Detected audio track: codec=" 
                  << CodecToString(audio_codec_) << " (" << audio_clock_rate_ << " Hz, "
-                 << static_cast<int>(audio_channels_) << " ch)";
+                 << static_cast<int>(audio_channels_) << " ch) -> In-process transcoding to AAC-LC";
     }
 
     state_ = SessionState::DESCRIBE_SENT;
@@ -1054,6 +1068,9 @@ void StreamSession::WorkerLoop() {
         // Ensure pristine depacketizer state before initiating any connection attempt
         if (depacketizer_) {
             depacketizer_->Reset();
+        }
+        if (audio_transcoder_) {
+            audio_transcoder_->Reset();
         }
         if (audio_depacketizer_) {
             audio_depacketizer_->Reset();

@@ -41,6 +41,7 @@ Rectangle {
                 { route: "live", label: "Live Matrix", iconName: "live" },
                 { route: "playback", label: "Recordings", iconName: "recordings" },
                 { route: "cameras", label: "Camera Manager", iconName: "cameras" },
+                { route: "users", label: "User Accounts", iconName: "users" },
                 { route: "dashboard", label: "Health & Telemetry", iconName: "dashboard" },
                 { route: "system", label: "System & Storage", iconName: "system" }
             ]

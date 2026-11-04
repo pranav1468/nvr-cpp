@@ -40,8 +40,8 @@ set(CORE_SOURCES
     src/media/stream_broker.cpp
     src/media/buffer_allocator.cpp
     src/media/video_decoder.cpp
-    src/media/video_scaler.cpp
     src/media/image_utils.cpp
+    src/media/audio_transcoder.cpp
     src/recording/atomic_writer.cpp
     src/recording/segmenter.cpp
     src/recording/recording_scheduler.cpp

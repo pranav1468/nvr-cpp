@@ -198,16 +198,7 @@ MotionGateResult MotionGateManager::ProcessFrame(int channel_id, const DecodedFr
     }
 
     MotionGateResult result = gate->ProcessFrame(frame);
-
-    // Autonomous Fallback Logic:
-    // If camera has hardware ONVIF event worker online, the ONVIF worker owns motion events.
-    // If NO ONVIF event worker is online (non-ONVIF RTSP camera), software motion gate
-    // seamlessly forwards motion state directly to RecordingScheduler.
-    bool onvif_active = CameraManager::Instance().IsEventWorkerOnline(channel_id);
-    if (!onvif_active) {
-        RecordingScheduler::Instance().SetMotionEvent(channel_id, result.is_motion_active);
-    }
-
+    RecordingScheduler::Instance().SetMotionEvent(channel_id, result.is_motion_active);
     return result;
 }
 

@@ -406,7 +406,7 @@ Item {
                                                 Layout.fillWidth: true
                                             }
                                             Text {
-                                                text: modelData.ip_address || "192.168.1.x"
+                                                text: modelData.ip_address || "Unassigned"
                                                 color: Theme.textMuted
                                                 font.family: Theme.fontMono
                                                 font.pixelSize: 10

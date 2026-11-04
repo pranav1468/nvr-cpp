@@ -26,6 +26,19 @@ Rectangle {
     property int frameRevision: (typeof LiveBridge !== "undefined" && LiveBridge && LiveBridge["rev" + root.tileIndex] !== undefined) ? LiveBridge["rev" + root.tileIndex] : 0
     property bool isSelected: false
     property bool hwAccelerated: (typeof LiveBridge !== "undefined" && LiveBridge && LiveBridge.hasHardwareGlSink) ? true : false
+    property string dynamicResolutionText: {
+        if (typeof LiveBridge !== "undefined" && LiveBridge && LiveBridge["res" + root.tileIndex]) {
+            return LiveBridge["res" + root.tileIndex];
+        }
+        var h = videoFrame.sourceSize.height;
+        if (h > 0) {
+            var pfx = (root.streamType === "MAIN" || root.isFullscreen) ? "MAIN" : "SUB";
+            if (h >= 2160) return pfx + " 4K";
+            if (h >= 1440) return pfx + " 2K";
+            return pfx + " " + h + "p";
+        }
+        return (root.streamType === "MAIN" || root.isFullscreen) ? "MAIN" : "SUB";
+    }
 
     // Signals
     signal fullscreenRequested(int channelId)
@@ -162,7 +175,7 @@ Rectangle {
                 Text {
                     id: subLabel
                     anchors.centerIn: parent
-                    text: root.streamType === "MAIN" ? "MAIN 1080p" : "SUB 360p"
+                    text: root.dynamicResolutionText
                     color: Qt.rgba(1, 1, 1, 0.85)
                     font.pixelSize: 9
                     font.bold: true

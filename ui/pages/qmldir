@@ -2,5 +2,7 @@ module ui.pages
 LivePage 1.0 LivePage.qml
 PlaybackPage 1.0 PlaybackPage.qml
 CamerasPage 1.0 CamerasPage.qml
+UsersPage 1.0 UsersPage.qml
 DashboardPage 1.0 DashboardPage.qml
 SystemPage 1.0 SystemPage.qml
+LoginPage 1.0 LoginPage.qml

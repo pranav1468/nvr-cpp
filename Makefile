@@ -13,19 +13,21 @@ CXXFLAGS ?= -std=c++17 -Wall -Wextra -Wpedantic -O2 -pthread
 override CXXFLAGS += -std=c++17 $(NVR_INCLUDES) $(NVR_DEFINES) -MMD -MP -pthread
 
 LDFLAGS ?= -pthread -ldl -rdynamic
-override LDFLAGS += -pthread -ldl -rdynamic
+override LDFLAGS += -pthread -ldl -rdynamic -Lbuild/lib -lsqlite3 -lcrypto
 
 SRCS = src/common/logger.cpp \
        src/common/deep_tracer.cpp \
        src/common/time_utils.cpp \
        src/common/thread_pool.cpp \
        src/common/config_loader.cpp \
+       src/common/crypto_utils.cpp \
+       src/database/database_manager.cpp \
        src/storage/retention_manager.cpp \
        src/media/stream_broker.cpp \
        src/media/buffer_allocator.cpp \
        src/media/video_decoder.cpp \
-       src/media/video_scaler.cpp \
        src/media/image_utils.cpp \
+       src/media/audio_transcoder.cpp \
        src/recording/atomic_writer.cpp \
        src/recording/segmenter.cpp \
        src/recording/recording_scheduler.cpp \
@@ -93,8 +95,11 @@ build/obj/%.o: src/%.cpp | build/obj
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-bin build build/obj:
+bin build build/obj build/lib:
 	mkdir -p $@
+	@test -d build/lib && test -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 && ln -sf /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 build/lib/libsqlite3.so || true
+	@test -d build/lib && test -f /usr/lib/x86_64-linux-gnu/libcrypto.so.3 && ln -sf /usr/lib/x86_64-linux-gnu/libcrypto.so.3 build/lib/libcrypto.so || true
+
 
 clean:
 	rm -rf build

@@ -181,6 +181,11 @@ void StreamBroker::Publish(const MediaPacketPtr& packet) {
         }
     }
 
+    if (packet->is_keyframe && packet->IsVideo()) {
+        std::unique_lock<std::shared_mutex> w_lock(rw_mutex_);
+        topic_param_cache_[topic_key].last_keyframe = packet;
+    }
+
     if (need_audio_cache_update) {
         std::unique_lock<std::shared_mutex> w_lock(rw_mutex_);
         auto& cache = topic_param_cache_[topic_key];
@@ -506,6 +511,16 @@ bool StreamBroker::GetCachedParameterSets(int channel_id, StreamType stream_type
     sps = it->second.sps;
     pps = it->second.pps;
     return (!sps.empty() && !pps.empty());
+}
+
+MediaPacketPtr StreamBroker::GetLatestKeyframe(int channel_id, StreamType stream_type) const {
+    uint32_t topic_key = MakeTopicKey(channel_id, stream_type);
+    std::shared_lock<std::shared_mutex> r_lock(rw_mutex_);
+    auto it = topic_param_cache_.find(topic_key);
+    if (it != topic_param_cache_.end()) {
+        return it->second.last_keyframe;
+    }
+    return nullptr;
 }
 
 size_t StreamBroker::GetClientBufferMemoryBytes() const {

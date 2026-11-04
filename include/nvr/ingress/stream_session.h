@@ -2,6 +2,7 @@
 
 #include "nvr/common/types.h"
 #include "nvr/ingress/rtp_depacketizer.h"
+#include "nvr/media/audio_transcoder.h"
 #include <string>
 #include <thread>
 #include <atomic>
@@ -85,6 +86,7 @@ private:
     std::string auth_header_;
     std::unique_ptr<RtpDepacketizer> depacketizer_;
     std::unique_ptr<RtpDepacketizer> audio_depacketizer_;
+    std::unique_ptr<AudioTranscoder> audio_transcoder_;
 
     bool has_audio_track_{false};
     std::string audio_track_control_;

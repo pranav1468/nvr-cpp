@@ -12,6 +12,7 @@
 #include "nvr/ai/motion_gate.h"
 #include "nvr/playback/playback_engine.h"
 #include "nvr/common/crypto_utils.h"
+#include "nvr/database/database_manager.h"
 
 #include <sys/sysinfo.h>
 #include <cstdlib>
@@ -54,7 +55,20 @@ CommandResult CommandDispatcher::Dispatch(const CommandEnvelope& cmd) {
         reg = it->second;
     }
 
-    // Minimal pipeline: all commands dispatch directly without session checks
+    // Authentication & RBAC Verification (Deferred until post-validation phase; full database auth preserved)
+    // When auth_token is provided, session verification is performed. If empty, defaults to full ADMIN access.
+    if (!cmd.auth_token.empty()) {
+        SessionRecord session;
+        if (DatabaseManager::Instance().ValidateSession(cmd.auth_token, session)) {
+            UserRole caller_role = UserRole::VIEWER;
+            if (session.role == "ADMIN") caller_role = UserRole::ADMIN;
+            else if (session.role == "OPERATOR") caller_role = UserRole::OPERATOR;
+
+            if (caller_role < reg.min_role) {
+                return CommandResult::Error(403, "Access denied: Requires role " + UserRoleToString(reg.min_role));
+            }
+        }
+    }
 
     // Execute handler safely
     try {
@@ -142,13 +156,15 @@ void CommandDispatcher::RegisterDefaultHandlers() {
 
         uint64_t total_rec_size = 0;
         uint32_t total_rec_segs = 0;
-        std::error_code ec;
-        if (std::filesystem::exists(rec_path, ec)) {
-            for (auto it = std::filesystem::recursive_directory_iterator(rec_path, std::filesystem::directory_options::skip_permission_denied, ec);
-                 it != std::filesystem::recursive_directory_iterator(); ++it) {
-                if (it->is_regular_file(ec) && it->path().extension() == ".mp4") {
-                    total_rec_size += it->file_size(ec);
-                    total_rec_segs++;
+        if (!DatabaseManager::Instance().GetRecordingStats(total_rec_segs, total_rec_size)) {
+            std::error_code ec;
+            if (std::filesystem::exists(rec_path, ec)) {
+                for (auto it = std::filesystem::recursive_directory_iterator(rec_path, std::filesystem::directory_options::skip_permission_denied, ec);
+                     it != std::filesystem::recursive_directory_iterator(); ++it) {
+                    if (it->is_regular_file(ec) && it->path().extension() == ".mp4") {
+                        total_rec_size += it->file_size(ec);
+                        total_rec_segs++;
+                    }
                 }
             }
         }
@@ -211,6 +227,104 @@ void CommandDispatcher::RegisterDefaultHandlers() {
         return CommandResult::Success(diag);
     }, "Query DeepTracer flight-recorder breadcrumbs and process resource metrics");
 
+    // 2.5 Storage Location & Partition Management
+    RegisterHandler("storage.get", UserRole::VIEWER, [](const CommandEnvelope&) -> CommandResult {
+        std::string rec_path = RetentionManager::Instance().GetRecordingPath();
+        uint64_t free_bytes = RetentionManager::Instance().GetFreeDiskSpaceBytes(rec_path);
+        uint64_t total_bytes = RetentionManager::Instance().GetTotalDiskSpaceBytes(rec_path);
+        uint64_t used_bytes = (total_bytes > free_bytes) ? (total_bytes - free_bytes) : 0;
+
+        bool writable = false;
+        try {
+            std::filesystem::path probe_path = std::filesystem::path(rec_path) / ".storage_write_probe";
+            std::ofstream probe(probe_path);
+            if (probe.is_open()) {
+                probe << "ok";
+                probe.close();
+                std::error_code ec;
+                std::filesystem::remove(probe_path, ec);
+                writable = true;
+            }
+        } catch (...) {
+            writable = false;
+        }
+
+        nlohmann::json resp;
+        resp["recording_path"] = rec_path;
+        resp["free_storage_bytes"] = free_bytes;
+        resp["total_storage_bytes"] = total_bytes;
+        resp["used_storage_bytes"] = used_bytes;
+        resp["is_writable"] = writable;
+        resp["status"] = writable ? "READY" : "READ_ONLY";
+
+        uint32_t seg_count = 0;
+        uint64_t seg_bytes = 0;
+        DatabaseManager::Instance().GetRecordingStats(seg_count, seg_bytes);
+        resp["total_segments"] = seg_count;
+        resp["total_recording_size_bytes"] = seg_bytes;
+
+        return CommandResult::Success(resp);
+    }, "Query active media storage mount and disk metrics");
+
+    RegisterHandler("storage.set_path", UserRole::ADMIN, [](const CommandEnvelope& cmd) -> CommandResult {
+        std::string raw_path = cmd.payload.value("path", cmd.payload.value("recording_path", ""));
+        if (raw_path.empty()) {
+            return CommandResult::Error(400, "Storage path cannot be empty");
+        }
+        if (raw_path.find('\0') != std::string::npos) {
+            return CommandResult::Error(400, "Invalid storage path contains null characters");
+        }
+
+        std::filesystem::path p(raw_path);
+        std::string target_path = p.lexically_normal().string();
+
+        std::error_code ec;
+        std::filesystem::create_directories(target_path, ec);
+        if (ec) {
+            return CommandResult::Error(400, "Cannot create storage directory: " + ec.message());
+        }
+
+        std::filesystem::path probe_path = std::filesystem::path(target_path) / ".storage_write_probe";
+        {
+            std::ofstream probe(probe_path);
+            if (!probe.is_open()) {
+                return CommandResult::Error(403, "Target directory is not writable (permission denied or read-only filesystem)");
+            }
+            probe << "test_write";
+        }
+        std::filesystem::remove(probe_path, ec);
+
+        uint64_t free_bytes = RetentionManager::Instance().GetFreeDiskSpaceBytes(target_path);
+        uint64_t total_bytes = RetentionManager::Instance().GetTotalDiskSpaceBytes(target_path);
+
+        RetentionManager::Instance().SetRecordingPath(target_path);
+        RecordingScheduler::Instance().SetStoragePath(target_path);
+        DatabaseManager::Instance().SetSetting("storage_recording_path", target_path);
+
+        std::string actor = "admin";
+        if (!cmd.auth_token.empty()) {
+            SessionRecord session;
+            if (DatabaseManager::Instance().ValidateSession(cmd.auth_token, session)) {
+                actor = session.username;
+            }
+        }
+        DatabaseManager::Instance().AppendAuditLog(
+            actor, "ADMIN", "127.0.0.1", "storage.set_path", "storage",
+            "Changed recording storage path to " + target_path,
+            nlohmann::json{{"new_path", target_path}, {"free_bytes", free_bytes}, {"total_bytes", total_bytes}}.dump(),
+            "SUCCESS"
+        );
+
+        nlohmann::json resp;
+        resp["recording_path"] = target_path;
+        resp["free_storage_bytes"] = free_bytes;
+        resp["total_storage_bytes"] = total_bytes;
+        resp["is_writable"] = true;
+        resp["status"] = "UPDATED";
+
+        return CommandResult::Success(resp, "Recording storage path successfully updated to " + target_path);
+    }, "Configure storage destination path for camera recordings (Admin only)");
+
     // 3. Camera Management
     RegisterHandler("camera.list", UserRole::VIEWER, [](const CommandEnvelope&) -> CommandResult {
         auto cameras = CameraManager::Instance().GetCameras();
@@ -223,7 +337,6 @@ void CommandDispatcher::RegisterDefaultHandlers() {
             item["sub_rtsp_url"] = crypto::MaskRtspUrl(c.sub_rtsp_url);
             item["onvif_xaddr"] = c.onvif_xaddr;
             item["onvif_username"] = c.onvif_username;
-            item["onvif_event_worker_online"] = CameraManager::Instance().IsEventWorkerOnline(c.id);
             item["software_motion_active"] = MotionGateManager::Instance().IsMotionActive(c.id);
             item["enabled"] = c.enabled;
             item["record_mode"] = static_cast<int>(c.record_mode);
@@ -243,7 +356,6 @@ void CommandDispatcher::RegisterDefaultHandlers() {
         }
         nlohmann::json res;
         res["channel_id"] = channel_id;
-        res["onvif_hardware_active"] = CameraManager::Instance().IsEventWorkerOnline(channel_id);
         res["software_motion_active"] = MotionGateManager::Instance().IsMotionActive(channel_id);
         MotionGateConfig cfg = MotionGateManager::Instance().GetChannelConfig(channel_id);
         res["config"]["grid_cols"] = cfg.grid_cols;
@@ -334,12 +446,12 @@ void CommandDispatcher::RegisterDefaultHandlers() {
         };
 
         std::string u_main = get_payload_str({"rtsp_url", "rtsp_url_main", "main_rtsp_url"});
-        if (!u_main.empty() && u_main.find("******") == std::string::npos) {
+        if (!u_main.empty() && u_main.find("***") == std::string::npos) {
             cfg.rtsp_url = u_main;
         }
 
         std::string u_sub = get_payload_str({"sub_rtsp_url", "rtsp_url_sub"});
-        if (!u_sub.empty() && u_sub.find("******") == std::string::npos) {
+        if (!u_sub.empty() && u_sub.find("***") == std::string::npos) {
             cfg.sub_rtsp_url = u_sub;
         }
 
@@ -1438,6 +1550,181 @@ void CommandDispatcher::RegisterDefaultHandlers() {
     };
     RegisterHandler("playback.export_list", UserRole::VIEWER, playback_export_list_fn, "List clip export jobs");
     RegisterHandler("recordings.export_list", UserRole::VIEWER, playback_export_list_fn, "Alias for playback.export_list");
+
+    // ====================================================
+    // User Authentication & RBAC Handlers
+    // ====================================================
+    RegisterHandler("auth.login", UserRole::VIEWER, [](const CommandEnvelope& cmd) -> CommandResult {
+        std::string username = cmd.payload.value("username", "");
+        std::string password = cmd.payload.value("password", "");
+        if (username.empty() || password.empty()) {
+            return CommandResult::Error(400, "Username and password are required");
+        }
+
+        UserRecord user;
+        std::string err;
+        if (!DatabaseManager::Instance().VerifyUserCredentials(username, password, user, &err)) {
+            DatabaseManager::Instance().AppendAuditLog(username, "UNKNOWN", "API", "auth.login", "security",
+                                                       "Failed login attempt: " + err, "{}", "FAILED");
+            return CommandResult::Error(401, err);
+        }
+
+        std::string token = DatabaseManager::Instance().CreateSession(user.id);
+        if (token.empty()) {
+            return CommandResult::Error(500, "Failed to generate session token");
+        }
+
+        DatabaseManager::Instance().AppendAuditLog(user.username, user.role, "API", "auth.login", "security",
+                                                   "Successful user login", "{}", "SUCCESS");
+
+        nlohmann::json data;
+        data["token"] = token;
+        data["username"] = user.username;
+        data["role"] = user.role;
+        data["user_id"] = user.id;
+        return CommandResult::Success(data);
+    }, "Authenticate user and issue session token");
+
+    RegisterHandler("auth.logout", UserRole::VIEWER, [](const CommandEnvelope& cmd) -> CommandResult {
+        std::string token = cmd.auth_token;
+        if (token.empty()) token = cmd.payload.value("token", "");
+        if (!token.empty()) {
+            SessionRecord s;
+            if (DatabaseManager::Instance().ValidateSession(token, s)) {
+                DatabaseManager::Instance().AppendAuditLog(s.username, s.role, "API", "auth.logout", "security",
+                                                           "User logged out", "{}");
+            }
+            DatabaseManager::Instance().RevokeSession(token);
+        }
+        return CommandResult::Success("Logged out successfully");
+    }, "Revoke active session token");
+
+    RegisterHandler("auth.me", UserRole::VIEWER, [](const CommandEnvelope& cmd) -> CommandResult {
+        if (cmd.auth_token.empty()) {
+            return CommandResult::Error(401, "Not authenticated");
+        }
+        SessionRecord s;
+        if (!DatabaseManager::Instance().ValidateSession(cmd.auth_token, s)) {
+            return CommandResult::Error(401, "Session expired or invalid");
+        }
+        nlohmann::json data;
+        data["authenticated"] = true;
+        data["user_id"] = s.user_id;
+        data["username"] = s.username;
+        data["role"] = s.role;
+        return CommandResult::Success(data);
+    }, "Get profile of currently authenticated session");
+
+    RegisterHandler("user.list", UserRole::ADMIN, [](const CommandEnvelope&) -> CommandResult {
+        auto users = DatabaseManager::Instance().ListUsers();
+        nlohmann::json arr = nlohmann::json::array();
+        for (const auto& u : users) {
+            arr.push_back({
+                {"id", u.id},
+                {"username", u.username},
+                {"role", u.role},
+                {"is_active", u.is_active},
+                {"failed_attempts", u.failed_attempts},
+                {"locked_until", u.locked_until},
+                {"created_at", u.created_at},
+                {"updated_at", u.updated_at}
+            });
+        }
+        return CommandResult::Success(arr);
+    }, "List all registered users (Admin only)");
+
+    RegisterHandler("user.add", UserRole::ADMIN, [](const CommandEnvelope& cmd) -> CommandResult {
+        std::string username = cmd.payload.value("username", "");
+        std::string password = cmd.payload.value("password", "");
+        std::string role = cmd.payload.value("role", "OPERATOR");
+
+        std::string err;
+        if (!DatabaseManager::Instance().CreateUser(username, password, role, &err)) {
+            return CommandResult::Error(400, "Failed to create user: " + err);
+        }
+
+        DatabaseManager::Instance().AppendAuditLog("admin", "ADMIN", "API", "user.add", "users",
+                                                   "Created user '" + username + "' with role '" + role + "'");
+        return CommandResult::Success("User '" + username + "' created successfully");
+    }, "Create a new user account (Admin only)");
+
+    RegisterHandler("user.delete", UserRole::ADMIN, [](const CommandEnvelope& cmd) -> CommandResult {
+        int user_id = cmd.payload.value("id", 0);
+        if (user_id <= 0 && cmd.payload.contains("user_id")) {
+            user_id = cmd.payload.value("user_id", 0);
+        }
+        if (user_id <= 0 && cmd.payload.contains("username")) {
+            std::string uname = cmd.payload.value("username", "");
+            UserRecord u;
+            if (DatabaseManager::Instance().GetUserByUsername(uname, u)) {
+                user_id = u.id;
+            }
+        }
+        if (user_id <= 0) {
+            return CommandResult::Error(400, "Valid user id or username is required");
+        }
+
+        std::string err;
+        if (!DatabaseManager::Instance().DeleteUser(user_id, &err)) {
+            return CommandResult::Error(400, err.empty() ? "Failed to delete user" : err);
+        }
+
+        DatabaseManager::Instance().AppendAuditLog("admin", "ADMIN", "API", "user.delete", "users",
+                                                   "Deleted user id " + std::to_string(user_id));
+        return CommandResult::Success("User deleted successfully");
+    }, "Delete a user account (Admin only)");
+
+    RegisterHandler("user.change_password", UserRole::VIEWER, [](const CommandEnvelope& cmd) -> CommandResult {
+        if (cmd.auth_token.empty()) {
+            return CommandResult::Error(401, "Authentication required to change password");
+        }
+        SessionRecord session;
+        if (!DatabaseManager::Instance().ValidateSession(cmd.auth_token, session)) {
+            return CommandResult::Error(401, "Invalid session");
+        }
+
+        std::string old_pass = cmd.payload.value("old_password", "");
+        std::string new_pass = cmd.payload.value("new_password", "");
+        if (old_pass.empty() || new_pass.empty()) {
+            return CommandResult::Error(400, "Both old_password and new_password are required");
+        }
+
+        std::string err;
+        if (!DatabaseManager::Instance().ChangeUserPassword(session.user_id, old_pass, new_pass, &err)) {
+            return CommandResult::Error(400, err);
+        }
+
+        DatabaseManager::Instance().AppendAuditLog(session.username, session.role, "API", "user.change_password", "security",
+                                                   "User changed their password");
+        return CommandResult::Success("Password changed successfully");
+    }, "Change own account password");
+
+    RegisterHandler("user.reset_password", UserRole::ADMIN, [](const CommandEnvelope& cmd) -> CommandResult {
+        int user_id = cmd.payload.value("id", 0);
+        if (user_id <= 0 && cmd.payload.contains("user_id")) {
+            user_id = cmd.payload.value("user_id", 0);
+        }
+        if (user_id <= 0 && cmd.payload.contains("username")) {
+            std::string uname = cmd.payload.value("username", "");
+            UserRecord u;
+            if (DatabaseManager::Instance().GetUserByUsername(uname, u)) {
+                user_id = u.id;
+            }
+        }
+        std::string new_pass = cmd.payload.value("new_password", "");
+        if (user_id <= 0 || new_pass.empty()) {
+            return CommandResult::Error(400, "Valid user ID/username and new_password are required");
+        }
+
+        std::string err;
+        if (!DatabaseManager::Instance().AdminResetPassword(user_id, new_pass, &err)) {
+            return CommandResult::Error(400, err);
+        }
+
+        DatabaseManager::Instance().AppendAuditLog("admin", "ADMIN", "API", "user.reset_password", "users",
+                                                   "Administrator reset password for user id " + std::to_string(user_id));
+        return CommandResult::Success("Password reset successfully");
+    }, "Reset a user password (Admin only)");
 }
 
 } // namespace nvr

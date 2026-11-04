@@ -14,9 +14,16 @@ QtObject {
     id: client
 
     property string baseUrl: "http://127.0.0.1:8080/api/v1"
-    property string currentUsername: "operator"
-    property string currentUserRole: "OPERATOR"
+    property string currentUsername: "admin"
+    property string currentUserRole: "ADMIN"
+    property string authToken: ""
     property bool isAuthenticated: true
+
+    Component.onCompleted: {
+        if (isLocal() && typeof NvrBridge.isCaptureMode === "function" && NvrBridge.isCaptureMode()) {
+            login("admin", "Admin@123");
+        }
+    }
 
     signal telemetryUpdated(var data)
 
@@ -148,6 +155,39 @@ QtObject {
             return { action: "layout.fullscreen", payload: body || {} };
         }
 
+        // Storage
+        if ((path === "/storage" || path === "/storage/status") && method === "GET") {
+            return { action: "storage.get", payload: {} };
+        }
+        if ((path === "/storage/path" || path === "/storage") && method === "POST") {
+            return { action: "storage.set_path", payload: body || {} };
+        }
+
+        // Authentication & User Management
+        if (path === "/auth/login" && method === "POST") {
+            return { action: "auth.login", payload: body || {} };
+        }
+        if (path === "/auth/logout" && method === "POST") {
+            return { action: "auth.logout", payload: body || {} };
+        }
+        if (path === "/auth/me" && method === "GET") {
+            return { action: "auth.me", payload: {} };
+        }
+        if (path === "/users") {
+            if (method === "GET") return { action: "user.list", payload: {} };
+            if (method === "POST") return { action: "user.add", payload: body || {} };
+        }
+        var userDeleteMatch = path.match(/^\/users\/([^\/]+)$/);
+        if (userDeleteMatch && method === "DELETE") {
+            return { action: "user.delete", payload: { username: decodeURIComponent(userDeleteMatch[1]) } };
+        }
+        if ((path === "/users/change_password" || path === "/users/password") && method === "POST") {
+            return { action: "user.change_password", payload: body || {} };
+        }
+        if (path === "/users/reset_password" && method === "POST") {
+            return { action: "user.reset_password", payload: body || {} };
+        }
+
         return null;
     }
 
@@ -188,6 +228,9 @@ QtObject {
         xhr.open(method, url, true);
         xhr.setRequestHeader("Content-Type", "application/json");
         xhr.setRequestHeader("Accept", "application/json");
+        if (authToken && authToken.length > 0) {
+            xhr.setRequestHeader("Authorization", "Bearer " + authToken);
+        }
 
         xhr.onreadystatechange = function() {
             if (xhr.readyState === XMLHttpRequest.DONE) {
@@ -214,6 +257,100 @@ QtObject {
         } else {
             xhr.send();
         }
+    }
+
+    // Generic REST Verbs
+    function get(endpoint, callback, errorCallback) {
+        request("GET", endpoint, null, callback, errorCallback);
+    }
+
+    function post(endpoint, body, callback, errorCallback) {
+        request("POST", endpoint, body, callback, errorCallback);
+    }
+
+    function put(endpoint, body, callback, errorCallback) {
+        request("PUT", endpoint, body, callback, errorCallback);
+    }
+
+    function del(endpoint, callback, errorCallback) {
+        request("DELETE", endpoint, null, callback, errorCallback);
+    }
+
+    // Authentication Operations
+    function login(username, password, callback, errorCallback) {
+        post("/auth/login", { username: username, password: password }, function(res) {
+            var data = (res && res.data) ? res.data : res;
+            if (data && data.token) {
+                client.authToken = data.token;
+                client.currentUsername = data.username || username;
+                client.currentUserRole = data.role || "OPERATOR";
+                client.isAuthenticated = true;
+                if (isLocal() && typeof NvrBridge.setAuthToken === "function") {
+                    NvrBridge.setAuthToken(data.token);
+                }
+                if (callback) callback(data);
+            } else {
+                var msg = (res && (res.message || res.error)) ? (res.message || res.error) : "Invalid credentials";
+                if (errorCallback) errorCallback(msg);
+            }
+        }, function(err) {
+            if (errorCallback) errorCallback(err);
+        });
+    }
+
+    function logout(callback) {
+        post("/auth/logout", {}, function() {
+            client.authToken = "";
+            client.currentUsername = "";
+            client.currentUserRole = "";
+            client.isAuthenticated = false;
+            if (isLocal() && typeof NvrBridge.setAuthToken === "function") {
+                NvrBridge.setAuthToken("");
+            }
+            if (callback) callback();
+        }, function() {
+            client.authToken = "";
+            client.currentUsername = "";
+            client.currentUserRole = "";
+            client.isAuthenticated = false;
+            if (isLocal() && typeof NvrBridge.setAuthToken === "function") {
+                NvrBridge.setAuthToken("");
+            }
+            if (callback) callback();
+        });
+    }
+
+    // User Management Operations
+    function getUsers(callback, errorCallback) {
+        get("/users", function(res) {
+            var list = Array.isArray(res) ? res : (Array.isArray(res.data) ? res.data : (res.users || []));
+            if (callback) callback(list);
+        }, errorCallback);
+    }
+
+    function addUser(userData, callback, errorCallback) {
+        post("/users", userData, callback, errorCallback);
+    }
+
+    function deleteUser(username, callback, errorCallback) {
+        del("/users/" + encodeURIComponent(username), callback, errorCallback);
+    }
+
+    function resetUserPassword(payload, callback, errorCallback) {
+        post("/users/reset_password", payload, callback, errorCallback);
+    }
+
+    function changeUserPassword(payload, callback, errorCallback) {
+        post("/users/change_password", payload, callback, errorCallback);
+    }
+
+    // Storage Management
+    function getStorage(callback, errorCallback) {
+        request("GET", "/storage", null, callback, errorCallback);
+    }
+
+    function setStoragePath(path, callback, errorCallback) {
+        request("POST", "/storage/path", { path: path }, callback, errorCallback);
     }
 
     // System Telemetry

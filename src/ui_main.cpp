@@ -19,6 +19,7 @@
 #include "nvr/common/types.h"
 #include "nvr/common/logger.h"
 #include "nvr/common/config_loader.h"
+#include "nvr/database/database_manager.h"
 #include "nvr/ingress/camera_manager.h"
 #include "nvr/recording/atomic_writer.h"
 #include "nvr/recording/recording_scheduler.h"
@@ -232,6 +233,22 @@ int main(int argc, char *argv[]) {
     std::filesystem::create_directories(config.storage.recording_path, ec);
     nvr::AtomicWriter::CleanOrphanedTmpFiles(config.storage.recording_path);
 
+    // Initialize SQLite Database Engine
+    std::filesystem::create_directories("config", ec);
+    std::string db_path = "config/nvr.db";
+    if (!nvr::DatabaseManager::Instance().Initialize(db_path)) {
+        LOG_ERROR << "Failed to initialize SQLite database at " << db_path;
+    }
+
+    // Load persisted user-defined storage path if configured in SQLite
+    std::string saved_storage_path = nvr::DatabaseManager::Instance().GetSetting("storage_recording_path");
+    if (!saved_storage_path.empty()) {
+        config.storage.recording_path = saved_storage_path;
+        LOG_INFO << "Loaded user-configured recording storage path from database: " << saved_storage_path;
+    } else {
+        nvr::DatabaseManager::Instance().SetSetting("storage_recording_path", config.storage.recording_path);
+    }
+
     nvr::RetentionManager::Instance().Configure(config.storage);
     nvr::RetentionManager::Instance().Start();
 
@@ -300,6 +317,20 @@ int main(int argc, char *argv[]) {
             if (liveBridge.value(onKey).toBool() != online) {
                 liveBridge.insert(onKey, online);
             }
+
+            auto frame = nvr::QmlVideoBridge::Instance().GetTileFrame(i);
+            if (frame && frame->height > 0) {
+                QString prefix = (frame->stream_type == nvr::StreamType::MAIN) ? "MAIN" : "SUB";
+                QString resStr;
+                if (frame->height >= 2160) resStr = prefix + " 4K";
+                else if (frame->height >= 1440) resStr = prefix + " 2K";
+                else resStr = QString("%1 %2p").arg(prefix).arg(frame->height);
+
+                QString resKey = QString("res%1").arg(i);
+                if (liveBridge.value(resKey).toString() != resStr) {
+                    liveBridge.insert(resKey, resStr);
+                }
+            }
         }
     });
     uiPump.start();
@@ -321,6 +352,7 @@ int main(int argc, char *argv[]) {
             captureMode = true;
         }
     }
+    nvrBridge.setCaptureMode(captureMode);
 
     const QUrl url(QUrl::fromLocalFile(currentDir + "/ui/Main.qml"));
 
@@ -382,6 +414,7 @@ int main(int argc, char *argv[]) {
     nvr::CameraManager::Instance().StopAll();
     nvr::RecordingScheduler::Instance().StopAll();
     nvr::RetentionManager::Instance().Stop();
+    nvr::DatabaseManager::Instance().Close();
 
     return exitCode;
 }

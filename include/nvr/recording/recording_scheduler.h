@@ -19,6 +19,8 @@ public:
     static RecordingScheduler& Instance();
 
     void Configure(const StorageConfig& storage_config);
+    void SetStoragePath(const std::string& new_path);
+    std::string GetStoragePath() const;
 
     bool StartChannelRecording(int channel_id, RecordMode mode = RecordMode::CONTINUOUS);
 

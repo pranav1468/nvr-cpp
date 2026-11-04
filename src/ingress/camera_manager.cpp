@@ -4,6 +4,7 @@
 #include "nvr/common/deep_tracer.h"
 #include "nvr/common/time_utils.h"
 #include "nvr/common/crypto_utils.h"
+#include "nvr/database/database_manager.h"
 #include "nvr/media/stream_broker.h"
 #include "nvr/recording/recording_scheduler.h"
 #include <algorithm>
@@ -24,17 +25,59 @@ CameraManager::~CameraManager() {
 }
 
 void CameraManager::Initialize(const std::vector<CameraConfig>& configs) {
+    if (LoadCamerasFromDb()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        LOG_INFO << "CameraManager initialized with " << cameras_.size() << " cameras from SQLite database";
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     cameras_.clear();
     for (const auto& cfg : configs) {
         CameraEntry entry;
         entry.config = cfg;
         cameras_[cfg.id] = std::move(entry);
+
+        CameraRecord rec;
+        rec.channel_id = cfg.id;
+        rec.name = cfg.name;
+        rec.rtsp_main_url = cfg.rtsp_url;
+        rec.rtsp_sub_url = cfg.sub_rtsp_url;
+        rec.onvif_xaddr = cfg.onvif_xaddr;
+        rec.onvif_username = cfg.onvif_username;
+        rec.onvif_password = cfg.onvif_password;
+        rec.enabled = cfg.enabled;
+        rec.record_mode = static_cast<int>(cfg.record_mode);
+        rec.updated_at = time_utils::WallTimeMs();
+        DatabaseManager::Instance().UpsertCamera(rec);
     }
-    LOG_INFO << "CameraManager initialized with " << cameras_.size() << " configured cameras";
+    LOG_INFO << "CameraManager initialized with " << cameras_.size() << " configured cameras (synced to SQLite)";
 }
 
 bool CameraManager::LoadCamerasFromDb() {
+    auto db_cams = DatabaseManager::Instance().GetCameras();
+    if (db_cams.empty()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    cameras_.clear();
+    for (const auto& rec : db_cams) {
+        CameraConfig cfg;
+        cfg.id = rec.channel_id;
+        cfg.name = rec.name;
+        cfg.rtsp_url = rec.rtsp_main_url;
+        cfg.sub_rtsp_url = rec.rtsp_sub_url;
+        cfg.onvif_xaddr = rec.onvif_xaddr;
+        cfg.onvif_username = rec.onvif_username;
+        cfg.onvif_password = rec.onvif_password;
+        cfg.enabled = rec.enabled;
+        cfg.record_mode = static_cast<RecordMode>(rec.record_mode);
+        cfg.reconnect_delay_sec = 3;
+
+        CameraEntry entry;
+        entry.config = cfg;
+        cameras_[cfg.id] = std::move(entry);
+    }
     return true;
 }
 
@@ -87,6 +130,20 @@ bool CameraManager::AddCamera(const CameraConfig& config) {
     }
     LOG_INFO << "[Channel " << config.id << "] Added camera: " << config.name;
     TRACE_EVENT("INGRESS", "Added camera channel " + std::to_string(config.id) + " (" + config.name + ")");
+
+    // Persist to SQLite and configuration file
+    CameraRecord rec;
+    rec.channel_id = config.id;
+    rec.name = config.name;
+    rec.rtsp_main_url = config.rtsp_url;
+    rec.rtsp_sub_url = config.sub_rtsp_url;
+    rec.onvif_xaddr = config.onvif_xaddr;
+    rec.onvif_username = config.onvif_username;
+    rec.onvif_password = config.onvif_password;
+    rec.enabled = config.enabled;
+    rec.record_mode = static_cast<int>(config.record_mode);
+    rec.updated_at = time_utils::WallTimeMs();
+    DatabaseManager::Instance().UpsertCamera(rec);
 
     SaveCamerasToFile();
     return true;
@@ -160,6 +217,21 @@ bool CameraManager::UpdateCamera(const CameraConfig& config) {
     }
     LOG_INFO << "[Channel " << config.id << "] Updated camera configuration (" << config.name << ")";
     TRACE_EVENT("INGRESS", "Updated camera channel " + std::to_string(config.id) + " (" + config.name + ")");
+
+    // Persist to SQLite
+    CameraRecord rec;
+    rec.channel_id = config.id;
+    rec.name = config.name;
+    rec.rtsp_main_url = config.rtsp_url;
+    rec.rtsp_sub_url = config.sub_rtsp_url;
+    rec.onvif_xaddr = config.onvif_xaddr;
+    rec.onvif_username = config.onvif_username;
+    rec.onvif_password = config.onvif_password;
+    rec.enabled = config.enabled;
+    rec.record_mode = static_cast<int>(config.record_mode);
+    rec.updated_at = time_utils::WallTimeMs();
+    DatabaseManager::Instance().UpsertCamera(rec);
+
     SaveCamerasToFile();
     return true;
 }
@@ -195,6 +267,9 @@ bool CameraManager::RemoveCamera(int channel_id) {
 
     LOG_INFO << "[Channel " << channel_id << "] Removed camera";
     TRACE_EVENT("INGRESS", "Removed camera channel " + std::to_string(channel_id));
+
+    // Remove from SQLite
+    DatabaseManager::Instance().DeleteCamera(channel_id);
 
     SaveCamerasToFile();
     return true;
@@ -336,19 +411,6 @@ bool CameraManager::EnsureMainStream(int channel_id) {
     return StartCamera(channel_id);
 }
 
-bool CameraManager::StartEventWorker(int /*channel_id*/) {
-    return false;
-}
-
-void CameraManager::StopEventWorker(int /*channel_id*/) {
-}
-
-bool CameraManager::IsEventWorkerOnline(int /*channel_id*/) const {
-    return false;
-}
-
-void CameraManager::EventWorkerLoop(int /*channel_id*/, std::shared_ptr<std::atomic<bool>> /*running*/, CameraConfig /*config*/) {
-}
 
 void CameraManager::StopAll() {
     std::vector<std::unique_ptr<StreamSession>> sessions;

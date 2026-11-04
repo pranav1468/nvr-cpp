@@ -1,6 +1,7 @@
 #include "nvr/storage/retention_manager.h"
 #include "nvr/common/logger.h"
 #include "nvr/common/time_utils.h"
+#include "nvr/database/database_manager.h"
 
 #include <sys/statvfs.h>
 #include <filesystem>
@@ -101,6 +102,17 @@ std::string RetentionManager::GetRecordingPath() {
     return config_.recording_path.empty() ? "./recordings" : config_.recording_path;
 }
 
+void RetentionManager::SetRecordingPath(const std::string& new_path) {
+    if (new_path.empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(config_mutex_);
+        config_.recording_path = new_path;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(new_path, ec);
+    LOG_INFO << "RetentionManager: Recording storage path updated to " << new_path;
+}
+
 void RetentionManager::EnforceRetentionOnce() {
     StorageConfig cfg;
     {
@@ -154,6 +166,7 @@ void RetentionManager::EnforceRetentionOnce() {
 
             if (std::filesystem::remove(seg.path, ec)) {
                 DeleteCompanionThumbnails(seg.path);
+                DatabaseManager::Instance().DeleteRecordingSegmentByPath(seg.path.string());
                 LOG_INFO << "Pruned old segment: " << seg.path.string() << " (Freed "
                          << (seg.size_bytes / 1024) << " KB)";
                 free_bytes = GetFreeDiskSpaceBytes(check_path);
@@ -182,6 +195,7 @@ void RetentionManager::EnforceRetentionOnce() {
             if (age_sec > max_age_sec) {
                 if (std::filesystem::remove(seg.path, ec)) {
                     DeleteCompanionThumbnails(seg.path);
+                    DatabaseManager::Instance().DeleteRecordingSegmentByPath(seg.path.string());
                     LOG_INFO << "Pruned expired segment (age > " << cfg.max_retention_days 
                              << " days): " << seg.path.string();
                 }

@@ -1107,8 +1107,8 @@ std::vector<LiveTileMetrics> LiveController::GetTileMetrics() const {
                 m.channel_id = pipe->channel_id;
                 m.tile_index = target.tile_index;
                 m.stream_type = pipe->stream_type;
-                m.width = (target.target_w > 0) ? target.target_w : actual_w;
-                m.height = (target.target_h > 0) ? target.target_h : actual_h;
+                m.width = (actual_w > 0) ? actual_w : target.target_w;
+                m.height = (actual_h > 0) ? actual_h : target.target_h;
                 m.enqueued_frames = pipe->enqueued_frames.load(std::memory_order_relaxed);
                 m.dropped_frames = pipe->dropped_frames.load(std::memory_order_relaxed);
                 m.rendered_frames = rendered;
@@ -1158,8 +1158,8 @@ LiveTileMetrics LiveController::GetChannelMetrics(int channel_id) const {
         }
         m.tile_index = has_target ? first_target.tile_index : 0;
         m.stream_type = pipe->stream_type;
-        uint32_t cw = (has_target && first_target.target_w > 0) ? first_target.target_w : pipe->stream_width.load();
-        uint32_t ch_h = (has_target && first_target.target_h > 0) ? first_target.target_h : pipe->stream_height.load();
+        uint32_t cw = (pipe->stream_width.load() > 0) ? pipe->stream_width.load() : first_target.target_w;
+        uint32_t ch_h = (pipe->stream_height.load() > 0) ? pipe->stream_height.load() : first_target.target_h;
         if (cw == 0) {
             if (current_layout_ == LiveGridLayout::SINGLE) { cw = 1920; ch_h = 1080; }
             else if (current_layout_ == LiveGridLayout::GRID_4) { cw = 960; ch_h = 540; }

@@ -1,25 +1,33 @@
 #pragma once
 
 #include <string>
+#include <vector>
+#include <cstdint>
 
 namespace nvr {
 namespace crypto {
 
-// Redact password from an RTSP URL (e.g. "rtsp://admin:secret123@192.168.1.10:554/live" -> "rtsp://admin:******@192.168.1.10:554/live")
-inline std::string MaskRtspUrl(const std::string& url) {
-    auto at_pos = url.find('@');
-    if (at_pos == std::string::npos) return url;
-    auto scheme_pos = url.find("://");
-    if (scheme_pos == std::string::npos) return url;
+// Generate cryptographically secure random bytes formatted as a hex string
+std::string GenerateRandomHex(size_t byte_count);
 
-    size_t user_start = scheme_pos + 3;
-    auto colon_pos = url.find(':', user_start);
-    if (colon_pos == std::string::npos || colon_pos >= at_pos) {
-        return url; // No password in URL
-    }
+// Hash a password using PBKDF2-HMAC-SHA256 (100,000 iterations standard)
+std::string HashPasswordPBKDF2(const std::string& password, const std::string& salt_hex, int iterations = 100000);
 
-    return url.substr(0, colon_pos + 1) + "******" + url.substr(at_pos);
-}
+// Constant-time password verification to prevent timing side-channel attacks
+bool VerifyPassword(const std::string& password, const std::string& salt_hex, const std::string& stored_hash_hex, int iterations = 100000);
+
+// Generate 256-bit cryptographically secure session bearer token (64 hex characters)
+std::string GenerateSessionToken();
+
+// AES-256-GCM authenticated encryption for camera credentials at rest
+std::string EncryptAesGcm(const std::string& plaintext, const std::string& key_hex);
+std::string DecryptAesGcm(const std::string& ciphertext_payload, const std::string& key_hex);
+
+// Mask passwords embedded inside RTSP URLs (e.g. rtsp://user:pass@host -> rtsp://user:*****@host)
+std::string MaskRtspUrl(const std::string& url);
+
+// Retrieve or initialize the local machine vault key (stored in config/vault.key)
+std::string GetOrCreateVaultKey(const std::string& vault_key_path = "config/vault.key");
 
 } // namespace crypto
 } // namespace nvr

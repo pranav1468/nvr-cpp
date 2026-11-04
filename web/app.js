@@ -4,6 +4,10 @@
  * Connects directly to the NVR C++ REST Engine (http://localhost:8080/api/v1).
  */
 
+// --- Authentication & Session State ---
+let authToken = "";
+let currentUser = { username: "admin", role: "ADMIN" };
+
 // --- Global State ---
 const MAX_CHANNELS = 8;
 
@@ -37,11 +41,15 @@ let pbPlaying = false;
 let pbRate = 1;
 let pbPlayhead = 0;
 let pbTimer = null;
-let pbAutoAdvance = true;
+let pbAutoAdvance = false;
+let pbClipDuration = 60;
 let pbLoop = false;
 let pbLayoutMode = "single";
 let pbViewMode = "cards";
 let pbIsDragging = false;
+let pbSeekDragging = false;
+let pbHls = null;
+let pbAudioMuted = false;
 
 // Wizard State
 let wizardStep = 1;
@@ -100,9 +108,22 @@ function formatDurationCompact(seconds) {
   return `${sec}s`;
 }
 
-function secondsOfDayUtc(iso) {
-  const d = new Date(iso);
-  return d.getUTCHours() * 3600 + d.getUTCMinutes() * 60 + d.getUTCSeconds();
+function formatTimeMSS(seconds, forceHours = false) {
+  const s = Math.max(0, Math.floor(seconds || 0));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0 || forceHours) {
+    return `${pad2(h)}:${pad2(m)}:${pad2(sec)}`;
+  }
+  return `${pad2(m)}:${pad2(sec)}`;
+}
+
+function getEpochMs(isoOrMs) {
+  if (typeof isoOrMs === "number" && !isNaN(isoOrMs)) return isoOrMs;
+  if (!isoOrMs) return 0;
+  const t = new Date(isoOrMs).getTime();
+  return isNaN(t) ? 0 : t;
 }
 
 function getSnapshotUrl(key, id) {
@@ -172,13 +193,14 @@ function switchTab(tabId) {
   if (tabId === "live") renderLiveMatrix();
   if (tabId === "playback") initPlaybackView();
   if (tabId === "cameras") renderCamerasView();
+  if (tabId === "users") renderUsersView();
   if (tabId === "dashboard") renderDashboardView();
   if (tabId === "system") renderSystemView();
 }
 
 function handleHashChange() {
   const hash = window.location.hash.replace("#", "") || "live";
-  if (["live", "playback", "cameras", "dashboard", "system"].includes(hash)) {
+  if (["live", "playback", "cameras", "users", "dashboard", "system"].includes(hash)) {
     switchTab(hash);
   } else {
     switchTab("live");
@@ -311,7 +333,7 @@ class NvrStreamEngine {
   constructor(config) {
     this.channelId = config.channelId;
     this.container = config.container;
-    this.authToken = config.authToken || "";
+    this.authToken = config.authToken || authToken || "";
     this.streamType = config.streamType || "sub"; // 'main' or 'sub'
     this.onStatus = config.onStatus || (() => {});
     this.onError = config.onError || (() => {});
@@ -331,8 +353,25 @@ class NvrStreamEngine {
     this.webcodecsMode = "annexb";
     this.awaitingKeyChunk = true;
     this.isDestroyed = false;
+    this.detectedWidth = 0;
+    this.detectedHeight = 0;
 
     this.initDOM();
+  }
+
+  updateDynamicResolutionBadge(w, h) {
+    if (!h || h <= 0) return;
+    this.detectedWidth = w;
+    this.detectedHeight = h;
+    const isMain = (this.streamType === "main");
+    const prefix = isMain ? "MAIN" : "SUB";
+    let resText = `${h}p`;
+    if (h >= 2160) resText = "4K";
+    else if (h >= 1440) resText = "2K";
+    const badgeEl = document.getElementById(`res-badge-${this.channelId}`);
+    if (badgeEl) {
+      badgeEl.textContent = `${prefix} ${resText}`;
+    }
   }
 
   initDOM() {
@@ -361,6 +400,16 @@ class NvrStreamEngine {
     this.video.muted = true;
     this.video.playsInline = true;
     Object.assign(this.video.style, { width: "100%", height: "100%", objectFit: "cover", display: "none" });
+    this.video.addEventListener("loadedmetadata", () => {
+      if (this.video && this.video.videoHeight > 0) {
+        this.updateDynamicResolutionBadge(this.video.videoWidth, this.video.videoHeight);
+      }
+    });
+    this.video.addEventListener("resize", () => {
+      if (this.video && this.video.videoHeight > 0) {
+        this.updateDynamicResolutionBadge(this.video.videoWidth, this.video.videoHeight);
+      }
+    });
     stage.appendChild(this.video);
 
     this.canvas = document.createElement("canvas");
@@ -440,6 +489,9 @@ class NvrStreamEngine {
             const msg = JSON.parse(evt.data);
             if (msg.type === "config") {
               console.log(`[Cam ${this.channelId}] Received config:`, msg.codec, msg.codec_string);
+              if (msg.height && msg.height > 0) {
+                this.updateDynamicResolutionBadge(msg.width, msg.height);
+              }
               await this.negotiatePlayer(msg);
             }
           } catch (e) {
@@ -586,6 +638,9 @@ class NvrStreamEngine {
         if (this.canvas && (this.canvas.width !== frame.displayWidth || this.canvas.height !== frame.displayHeight)) {
           this.canvas.width = frame.displayWidth;
           this.canvas.height = frame.displayHeight;
+        }
+        if (frame.displayHeight > 0 && this.detectedHeight !== frame.displayHeight) {
+          this.updateDynamicResolutionBadge(frame.displayWidth, frame.displayHeight);
         }
         this.ctx?.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
         frame.close();
@@ -781,115 +836,64 @@ function destroyAllLiveStreams() {
 }
 
 // --- View 1: Live Matrix ---
-function renderLiveMatrix() {
-  renderLiveCameraDir();
-
-  const grid = document.getElementById("live-matrix-grid");
-  if (!grid) return;
-
-  grid.className = `grid h-[calc(100vh-13rem)] min-h-[420px] gap-2 ${fullscreenCh ? "matrix-1" : `matrix-${liveLayout}`}`;
-
-  const tileChannels = fullscreenCh
-    ? [fullscreenCh]
-    : liveLayout === "7plus1"
-      ? Array.from({ length: 8 }, (_, i) => i + 1)
-      : Array.from({ length: liveLayout }, (_, i) => i + 1);
-
-  // Clean up stream engines for channels no longer in the active grid
-  for (const [c, eng] of liveStreamEngines.entries()) {
-    if (!tileChannels.includes(c)) {
-      try { eng.destroy(); } catch {}
-      liveStreamEngines.delete(c);
-    }
+// --- View 1: Live Matrix (Persistent, Zero-Flicker Architecture) ---
+function ensurePersistentTiles(grid) {
+  if (grid.dataset.initialized === "true" && grid.children.length === 8) {
+    return;
   }
-
-  const now = new Date();
-  const timeStr = `${now.getFullYear()}-${pad2(now.getMonth() + 1)}-${pad2(now.getDate())} ${pad2(now.getHours())}:${pad2(now.getMinutes())}:${pad2(now.getSeconds())}`;
-
-  grid.innerHTML = tileChannels
-    .map((ch, idx) => {
+  grid.innerHTML = Array.from({ length: 8 }, (_, i) => i + 1)
+    .map((ch) => {
       const cam = cameras.find((c) => c.id === ch);
-      const isMaster = liveLayout === "7plus1" && idx === 0;
-      const isMain = fullscreenCh !== null || isMaster || liveLayout === 1;
       const online = cam ? isCamOnline(cam) : false;
-      const selected = selectedCamId === ch;
-
       return `
-        <div data-ch="${ch}" class="tile-stage-bg group relative min-h-[120px] overflow-hidden rounded-xl border transition-colors cursor-pointer ${selected ? "border-primary ring-2 ring-primary/40" : "border-border"} ${isMaster ? "tile-master" : ""}">
-          ${
-            cam && online
-              ? `
-            <div id="stream-stage-${ch}" class="nvr-media-stage absolute inset-0 bg-black"></div>
-            <div class="scanlines pointer-events-none absolute inset-0"></div>
-          `
-              : `
-            <div class="absolute inset-0 flex flex-col items-center justify-center gap-1.5 text-white/50 bg-[#090d16]">
-              <svg class="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
-              <span class="text-[11px] font-semibold tracking-wide">${cam ? "NO SIGNAL" : "NO CAMERA ON THIS CHANNEL"}</span>
-              <a href="#cameras" class="text-[10px] font-semibold text-primary-foreground/80 underline decoration-dotted hover:text-white">Assign a camera</a>
-            </div>
-          `
-          }
+        <div data-ch="${ch}" class="tile-stage-bg group relative min-h-[120px] overflow-hidden rounded-xl border border-border transition-colors cursor-pointer">
+          <div id="stream-stage-${ch}" class="nvr-media-stage absolute inset-0 bg-black"></div>
+          <div id="no-signal-${ch}" class="absolute inset-0 flex flex-col items-center justify-center gap-1.5 text-white/50 bg-[#090d16] ${cam && online ? "hidden" : ""}">
+            <svg class="h-7 w-7" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z"/></svg>
+            <span class="text-[11px] font-semibold tracking-wide">${cam ? "NO SIGNAL" : "NO CAMERA ON THIS CHANNEL"}</span>
+            <a href="#cameras" class="text-[10px] font-semibold text-primary-foreground/80 underline decoration-dotted hover:text-white">Assign a camera</a>
+          </div>
 
           <!-- Top HUD Overlay -->
-          <div class="absolute inset-x-0 top-0 flex items-center justify-between gap-1 bg-gradient-to-b from-black/70 to-transparent px-2 py-1.5">
+          <div class="absolute inset-x-0 top-0 flex items-center justify-between gap-1 bg-gradient-to-b from-black/70 to-transparent px-2 py-1.5 z-10 pointer-events-none">
             <span class="flex min-w-0 items-center gap-1.5">
-              <span class="h-[7px] w-[7px] shrink-0 rounded-full ${online ? "bg-success soft-pulse" : "bg-white/30"}"></span>
-              <span class="truncate font-mono text-[10.5px] font-semibold text-white drop-shadow">
+              <span id="dot-${ch}" class="h-[7px] w-[7px] shrink-0 rounded-full ${online ? "bg-success soft-pulse" : "bg-white/30"}"></span>
+              <span id="label-${ch}" class="truncate font-mono text-[10.5px] font-semibold text-white drop-shadow">
                 ${chLabel(ch)}: ${cam ? cam.name : "Empty"}
               </span>
             </span>
             <span class="flex shrink-0 items-center gap-1">
-              <span class="inline-flex items-center rounded-md border border-transparent bg-black/55 px-2 py-0.5 font-mono text-[9px] text-white">
-                ${isMain ? "MAIN 1080p" : "SUB 360p"}
+              <span id="res-badge-${ch}" class="inline-flex items-center rounded-md border border-transparent bg-black/55 px-2 py-0.5 font-mono text-[9px] text-white">
+                SUB
               </span>
-              ${
-                !fullscreenCh
-                  ? `
-                <span class="hidden items-center rounded-md border border-transparent bg-black/55 px-2 py-0.5 font-mono text-[9px] text-white sm:inline">
-                  VPU HW
-                </span>
-              `
-                  : ""
-              }
-              ${
-                cam && cam.recording
-                  ? `
-                <span class="inline-flex items-center rounded-md border border-transparent bg-destructive px-2 py-0.5 font-mono text-[9px] font-bold text-white">
-                  <span class="rec-dot mr-1 inline-block h-1.5 w-1.5 rounded-full bg-white"></span>
-                  REC
-                </span>
-              `
-                  : ""
-              }
+              <span id="rec-badge-${ch}" class="inline-flex items-center rounded-md border border-transparent bg-destructive px-2 py-0.5 font-mono text-[9px] font-bold text-white ${cam && cam.recording ? "" : "hidden"}">
+                <span class="rec-dot mr-1 inline-block h-1.5 w-1.5 rounded-full bg-white"></span>
+                REC
+              </span>
             </span>
           </div>
 
-          <!-- Timestamp Overlay -->
-          <div class="pointer-events-none absolute bottom-0 left-0 font-mono text-[10px] text-white/90 drop-shadow">
-            <span class="bg-black/45 px-1.5 py-0.5">${timeStr}</span>
-          </div>
-
           <!-- Bottom Right Hover Controls -->
-          <div class="absolute bottom-0 right-0 flex items-center gap-1 p-1.5 opacity-0 transition-opacity group-hover:opacity-100">
+          <div class="absolute bottom-0 right-0 flex items-center gap-1 p-1.5 opacity-0 transition-opacity group-hover:opacity-100 z-10">
             <button type="button" data-expand-ch="${ch}" title="Fullscreen view" class="flex h-7 w-7 items-center justify-center rounded-md bg-black/55 text-white backdrop-blur transition-colors hover:bg-primary">
               <svg class="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
             </button>
           </div>
 
           <!-- Bottom Center Stream Tier Status -->
-          <div class="absolute bottom-0 left-1/2 hidden -translate-x-1/2 items-center gap-2 sm:flex">
+          <div class="absolute bottom-0 left-1/2 hidden -translate-x-1/2 items-center gap-2 sm:flex z-10 pointer-events-none">
             <span id="stream-tier-${ch}" class="px-2 py-0.5 font-mono text-[10px] text-white/90 bg-black/55">
               ${cam && online ? "Connecting…" : "Standby"}
             </span>
           </div>
-
         </div>
       `;
     })
     .join("");
 
-  // Attach Tile Listeners
+  grid.dataset.initialized = "true";
+
+  // Attach Tile Listeners once
   grid.querySelectorAll("[data-ch]").forEach((tile) => {
     const ch = Number(tile.dataset.ch);
     tile.addEventListener("click", () => {
@@ -904,7 +908,6 @@ function renderLiveMatrix() {
     });
   });
 
-
   grid.querySelectorAll("[data-expand-ch]").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
@@ -916,22 +919,113 @@ function renderLiveMatrix() {
       }
     });
   });
+}
 
-  // Mount / align live video stream engines for each active online tile
-  tileChannels.forEach((ch, idx) => {
+function renderLiveMatrix() {
+  renderLiveCameraDir();
+
+  const grid = document.getElementById("live-matrix-grid");
+  if (!grid) return;
+
+  ensurePersistentTiles(grid);
+
+  grid.className = `grid h-[calc(100vh-13rem)] min-h-[420px] gap-2 ${fullscreenCh ? "matrix-1" : `matrix-${liveLayout}`}`;
+
+  const tileChannels = fullscreenCh
+    ? [fullscreenCh]
+    : liveLayout === "7plus1"
+      ? Array.from({ length: 8 }, (_, i) => i + 1)
+      : Array.from({ length: liveLayout }, (_, i) => i + 1);
+
+  // Manage visibility and streaming for all 8 channels without tearing down active DOM or Sockets
+  for (let ch = 1; ch <= 8; ch++) {
+    const tile = grid.querySelector(`[data-ch="${ch}"]`);
+    if (!tile) continue;
+
+    const isVisible = tileChannels.includes(ch);
+    if (!isVisible) {
+      tile.classList.add("hidden");
+      tile.classList.remove("tile-master");
+      continue;
+    }
+
+    tile.classList.remove("hidden");
+    const isMaster = (liveLayout === "7plus1" && ch === 1 && !fullscreenCh);
+    if (isMaster) tile.classList.add("tile-master");
+    else tile.classList.remove("tile-master");
+
+    if (selectedCamId === ch) {
+      tile.classList.add("border-primary", "ring-2", "ring-primary/40");
+      tile.classList.remove("border-border");
+    } else {
+      tile.classList.remove("border-primary", "ring-2", "ring-primary/40");
+      tile.classList.add("border-border");
+    }
+
     const cam = cameras.find((c) => c.id === ch);
-    const isMaster = liveLayout === "7plus1" && idx === 0;
-    const isMain = fullscreenCh !== null || isMaster || liveLayout === 1;
     const online = cam ? isCamOnline(cam) : false;
+    const isMain = (fullscreenCh !== null || isMaster || liveLayout === 1);
+    const targetStream = isMain ? "main" : "sub";
+    const isEnabled = cam && (cam.enabled !== false);
+
+    // Update HUD elements
+    const labelEl = document.getElementById(`label-${ch}`);
+    if (labelEl) labelEl.textContent = `${chLabel(ch)}: ${cam ? cam.name : "Empty"}`;
+
+    const dotEl = document.getElementById(`dot-${ch}`);
+    if (dotEl) dotEl.className = `h-[7px] w-[7px] shrink-0 rounded-full ${online ? "bg-success soft-pulse" : "bg-white/30"}`;
+
+    const resBadgeEl = document.getElementById(`res-badge-${ch}`);
+    if (resBadgeEl) {
+      const existing = liveStreamEngines.get(ch);
+      const prefix = isMain ? "MAIN" : "SUB";
+      if (existing && existing.detectedHeight > 0) {
+        let resText = `${existing.detectedHeight}p`;
+        if (existing.detectedHeight >= 2160) resText = "4K";
+        else if (existing.detectedHeight >= 1440) resText = "2K";
+        resBadgeEl.textContent = `${prefix} ${resText}`;
+      } else {
+        resBadgeEl.textContent = prefix;
+      }
+    }
+
+    const noSigEl = document.getElementById(`no-signal-${ch}`);
+    if (noSigEl) {
+      if (cam && online) noSigEl.classList.add("hidden");
+      else noSigEl.classList.remove("hidden");
+    }
 
     const stageEl = document.getElementById(`stream-stage-${ch}`);
-    if (stageEl && online) {
-      const targetStream = isMain ? "main" : "sub";
+    if (stageEl && isEnabled) {
       const existing = liveStreamEngines.get(ch);
-      if (!existing || existing.streamType !== targetStream) {
-        if (existing) {
-          try { existing.destroy(); } catch {}
-        }
+      if (!existing) {
+        // First-time mount: start stream
+        const engine = new NvrStreamEngine({
+          channelId: ch,
+          container: stageEl,
+          streamType: targetStream,
+          onStatus: (st) => {
+            const badgeEl = document.getElementById(`stream-tier-${ch}`);
+            if (badgeEl) {
+              badgeEl.textContent = st.tier || st.text;
+              badgeEl.className = `px-2 py-0.5 font-mono text-[10px] text-white/90 ${
+                st.state === "PLAYING" ? "bg-success/80" : st.state === "FALLBACK" ? "bg-warning/80" : "bg-black/55"
+              }`;
+            }
+          },
+          onError: () => {
+            const badgeEl = document.getElementById(`stream-tier-${ch}`);
+            if (badgeEl) {
+              badgeEl.textContent = "Error";
+              badgeEl.className = "px-2 py-0.5 font-mono text-[10px] text-white/90 bg-destructive/80";
+            }
+          },
+        });
+        liveStreamEngines.set(ch, engine);
+        engine.start();
+      } else if (existing.streamType !== targetStream) {
+        // Stream type changed (e.g. sub to main for fullscreen, or main to sub on exit)
+        try { existing.destroy(); } catch {}
         const engine = new NvrStreamEngine({
           channelId: ch,
           container: stageEl,
@@ -956,6 +1050,8 @@ function renderLiveMatrix() {
         liveStreamEngines.set(ch, engine);
         engine.start();
       }
+      // If existing engine already matches targetStream: DO NOTHING.
+      // Stream continues playing without a single dropped frame!
     } else {
       const existing = liveStreamEngines.get(ch);
       if (existing) {
@@ -963,7 +1059,7 @@ function renderLiveMatrix() {
         liveStreamEngines.delete(ch);
       }
     }
-  });
+  }
 }
 
 function selectCamera(id) {
@@ -1275,7 +1371,7 @@ function openReviewItemInPlayer(item) {
 
   if (targetSeg) {
     setPlaybackViewMode("player");
-    startSegmentPlayback(targetSeg, 0);
+    startSegmentPlayback(targetSeg, 0, item);
     const stage = document.getElementById("pb-stage-container");
     if (stage) {
       stage.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -1313,8 +1409,14 @@ function renderReviewCards() {
       const cam = cameras.find((c) => c.id === item.channel_id);
       const camName = cam ? cam.name : `Camera ${pad2(item.channel_id)}`;
       const durationStr = formatDurationCompact(item.duration_seconds);
-      const timeStr = `${item.start_time.slice(11, 16)} – ${item.end_time.slice(11, 16)}`;
-      const dateStr = item.start_time.slice(0, 10);
+      const startD = new Date(item.start_time);
+      const endD = new Date(item.end_time);
+      const startValid = !isNaN(startD.getTime());
+      const endValid = !isNaN(endD.getTime());
+      const timeStr = (startValid && endValid)
+        ? `${startD.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} – ${endD.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+        : `${item.start_time.slice(11, 16)} – ${item.end_time.slice(11, 16)}`;
+      const dateStr = startValid ? startD.toLocaleDateString() : item.start_time.slice(0, 10);
       const fallbackSnapshot = getSnapshotUrl(null, item.channel_id);
       const thumbUrl = item.thumbnail_url || fallbackSnapshot;
       const previewVideoUrl = item.video_url || "";
@@ -1458,38 +1560,6 @@ function renderPlaybackUI() {
     countEl.textContent = pbSegments === null ? "Press Search footage to load the index" : `${pbSegments.length} segments found`;
   }
 
-  // Render 24h timeline track
-  const track = document.getElementById("pb-timeline-track");
-  const needle = document.getElementById("pb-needle");
-  if (track) {
-    // Preserve needle
-    track.innerHTML = "";
-    if (needle) track.appendChild(needle);
-
-    (pbSegments || []).forEach((seg) => {
-      const left = (secondsOfDayUtc(seg.start_time) / 86400) * 100;
-      const width = Math.max(0.4, ((seg.duration_seconds || 60) / 86400) * 100);
-
-      const block = document.createElement("div");
-      block.className = `absolute top-1 h-4 rounded-sm opacity-90 hover:opacity-100 cursor-pointer ${
-        seg.trigger_type === "continuous"
-          ? "timeline-block-continuous"
-          : seg.trigger_type === "motion"
-            ? "timeline-block-motion"
-            : "timeline-block-event"
-      }`;
-      block.style.left = `${left}%`;
-      block.style.width = `${width}%`;
-      block.title = `Segment #${seg.id} · ${seg.trigger_type} (${seg.duration_seconds}s)`;
-
-      block.addEventListener("click", (e) => {
-        e.stopPropagation();
-        startSegmentPlayback(seg);
-      });
-      track.appendChild(block);
-    });
-  }
-
   // Render Table
   const tbody = document.getElementById("pb-table-body");
   if (tbody) {
@@ -1607,7 +1677,7 @@ async function toggleRecordingLock(segId) {
 function getConsecutiveSegment(currentSeg, forward = true) {
   if (!currentSeg || !pbSegments || pbSegments.length === 0) return null;
   const sameChannelSegs = pbSegments.filter((s) => s.channel_id === currentSeg.channel_id);
-  sameChannelSegs.sort((a, b) => secondsOfDayUtc(a.start_time) - secondsOfDayUtc(b.start_time));
+  sameChannelSegs.sort((a, b) => getEpochMs(a.start_time_ms || a.start_time) - getEpochMs(b.start_time_ms || b.start_time));
   const idx = sameChannelSegs.findIndex((s) => s.id === currentSeg.id);
   if (idx === -1) return null;
   if (forward && idx + 1 < sameChannelSegs.length) {
@@ -1628,18 +1698,28 @@ function highlightActiveSegmentRow(segId) {
   });
 }
 
-function syncAllChannelsToTime(targetSod) {
-  for (let ch = 1; ch <= 4; ch++) {
+function syncAllChannelsToTime(targetMs) {
+  const currentTargetMs = (targetMs && targetMs > 86400000)
+    ? targetMs
+    : (pbActive ? getEpochMs(pbActive.start_time_ms || pbActive.start_time) + (targetMs || 0) * 1000 : 0);
+
+  for (let ch = 1; ch <= MAX_CHANNELS; ch++) {
     const vid = document.getElementById(`pb-sync-vid-${ch}`);
     if (!vid) continue;
-    const seg = (pbSegments || []).find((s) => s.channel_id === ch && targetSod >= secondsOfDayUtc(s.start_time) && targetSod <= secondsOfDayUtc(s.end_time));
+    const seg = (pbSegments || []).find((s) => {
+      if (s.channel_id !== ch) return false;
+      const sStart = getEpochMs(s.start_time_ms || s.start_time);
+      const sEnd = getEpochMs(s.end_time_ms || s.end_time);
+      return currentTargetMs >= sStart && currentTargetMs <= sEnd;
+    });
     if (seg) {
       const url = seg.video_url || `/api/v1/recordings/video?path=${encodeURIComponent(seg.file_path)}`;
       const fullUrl = new URL(url, window.location.origin).href;
       if (vid.src !== fullUrl) {
         vid.src = url;
       }
-      const offset = Math.max(0, targetSod - secondsOfDayUtc(seg.start_time));
+      const sStart = getEpochMs(seg.start_time_ms || seg.start_time);
+      const offset = Math.max(0, (currentTargetMs - sStart) / 1000);
       vid.currentTime = offset;
       vid.playbackRate = pbRate;
       if (pbPlaying) vid.play().catch(() => {});
@@ -1650,19 +1730,33 @@ function syncAllChannelsToTime(targetSod) {
   }
 }
 
-function startSegmentPlayback(seg, seekOffsetSec = 0) {
+function startSegmentPlayback(seg, seekOffsetSec = 0, activityItem = null) {
   if (!seg) return;
   pbActive = seg;
-  const segStart = secondsOfDayUtc(seg.start_time);
+  pbClipDuration = (activityItem && activityItem.duration_seconds) ? activityItem.duration_seconds : (seg.duration_seconds || 60);
+  pbPlayhead = getEpochMs(seg.start_time_ms || seg.start_time);
   pbPlayhead = segStart + seekOffsetSec;
   pbPlaying = true;
 
   document.getElementById("pb-placeholder")?.classList.add("hidden");
-  document.getElementById("pb-overlay-hud")?.classList.remove("hidden");
+  document.getElementById("pb-top-overlay")?.classList.remove("hidden");
+  document.getElementById("pb-controls-overlay")?.classList.remove("hidden");
 
   const cam = cameras.find((c) => c.id === seg.channel_id);
-  const badgeCam = document.getElementById("pb-badge-cam");
-  if (badgeCam) badgeCam.textContent = `${chLabel(seg.channel_id)} · ${cam ? cam.name : "Camera"}`;
+  const camName = cam ? cam.name : chLabel(seg.channel_id);
+  const dateObj = new Date(seg.start_time);
+  const localTimeStr = isNaN(dateObj.getTime()) ? seg.start_time : dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const titleEl = document.getElementById("pb-watching-title");
+  if (titleEl) {
+    titleEl.textContent = `${camName} · ${localTimeStr} (${formatDurationCompact(pbClipDuration)})`;
+  }
+
+
+
+  if (pbHls) {
+    try { pbHls.destroy(); } catch (_) {}
+    pbHls = null;
+  }
 
   const videoEl = document.getElementById("pb-video");
   if (videoEl) {
@@ -1677,10 +1771,19 @@ function startSegmentPlayback(seg, seekOffsetSec = 0) {
         videoEl.src = videoUrl;
       }
       videoEl.playbackRate = pbRate;
+      videoEl.muted = pbAudioMuted;
       if (seekOffsetSec > 0) {
         videoEl.currentTime = seekOffsetSec;
       }
-      videoEl.play().catch(() => {});
+      videoEl.play().catch((err) => {
+        // Browser autoplay restriction: if unmuted autoplay is rejected, fallback to muted
+        if (err.name === "NotAllowedError" && !videoEl.muted) {
+          videoEl.muted = true;
+          pbAudioMuted = true;
+          updateAudioUI();
+          videoEl.play().catch(() => {});
+        }
+      });
     }
   }
 
@@ -1689,7 +1792,7 @@ function startSegmentPlayback(seg, seekOffsetSec = 0) {
   }
 
   // Enable playback buttons
-  ["btn-pb-step-back", "btn-pb-back1s", "btn-pb-playpause", "btn-pb-fwd1s", "btn-pb-step-fwd", "btn-pb-download", "btn-pb-fullscreen"].forEach((id) => {
+  ["btn-pb-back10s", "btn-pb-playpause", "btn-pb-fwd10s", "btn-pb-download", "btn-pb-fullscreen"].forEach((id) => {
     const el = document.getElementById(id);
     if (el) el.removeAttribute("disabled");
   });
@@ -1702,35 +1805,56 @@ function startSegmentPlayback(seg, seekOffsetSec = 0) {
 }
 
 function updatePlayheadUI() {
-  if (!pbActive) return;
-  const end = secondsOfDayUtc(pbActive.end_time);
+  const videoEl = document.getElementById("pb-video");
+  const cur = videoEl ? videoEl.currentTime : 0;
+  const dur = (videoEl && videoEl.duration && !isNaN(videoEl.duration) && videoEl.duration > 0)
+                ? videoEl.duration
+                : (pbClipDuration || 60);
 
+  const pct = Math.min(100, Math.max(0, (cur / dur) * 100));
+
+  const seekFill = document.getElementById("pb-seek-fill");
+  const seekThumb = document.getElementById("pb-seek-thumb");
+  if (seekFill) seekFill.style.width = `${pct}%`;
+  if (seekThumb) seekThumb.style.left = `${pct}%`;
+
+  const hasHours = dur >= 3600;
   const counter = document.getElementById("pb-time-counter");
-  if (counter) counter.textContent = `${formatSecondsOfDay(pbPlayhead)} / ${formatSecondsOfDay(end)}`;
-
-  const hud = document.getElementById("pb-timestamp-hud");
-  if (hud) hud.textContent = formatSecondsOfDay(pbPlayhead);
-
-  const needle = document.getElementById("pb-needle");
-  if (needle) {
-    needle.classList.remove("hidden");
-    needle.style.left = `${(pbPlayhead / 86400) * 100}%`;
-  }
+  if (counter) counter.textContent = `${formatTimeMSS(cur, hasHours)} / ${formatTimeMSS(dur, hasHours)}`;
 }
 
 function updatePlayPauseUI() {
   const icon = document.getElementById("icon-pb-play");
-  const label = document.getElementById("label-pb-play");
   const badge = document.getElementById("pb-badge-state");
 
-  if (label) label.textContent = pbPlaying ? "Pause" : "Play";
   if (icon) {
-    icon.innerHTML = pbPlaying ? '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>' : '<polygon points="5 3 19 12 5 21 5 3"/>';
+    icon.innerHTML = pbPlaying
+      ? '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>'
+      : '<polygon points="5 3 19 12 5 21 5 3"/>';
   }
   if (badge) {
     badge.innerHTML = `<span class="${pbPlaying ? "rec-dot" : ""} mr-1 inline-block h-1.5 w-1.5 rounded-full bg-white"></span>${pbPlaying ? "PLAYING" : "PAUSED"}`;
+    badge.className = pbPlaying
+      ? "inline-flex items-center rounded-md border border-transparent bg-destructive/90 px-2.5 py-0.5 font-mono text-[10px] font-bold text-white shadow"
+      : "inline-flex items-center rounded-md border border-white/20 bg-black/60 px-2.5 py-0.5 font-mono text-[10px] font-bold text-white/80 shadow";
   }
 }
+
+function updateAudioUI() {
+  const iconOn = document.getElementById("icon-pb-audio-on");
+  const iconOff = document.getElementById("icon-pb-audio-off");
+  if (iconOn && iconOff) {
+    if (pbAudioMuted) {
+      iconOn.classList.add("hidden");
+      iconOff.classList.remove("hidden");
+    } else {
+      iconOn.classList.remove("hidden");
+      iconOff.classList.add("hidden");
+    }
+  }
+}
+
+
 
 // --- View 3: Cameras Management ---
 function renderCamerasView() {
@@ -1778,7 +1902,6 @@ function renderCamerasView() {
             online
               ? `
             <img src="${getSnapshotUrl(cam.snapshot_key, cam.id)}" alt="${cam.name}" class="tile-drift absolute inset-0 h-full w-full object-cover" />
-            <div class="scanlines absolute inset-0"></div>
           `
               : `
             <div class="absolute inset-0 flex flex-col items-center justify-center gap-1.5 text-white/50">
@@ -1963,7 +2086,6 @@ function renderDashboardView() {
         <div class="overflow-hidden rounded-xl border border-border/70 bg-card shadow-card">
           <div class="tile-stage-bg relative aspect-video overflow-hidden">
             <img src="${getSnapshotUrl(cam.snapshot_key, cam.id)}" alt="${cam.name}" class="tile-drift h-full w-full object-cover" />
-            <div class="scanlines absolute inset-0"></div>
             <div class="absolute left-2 top-2">
               <span class="inline-flex items-center rounded-md border border-transparent bg-black/50 px-2.5 py-0.5 font-mono text-[10px] text-white font-semibold">${chLabel(cam.id)}</span>
             </div>
@@ -1997,6 +2119,29 @@ function renderDashboardView() {
 async function renderSystemView() {
   const box = document.getElementById("trace-box");
   const badge = document.getElementById("trace-events-badge");
+
+  // Load storage path and disk telemetry
+  try {
+    const sRes = await fetch("/api/v1/storage");
+    if (sRes.ok) {
+      const sJson = await sRes.json();
+      const sData = sJson.data ?? sJson;
+      const recPath = sData.recording_path || "./recordings";
+      const pathLabel = document.getElementById("sys-storage-path");
+      if (pathLabel) pathLabel.textContent = `${recPath} (dedicated disk)`;
+      const pathInput = document.getElementById("input-storage-path");
+      if (pathInput && document.activeElement !== pathInput) {
+        pathInput.value = recPath;
+      }
+
+      const diskHealth = document.getElementById("sys-disk-health");
+      if (diskHealth) {
+        const freeGb = (sData.free_storage_bytes / (1024 * 1024 * 1024)).toFixed(1);
+        const totalGb = (sData.total_storage_bytes / (1024 * 1024 * 1024)).toFixed(1);
+        diskHealth.textContent = `${freeGb} GB Free / ${totalGb} GB (${sData.is_writable ? "Writable" : "Read-Only"})`;
+      }
+    }
+  } catch {}
 
   try {
     const res = await fetch("/api/v1/diagnostics/trace?max_count=128");
@@ -2032,6 +2177,65 @@ async function renderSystemView() {
   }
 }
 
+async function updateStoragePath() {
+  const input = document.getElementById("input-storage-path");
+  const errBox = document.getElementById("change-storage-error");
+  if (errBox) errBox.classList.add("hidden");
+
+  if (!input) return;
+  const newPath = input.value.trim();
+  if (!newPath) {
+    if (errBox) {
+      errBox.textContent = "Please enter a valid storage path";
+      errBox.classList.remove("hidden");
+    }
+    showToast("Please enter a valid storage path", "error");
+    return;
+  }
+
+  const btn = document.getElementById("btn-apply-storage-path");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Applying...";
+  }
+
+  try {
+    const res = await fetch("/api/v1/storage/path", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: newPath })
+    });
+    const data = await res.json();
+    if (res.ok && (data.success || data.recording_path)) {
+      const appliedPath = data.data?.recording_path || data.recording_path || newPath;
+      showToast("Recording storage path updated to " + appliedPath, "success");
+      const pathLabel = document.getElementById("sys-storage-path");
+      if (pathLabel) pathLabel.textContent = `${appliedPath} (dedicated disk)`;
+      closeModal("modal-change-storage");
+      await renderSystemView();
+      await fetchTelemetry();
+    } else {
+      const msg = data.message || data.error || "Failed to update storage path";
+      if (errBox) {
+        errBox.textContent = msg;
+        errBox.classList.remove("hidden");
+      }
+      showToast(msg, "error");
+    }
+  } catch (err) {
+    if (errBox) {
+      errBox.textContent = err.message;
+      errBox.classList.remove("hidden");
+    }
+    showToast("Network error updating storage path: " + err.message, "error");
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Apply Path";
+    }
+  }
+}
+
 // --- Modals Implementation ---
 function openModal(id) {
   const modal = document.getElementById(id);
@@ -2041,6 +2245,252 @@ function openModal(id) {
 function closeModal(id) {
   const modal = document.getElementById(id);
   if (modal) modal.classList.remove("open");
+}
+
+// --- User Header Display ---
+function updateUserHeader() {
+  const uEl = document.getElementById("header-username");
+  const rEl = document.getElementById("header-user-role");
+
+  if (currentUser && currentUser.username) {
+    if (uEl) uEl.textContent = currentUser.username;
+    if (rEl) {
+      rEl.textContent = currentUser.role || "ADMIN";
+      rEl.className = "rounded bg-primary/20 px-1.5 py-0.5 text-[9px] font-bold text-primary";
+    }
+  }
+}
+
+async function renderUsersView() {
+  await loadUsersTable();
+}
+
+async function loadUsersTable() {
+  const tbody = document.getElementById("users-table-body");
+  if (!tbody) return;
+
+  try {
+    const res = await fetch("/api/v1/users");
+    if (!res.ok) return;
+    const json = await res.json();
+    const users = Array.isArray(json.data) ? json.data : (Array.isArray(json) ? json : (json.data?.users || json.users || []));
+    tbody.innerHTML = "";
+
+    // Calculate KPI metrics
+    let total = 0, admins = 0, operators = 0, viewers = 0;
+    users.forEach((u) => {
+      total++;
+      const r = (u.role || "").toUpperCase();
+      if (r === "ADMIN") admins++;
+      else if (r === "OPERATOR") operators++;
+      else if (r === "VIEWER") viewers++;
+    });
+
+    const kpiTotal = document.getElementById("kpi-total-users");
+    const kpiAdmin = document.getElementById("kpi-admin-users");
+    const kpiOp = document.getElementById("kpi-operator-users");
+    const kpiVw = document.getElementById("kpi-viewer-users");
+    if (kpiTotal) kpiTotal.textContent = total;
+    if (kpiAdmin) kpiAdmin.textContent = admins;
+    if (kpiOp) kpiOp.textContent = operators;
+    if (kpiVw) kpiVw.textContent = viewers;
+
+    if (!Array.isArray(users) || users.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6" class="py-6 text-center text-muted-foreground">No accounts found</td></tr>`;
+      return;
+    }
+
+    users.forEach((u) => {
+      const tr = document.createElement("tr");
+      tr.className = "hover:bg-muted/40 transition-colors";
+
+      const createdDate = u.created_at ? new Date(u.created_at).toLocaleDateString() : "System Default";
+      const isSelf = currentUser && currentUser.username === u.username;
+
+      let roleBadge = `<span class="rounded bg-purple-500/15 text-purple-600 px-2 py-0.5 text-[10px] font-bold">ADMIN</span>`;
+      if (u.role === "OPERATOR") roleBadge = `<span class="rounded bg-emerald-500/15 text-emerald-600 px-2 py-0.5 text-[10px] font-bold">OPERATOR</span>`;
+      else if (u.role === "VIEWER") roleBadge = `<span class="rounded bg-slate-500/15 text-slate-600 px-2 py-0.5 text-[10px] font-bold">VIEWER</span>`;
+
+      const initial = (u.username || "U").charAt(0).toUpperCase();
+
+      tr.innerHTML = `
+        <td class="py-2.5 px-3">
+          <div class="flex items-center gap-2.5">
+            <div class="flex h-7 w-7 items-center justify-center rounded-full ${u.role === 'ADMIN' ? 'bg-purple-100 text-purple-700' : (u.role === 'OPERATOR' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-700')} text-xs font-bold">
+              ${initial}
+            </div>
+            <div>
+              <span class="font-mono font-medium text-foreground text-xs">${escapeHtml(u.username)}</span>
+              ${isSelf ? '<span class="ml-1 rounded bg-primary/10 text-primary text-[9px] font-bold px-1.5 py-0.5">YOU</span>' : ''}
+            </div>
+          </div>
+        </td>
+        <td class="py-2.5 px-3">${roleBadge}</td>
+        <td class="py-2.5 px-3">
+          <span class="inline-flex items-center gap-1.5 text-xs text-foreground font-medium">
+            <span class="h-1.5 w-1.5 rounded-full bg-success"></span>
+            Active
+          </span>
+        </td>
+        <td class="py-2.5 px-3 text-muted-foreground font-mono text-[11px]">PBKDF2-HMAC-SHA256 (100k)</td>
+        <td class="py-2.5 px-3 text-muted-foreground text-xs">${createdDate}</td>
+        <td class="py-2.5 px-3 text-right space-x-1.5">
+          <button type="button" class="btn-reset-user-pwd inline-flex items-center gap-1 rounded-md px-2.5 py-1 text-[11px] font-medium bg-secondary text-secondary-foreground hover:bg-accent transition-colors cursor-pointer" data-user="${escapeHtml(u.username)}">
+            <svg class="h-3 w-3 text-muted-foreground" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />
+            </svg>
+            Reset
+          </button>
+          ${(!isSelf && u.username !== "admin") ? `
+          <button type="button" class="btn-delete-user inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium bg-destructive/15 text-destructive hover:bg-destructive/25 transition-colors cursor-pointer" data-user="${escapeHtml(u.username)}">
+            <svg class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+            Delete
+          </button>` : ''}
+        </td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    // Reset password button click handlers
+    tbody.querySelectorAll(".btn-reset-user-pwd").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const target = btn.getAttribute("data-user");
+        const targetInput = document.getElementById("reset-pwd-target-user");
+        const errBox = document.getElementById("reset-pwd-error");
+        const pwdInput = document.getElementById("reset-pwd-new");
+        if (targetInput) targetInput.value = target;
+        if (pwdInput) pwdInput.value = "";
+        if (errBox) {
+          errBox.classList.add("hidden");
+          errBox.textContent = "";
+        }
+        openModal("modal-reset-pwd");
+      });
+    });
+
+    // Delete user button click handlers
+    tbody.querySelectorAll(".btn-delete-user").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const target = btn.getAttribute("data-user");
+        if (confirm(`Are you sure you want to delete user account '${target}'?`)) {
+          await deleteUserAccount(target);
+        }
+      });
+    });
+
+  } catch (err) {
+    console.error("Error loading users table:", err);
+  }
+}
+
+async function deleteUserAccount(username) {
+  try {
+    const res = await fetch(`/api/v1/users/${encodeURIComponent(username)}`, {
+      method: "DELETE"
+    });
+    const result = await res.json();
+    if (res.ok && result.success) {
+      showToast(`User '${username}' deleted successfully.`);
+      await loadUsersTable();
+    } else {
+      showToast(result.message || "Failed to delete user.", "error");
+    }
+  } catch {
+    showToast("Network error deleting user.", "error");
+  }
+}
+
+async function handleSaveNewUser() {
+  const uInput = document.getElementById("new-user-name");
+  const pInput = document.getElementById("new-user-password");
+  const rInput = document.getElementById("new-user-role");
+  const errBox = document.getElementById("add-user-error");
+
+  const username = uInput?.value.trim();
+  const password = pInput?.value;
+  const role = rInput?.value || "VIEWER";
+
+  if (!username || !password) {
+    if (errBox) {
+      errBox.textContent = "Username and password are required.";
+      errBox.classList.remove("hidden");
+    }
+    return;
+  }
+  if (password.length < 4) {
+    if (errBox) {
+      errBox.textContent = "Password must be at least 4 characters long.";
+      errBox.classList.remove("hidden");
+    }
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/v1/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password, role })
+    });
+    const result = await res.json();
+    if (res.ok && result.success) {
+      closeModal("modal-add-user");
+      if (uInput) uInput.value = "";
+      if (pInput) pInput.value = "";
+      showToast(`User '${username}' created successfully.`);
+      await loadUsersTable();
+    } else {
+      if (errBox) {
+        errBox.textContent = result.message || "Failed to create user.";
+        errBox.classList.remove("hidden");
+      }
+    }
+  } catch {
+    if (errBox) {
+      errBox.textContent = "Network error creating user.";
+      errBox.classList.remove("hidden");
+    }
+  }
+}
+
+async function handleSaveResetPassword() {
+  const target = document.getElementById("reset-pwd-target-user")?.value;
+  const newInput = document.getElementById("reset-pwd-new");
+  const errBox = document.getElementById("reset-pwd-error");
+
+  const new_password = newInput?.value;
+  if (!target || !new_password) {
+    if (errBox) {
+      errBox.textContent = "New password is required.";
+      errBox.classList.remove("hidden");
+    }
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/v1/users/reset_password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: target, new_password })
+    });
+    const result = await res.json();
+    if (res.ok && result.success) {
+      closeModal("modal-reset-pwd");
+      if (newInput) newInput.value = "";
+      showToast(`Password for '${target}' reset successfully.`);
+    } else {
+      if (errBox) {
+        errBox.textContent = result.message || "Failed to reset password.";
+        errBox.classList.remove("hidden");
+      }
+    }
+  } catch {
+    if (errBox) {
+      errBox.textContent = "Network error resetting password.";
+      errBox.classList.remove("hidden");
+    }
+  }
 }
 
 function openEditModal(camId) {
@@ -2240,9 +2690,18 @@ function submitAddModal() {
     return;
   }
 
-  let ip = "192.168.1.100";
-  const m = mainUrl.match(/@?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
-  if (m) ip = m[1];
+  let ip = "";
+  try {
+    const parsedUrl = new URL(mainUrl.replace(/^rtsp:\/\//i, "http://"));
+    ip = parsedUrl.hostname || "";
+  } catch (e) {
+    const m = mainUrl.match(/@?([a-zA-Z0-9\.\-_]+)(?::[0-9]+)?\//);
+    if (m) ip = m[1];
+  }
+  if (!ip) {
+    const mIp = mainUrl.match(/@?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/);
+    ip = mIp ? mIp[1] : "";
+  }
 
   const newCam = {
     id: ch,
@@ -2613,9 +3072,19 @@ function setupEventListeners() {
   if (pbVideo) {
     pbVideo.addEventListener("timeupdate", () => {
       if (!pbActive) return;
-      const startSod = secondsOfDayUtc(pbActive.start_time);
-      pbPlayhead = startSod + pbVideo.currentTime;
+      const startMs = getEpochMs(pbActive.start_time_ms || pbActive.start_time);
+      pbPlayhead = startMs + Math.floor(pbVideo.currentTime * 1000);
       updatePlayheadUI();
+
+      // Bounded clip playback: stop cleanly when clip finishes
+      if (pbClipDuration > 0 && !pbAutoAdvance && !pbLoop) {
+        if (pbVideo.currentTime >= pbClipDuration && !pbVideo.paused) {
+          pbVideo.pause();
+          pbPlaying = false;
+          updatePlayPauseUI();
+          updatePlayheadUI();
+        }
+      }
     });
     pbVideo.addEventListener("play", () => {
       pbPlaying = true;
@@ -2639,9 +3108,35 @@ function setupEventListeners() {
         }
       }
       pbPlaying = false;
+      pbVideo.pause();
       updatePlayPauseUI();
+      updatePlayheadUI();
+    });
+    pbVideo.addEventListener("error", () => {
+      const err = pbVideo.error;
+      let msg = "Playback error";
+      if (err) {
+        if (err.code === 1) msg = "Playback aborted";
+        else if (err.code === 2) msg = "Network error while loading video";
+        else if (err.code === 3) msg = "Video decode error (codec or corrupted segment)";
+        else if (err.code === 4) msg = "Video format or codec not supported by browser";
+      }
+      console.warn("[Playback Error]", msg, err);
+      showToast(msg, "error");
     });
   }
+
+  // Playback audio volume and mute toggle
+  document.getElementById("btn-pb-audio")?.addEventListener("click", () => {
+    const v = document.getElementById("pb-video");
+    pbAudioMuted = !pbAudioMuted;
+    if (v) {
+      v.muted = pbAudioMuted;
+      if (!pbAudioMuted && v.volume === 0) v.volume = 1.0;
+    }
+    updateAudioUI();
+    showToast(pbAudioMuted ? "Audio muted" : "Audio unmuted", "info");
+  });
 
   // Playback search and filter triggers
   document.getElementById("btn-search-recordings")?.addEventListener("click", searchRecordings);
@@ -2659,96 +3154,65 @@ function setupEventListeners() {
   document.getElementById("btn-pb-mode-table")?.addEventListener("click", () => setPlaybackViewMode("table"));
   document.getElementById("btn-back-to-cards")?.addEventListener("click", () => setPlaybackViewMode("cards"));
 
-  // Playback timeline track scrubbing and tooltip preview
-  const track = document.getElementById("pb-timeline-track");
-  const tooltip = document.getElementById("pb-timeline-tooltip");
 
-  function handleTimelineScrub(e) {
-    if (!track) return;
-    const rect = track.getBoundingClientRect();
+
+  // Modern Seek Bar scrubbing (matches user reference player)
+  const seekContainer = document.getElementById("pb-seek-container");
+  function handleSeekbarScrub(e) {
+    if (!seekContainer) return;
+    const rect = seekContainer.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const sod = ratio * 86400;
-
-    const hit = (pbSegments ?? []).find((s) => sod >= secondsOfDayUtc(s.start_time) && sod <= secondsOfDayUtc(s.end_time));
-    if (hit) {
-      if (pbActive?.id !== hit.id) {
-        startSegmentPlayback(hit, Math.max(0, sod - secondsOfDayUtc(hit.start_time)));
-      } else {
-        const segStart = secondsOfDayUtc(hit.start_time);
-        const offsetSec = Math.max(0, sod - segStart);
-        const v = document.getElementById("pb-video");
-        if (v) v.currentTime = offsetSec;
-        pbPlayhead = sod;
-        updatePlayheadUI();
-      }
-      if (pbLayoutMode === "grid4") {
-        syncAllChannelsToTime(sod);
-      }
-    } else {
-      pbPlayhead = sod;
+    const v = document.getElementById("pb-video");
+    if (v) {
+      const dur = (v.duration && !isNaN(v.duration) && v.duration > 0) ? v.duration : (pbClipDuration || 60);
+      v.currentTime = ratio * dur;
       updatePlayheadUI();
     }
   }
 
-  track?.addEventListener("mousedown", (e) => {
-    pbIsDragging = true;
-    handleTimelineScrub(e);
+  seekContainer?.addEventListener("mousedown", (e) => {
+    pbSeekDragging = true;
+    handleSeekbarScrub(e);
   });
 
   window.addEventListener("mousemove", (e) => {
-    if (pbIsDragging) {
-      handleTimelineScrub(e);
+    if (pbSeekDragging) {
+      handleSeekbarScrub(e);
     }
   });
 
   window.addEventListener("mouseup", () => {
-    if (pbIsDragging) {
-      pbIsDragging = false;
+    if (pbSeekDragging) {
+      pbSeekDragging = false;
     }
   });
 
-  track?.addEventListener("mousemove", (e) => {
-    if (!track || !tooltip) return;
-    const rect = track.getBoundingClientRect();
-    const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    const sod = ratio * 86400;
-    const hit = (pbSegments ?? []).find((s) => sod >= secondsOfDayUtc(s.start_time) && sod <= secondsOfDayUtc(s.end_time));
-
-    tooltip.classList.remove("hidden");
-    const trackLeftOffset = Math.max(40, Math.min(rect.width - 40, e.clientX - rect.left));
-    tooltip.style.left = `${trackLeftOffset}px`;
-
-    let content = formatSecondsOfDay(sod);
-    if (hit) {
-      content += ` · CH${hit.channel_id} [${hit.trigger || "NORMAL"}]`;
-    }
-    tooltip.textContent = content;
-  });
-
-  track?.addEventListener("mouseleave", () => {
-    if (tooltip && !pbIsDragging) {
-      tooltip.classList.add("hidden");
-    }
-  });
-
-  function getPlaybackStepSeconds() {
-    const cam = pbActive ? camerasState.find((c) => c.id === pbActive.channel_id) : null;
-    const fps = (cam && cam.fps > 0) ? cam.fps : 25;
-    return 1.0 / fps;
-  }
-
-  // Step backward 1 frame (1/FPS)
-  document.getElementById("btn-pb-step-back")?.addEventListener("click", () => {
+  // Top Overlay Back button
+  document.getElementById("btn-pb-overlay-back")?.addEventListener("click", () => {
     const v = document.getElementById("pb-video");
-    if (!v) return;
-    if (!v.paused) v.pause();
-    v.currentTime = Math.max(0, v.currentTime - getPlaybackStepSeconds());
+    if (v) v.pause();
+    pbPlaying = false;
+    updatePlayPauseUI();
+    setPlaybackViewMode("cards");
   });
 
-  // 1 second skip back
-  document.getElementById("btn-pb-back1s")?.addEventListener("click", () => {
+  // 10 seconds skip back
+  document.getElementById("btn-pb-back10s")?.addEventListener("click", () => {
     const v = document.getElementById("pb-video");
-    if (v) v.currentTime = Math.max(0, v.currentTime - 1);
+    if (v) {
+      v.currentTime = Math.max(0, v.currentTime - 10);
+      updatePlayheadUI();
+    }
+  });
+
+  // 10 seconds skip forward
+  document.getElementById("btn-pb-fwd10s")?.addEventListener("click", () => {
+    const v = document.getElementById("pb-video");
+    if (v) {
+      const dur = (v.duration && !isNaN(v.duration) && v.duration > 0) ? v.duration : (pbClipDuration || 60);
+      v.currentTime = Math.min(dur, v.currentTime + 10);
+      updatePlayheadUI();
+    }
   });
 
   // Play / Pause toggle
@@ -2759,57 +3223,6 @@ function setupEventListeners() {
       v.play().catch(() => {});
     } else {
       v.pause();
-    }
-  });
-
-  // 1 second skip forward
-  document.getElementById("btn-pb-fwd1s")?.addEventListener("click", () => {
-    const v = document.getElementById("pb-video");
-    if (v) v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 1);
-  });
-
-  // Step forward 1 frame (1/FPS)
-  document.getElementById("btn-pb-step-fwd")?.addEventListener("click", () => {
-    const v = document.getElementById("pb-video");
-    if (!v) return;
-    if (!v.paused) v.pause();
-    v.currentTime = Math.min(v.duration || Infinity, v.currentTime + getPlaybackStepSeconds());
-  });
-
-  // Auto-advance toggle
-  const autoNextBtn = document.getElementById("btn-pb-autonext");
-  if (autoNextBtn && pbAutoAdvance) {
-    autoNextBtn.classList.add("text-primary", "border-primary/50", "bg-primary/10");
-  }
-  autoNextBtn?.addEventListener("click", () => {
-    pbAutoAdvance = !pbAutoAdvance;
-    if (autoNextBtn) {
-      if (pbAutoAdvance) {
-        autoNextBtn.classList.remove("text-muted-foreground");
-        autoNextBtn.classList.add("text-primary", "border-primary/50", "bg-primary/10");
-        showToast("Auto-advance enabled: next sequential segment will play automatically", "info");
-      } else {
-        autoNextBtn.classList.remove("text-primary", "border-primary/50", "bg-primary/10");
-        autoNextBtn.classList.add("text-muted-foreground");
-        showToast("Auto-advance disabled", "info");
-      }
-    }
-  });
-
-  // Segment loop toggle
-  const loopBtn = document.getElementById("btn-pb-loop");
-  loopBtn?.addEventListener("click", () => {
-    pbLoop = !pbLoop;
-    if (loopBtn) {
-      if (pbLoop) {
-        loopBtn.classList.remove("text-muted-foreground");
-        loopBtn.classList.add("text-primary", "border-primary/50", "bg-primary/10");
-        showToast("Segment loop enabled", "info");
-      } else {
-        loopBtn.classList.remove("text-primary", "border-primary/50", "bg-primary/10");
-        loopBtn.classList.add("text-muted-foreground");
-        showToast("Segment loop disabled", "info");
-      }
     }
   });
 
@@ -2856,10 +3269,11 @@ function setupEventListeners() {
       });
       btn.className = "pb-rate-btn rounded-md px-2 py-1 text-[11px] font-bold transition-colors bg-primary text-primary-foreground";
       pbRate = Number(btn.dataset.rate);
-      document.getElementById("pb-badge-rate").textContent = `x${pbRate}`;
+      const rateBadge = document.getElementById("pb-badge-rate");
+      if (rateBadge) rateBadge.textContent = `x${pbRate}`;
       const v = document.getElementById("pb-video");
       if (v) v.playbackRate = pbRate;
-      for (let ch = 1; ch <= 4; ch++) {
+      for (let ch = 1; ch <= MAX_CHANNELS; ch++) {
         const vid = document.getElementById(`pb-sync-vid-${ch}`);
         if (vid) vid.playbackRate = pbRate;
       }
@@ -3036,6 +3450,37 @@ function setupEventListeners() {
   document.getElementById("btn-submit-add-cam")?.addEventListener("click", submitAddModal);
   document.getElementById("btn-confirm-delete")?.addEventListener("click", confirmDeleteModal);
 
+  // User Management Wiring
+  document.getElementById("btn-add-user-modal")?.addEventListener("click", () => {
+    const err = document.getElementById("add-user-error");
+    if (err) err.classList.add("hidden");
+    document.getElementById("new-user-name").value = "";
+    document.getElementById("new-user-password").value = "";
+    openModal("modal-add-user");
+  });
+  document.getElementById("btn-save-new-user")?.addEventListener("click", handleSaveNewUser);
+  document.getElementById("btn-save-reset-pwd")?.addEventListener("click", handleSaveResetPassword);
+  document.getElementById("btn-users-refresh")?.addEventListener("click", loadUsersTable);
+  document.getElementById("users-search-input")?.addEventListener("input", (e) => {
+    const q = (e.target.value || "").toLowerCase();
+    document.querySelectorAll("#users-table-body tr").forEach((row) => {
+      const text = row.textContent.toLowerCase();
+      row.style.display = text.includes(q) ? "" : "none";
+    });
+  });
+  document.getElementById("btn-change-storage-path")?.addEventListener("click", () => {
+    const err = document.getElementById("change-storage-error");
+    if (err) err.classList.add("hidden");
+    const curPathEl = document.getElementById("sys-storage-path");
+    const mCur = document.getElementById("modal-current-storage-path");
+    const input = document.getElementById("input-storage-path");
+    const current = (curPathEl?.textContent || "./recordings").replace(" (dedicated disk)", "").trim();
+    if (mCur) mCur.textContent = current;
+    if (input) input.value = current;
+    openModal("modal-change-storage");
+  });
+  document.getElementById("btn-apply-storage-path")?.addEventListener("click", updateStoragePath);
+
   // Wizard actions
   document.getElementById("btn-onvif-rescan")?.addEventListener("click", rescanOnvif);
   document.getElementById("btn-onvif-back")?.addEventListener("click", () => {
@@ -3070,20 +3515,24 @@ function setupEventListeners() {
 }
 
 // --- Initialization ---
+let telemetryInterval = null;
+
 async function initApp() {
   startClock();
   setupEventListeners();
+  updateUserHeader();
 
   await loadCameras();
   await fetchTelemetry();
-
   initPlaybackView();
-
-  // Setup periodic telemetry polling every 3 seconds
-  setInterval(fetchTelemetry, 3000);
-
-  // Activate initial tab from URL hash
+  if (!telemetryInterval) {
+    telemetryInterval = setInterval(fetchTelemetry, 3000);
+  }
   handleHashChange();
 }
 
-window.addEventListener("DOMContentLoaded", initApp);
+if (document.readyState === "loading") {
+  window.addEventListener("DOMContentLoaded", initApp);
+} else {
+  initApp();
+}
