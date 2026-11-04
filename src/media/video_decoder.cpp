@@ -143,6 +143,8 @@ public:
         frame_free_ = reinterpret_cast<void(*)(AVFrame**)>(dlsym(avutil_lib_, "av_frame_free"));
         frame_unref_ = reinterpret_cast<void(*)(AVFrame*)>(dlsym(avutil_lib_, "av_frame_unref"));
         flush_buffers_ = reinterpret_cast<void(*)(AVCodecContext*)>(dlsym(avcodec_lib_, "avcodec_flush_buffers"));
+        dict_set_ = reinterpret_cast<int(*)(void**, const char*, const char*, int)>(dlsym(avutil_lib_, "av_dict_set"));
+        dict_free_ = reinterpret_cast<void(*)(void**)>(dlsym(avutil_lib_, "av_dict_free"));
 
         if (!find_decoder_by_name_ || !alloc_context3_ || !open2_ || !free_context_ ||
             !send_packet_ || !receive_frame_ || !frame_alloc_ || !frame_free_ ||
@@ -168,7 +170,20 @@ public:
         }
 
         ctx_ = alloc_context3_(codec_);
-        if (!ctx_ || open2_(ctx_, codec_, nullptr) != 0) {
+        if (!ctx_) {
+            Close();
+            return false;
+        }
+
+        void* opts = nullptr;
+        if (dict_set_) {
+            dict_set_(&opts, "threads", "1", 0);
+        }
+        int open_res = open2_(ctx_, codec_, opts ? reinterpret_cast<void**>(&opts) : nullptr);
+        if (opts && dict_free_) {
+            dict_free_(&opts);
+        }
+        if (open_res != 0) {
             Close();
             return false;
         }
@@ -300,6 +315,8 @@ private:
     AVFrame*(*frame_alloc_)(){nullptr};
     void(*frame_free_)(AVFrame**){nullptr};
     void(*frame_unref_)(AVFrame*){nullptr};
+    int(*dict_set_)(void**, const char*, const char*, int){nullptr};
+    void(*dict_free_)(void**){nullptr};
 };
 
 struct V4l2MmapBuffer {

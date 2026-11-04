@@ -533,9 +533,9 @@ bool RestServer::Start() {
     }
 
     is_running_.store(true);
-    size_t hw_threads = std::max<size_t>(4, std::thread::hardware_concurrency());
-    worker_pool_ = std::make_unique<ThreadPool>(std::max<size_t>(32, hw_threads * 4));
-    media_pool_ = std::make_unique<ThreadPool>(std::max<size_t>(32, hw_threads * 4));
+    size_t pool_size = std::clamp<size_t>(std::thread::hardware_concurrency(), 2, 4);
+    worker_pool_ = std::make_unique<ThreadPool>(pool_size);
+    media_pool_ = std::make_unique<ThreadPool>(pool_size);
     listener_thread_ = std::thread(&RestServer::ListenerLoop, this);
 
     LOG_INFO << "[RestServer] HTTP REST Control Plane listening on " 
