@@ -11,6 +11,10 @@ RtpDepacketizer::RtpDepacketizer(int channel_id, StreamType stream_type, CodecTy
 
 void RtpDepacketizer::Reset() {
     FlushAu();
+    au_buffer_.clear();
+    au_has_data_ = false;
+    au_has_vcl_ = false;
+    au_is_keyframe_ = false;
     fu_buffer_.clear();
     fu_in_progress_ = false;
     fu_is_keyframe_ = false;
@@ -26,6 +30,10 @@ void RtpDepacketizer::Reset() {
 void RtpDepacketizer::SetCodec(CodecType codec) {
     if (codec_ != codec) {
         FlushAu();
+        au_buffer_.clear();
+        au_has_data_ = false;
+        au_has_vcl_ = false;
+        au_is_keyframe_ = false;
         fu_buffer_.clear();
         fu_in_progress_ = false;
         fu_is_keyframe_ = false;
@@ -164,8 +172,24 @@ void RtpDepacketizer::ProcessVideoPacketInternal(const uint8_t* payload, size_t 
 void RtpDepacketizer::AppendNalToAu(const uint8_t* nal_data, size_t nal_len, bool is_key, uint32_t rtp_timestamp, uint16_t seq_num) {
     if (!nal_data || nal_len == 0) return;
 
+    bool is_vcl = false;
+    if (codec_ == CodecType::H265) {
+        uint8_t nal_type = (nal_data[0] >> 1) & 0x3F;
+        is_vcl = (nal_type <= 31);
+    } else if (codec_ == CodecType::H264) {
+        uint8_t nal_type = nal_data[0] & 0x1F;
+        is_vcl = (nal_type >= 1 && nal_type <= 5);
+    } else {
+        is_vcl = true;
+    }
+
     if (au_has_data_ && rtp_timestamp != au_timestamp_) {
-        FlushAu();
+        if (au_has_vcl_) {
+            FlushAu();
+        } else {
+            // Parameter sets / SEI preceded the slice with an earlier RTP timestamp; keep them attached to the slice
+            au_timestamp_ = rtp_timestamp;
+        }
     }
 
     if (!au_has_data_) {
@@ -173,6 +197,7 @@ void RtpDepacketizer::AppendNalToAu(const uint8_t* nal_data, size_t nal_len, boo
         au_timestamp_ = rtp_timestamp;
         au_seq_num_ = seq_num;
         au_is_keyframe_ = false;
+        au_has_vcl_ = false;
         au_has_data_ = true;
     }
 
@@ -183,6 +208,9 @@ void RtpDepacketizer::AppendNalToAu(const uint8_t* nal_data, size_t nal_len, boo
     au_buffer_.push_back(0x01);
     au_buffer_.insert(au_buffer_.end(), nal_data, nal_data + nal_len);
 
+    if (is_vcl) {
+        au_has_vcl_ = true;
+    }
     if (is_key) {
         au_is_keyframe_ = true;
     }
@@ -192,11 +220,17 @@ void RtpDepacketizer::AppendNalToAu(const uint8_t* nal_data, size_t nal_len, boo
 void RtpDepacketizer::FlushAu() {
     if (!au_has_data_ || au_buffer_.empty()) {
         au_has_data_ = false;
+        au_has_vcl_ = false;
+        return;
+    }
+    if (!au_has_vcl_) {
+        // Do not emit bare parameter sets (VPS/SPS/PPS) without a VCL slice; retain until slice arrives
         return;
     }
     EmitPacket(au_buffer_, au_is_keyframe_, au_timestamp_, au_seq_num_);
     au_buffer_.clear();
     au_has_data_ = false;
+    au_has_vcl_ = false;
     au_is_keyframe_ = false;
 }
 

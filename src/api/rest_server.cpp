@@ -51,7 +51,8 @@ struct WsStreamContext {
     std::condition_variable cv;
     std::deque<MediaPacketPtr> queue;
     std::atomic<bool> closed{false};
-    static constexpr size_t kMaxQueueDepth = 15; // Freshness-first bounded queue (~500ms @ 30fps)
+    bool awaiting_keyframe{true};
+    static constexpr size_t kMaxQueueDepth = 30; // Full 1-second GOP capacity
 };
 
 std::string HttpStatusMessage(int code) {
@@ -2129,12 +2130,30 @@ void RestServer::HandleWebSocketStream(int client_fd, int channel_id, StreamType
             }
             std::lock_guard<std::mutex> lock(ctx->mtx);
             if (ctx->queue.size() >= WsStreamContext::kMaxQueueDepth) {
-                while (ctx->queue.size() > 2) {
-                    ctx->queue.pop_front();
+                if (pkt->is_keyframe) {
+                    ctx->queue.clear();
+                    ctx->awaiting_keyframe = false;
+                } else {
+                    while (!ctx->queue.empty() && !ctx->queue.front()->is_keyframe) {
+                        ctx->queue.pop_front();
+                    }
+                    if (!ctx->queue.empty()) {
+                        ctx->queue.pop_front();
+                        while (!ctx->queue.empty() && !ctx->queue.front()->is_keyframe) {
+                            ctx->queue.pop_front();
+                        }
+                    }
+                    if (ctx->queue.empty()) {
+                        ctx->awaiting_keyframe = true;
+                        return;
+                    }
                 }
-                while (!ctx->queue.empty() && !ctx->queue.front()->is_keyframe) {
-                    ctx->queue.pop_front();
+            }
+            if (ctx->awaiting_keyframe) {
+                if (!pkt->is_keyframe) {
+                    return;
                 }
+                ctx->awaiting_keyframe = false;
             }
             ctx->queue.push_back(pkt);
             ctx->cv.notify_one();
@@ -2209,11 +2228,15 @@ void RestServer::HandleWebSocketStream(int client_fd, int channel_id, StreamType
         ctx->closed.store(true);
     }
 
-    // Instant Keyframe Burst: immediately dispatch latest cached IDR to start client decoding in <30ms
+    // Only dispatch cached IDR if it was captured within the last 45ms (so no intermediate P-frames were missed)
     auto initial_kf = StreamBroker::Instance().GetLatestKeyframe(channel_id, stream_type);
-    if (initial_kf) {
+    if (initial_kf && initial_kf->wall_time_ms > 0 &&
+        (time_utils::WallTimeMs() - initial_kf->wall_time_ms) <= 45) {
         std::lock_guard<std::mutex> lock(ctx->mtx);
-        ctx->queue.push_back(initial_kf);
+        if (ctx->queue.empty()) {
+            ctx->queue.push_back(initial_kf);
+            ctx->awaiting_keyframe = false;
+        }
     }
 
     while (is_running_.load() && !ctx->closed.load()) {

@@ -489,7 +489,20 @@ class NvrStreamEngine {
               if (msg.height && msg.height > 0) {
                 this.updateDynamicResolutionBadge(msg.width, msg.height);
               }
-              await this.negotiatePlayer(msg);
+              this.isNegotiating = true;
+              this.pendingInitFrames = [];
+              try {
+                await this.negotiatePlayer(msg);
+              } finally {
+                this.isNegotiating = false;
+              }
+              if (!this.isDestroyed && this.pendingInitFrames?.length) {
+                const queued = this.pendingInitFrames;
+                this.pendingInitFrames = [];
+                for (const f of queued) {
+                  this.dispatchFrame(f.nalData, f.ptsUs, f.isKey, f.isH265);
+                }
+              }
             }
           } catch (e) {
             console.error(`[Cam ${this.channelId}] config error:`, e);
@@ -501,7 +514,16 @@ class NvrStreamEngine {
         const dv = new DataView(buf);
         const ptsUs = Number(dv.getBigUint64(0, true));
         const flags = dv.getUint32(8, true);
-        this.dispatchFrame(new Uint8Array(buf, 12), ptsUs, (flags & 0x01) !== 0, (flags & 0x02) !== 0);
+        const nalData = new Uint8Array(buf, 12);
+        const isKey = (flags & 0x01) !== 0;
+        const isH265 = (flags & 0x02) !== 0;
+        if (this.isNegotiating) {
+          if (this.pendingInitFrames && this.pendingInitFrames.length < 30) {
+            this.pendingInitFrames.push({ nalData: nalData.slice(), ptsUs, isKey, isH265 });
+          }
+          return;
+        }
+        this.dispatchFrame(nalData, ptsUs, isKey, isH265);
       };
 
       this.ws.onerror = () => {
@@ -738,7 +760,7 @@ class NvrStreamEngine {
         typeof SharedArrayBuffer !== "undefined";
 
       const hardwareThreads = navigator.hardwareConcurrency || 4;
-      const targetThreads = canUseThreads ? Math.min(4, Math.max(2, Math.floor(hardwareThreads / 2))) : 1;
+      const targetThreads = canUseThreads ? Math.min(2, Math.max(1, Math.floor(hardwareThreads / 4))) : 1;
       const chosenVariant = canUseThreads ? "threads-simd" : "auto";
 
       this.awaitingKeyChunk = true;
@@ -752,7 +774,7 @@ class NvrStreamEngine {
         threads: targetThreads,
         renderer: "auto",
         codec: cfg?.codec_string || "hev1.1.6.L90",
-        workerFrameOutput: "metadata",
+        workerFrameOutput: "planes",
         lowLatency: {
           enabled: true,
           maxInputFrames: 120,

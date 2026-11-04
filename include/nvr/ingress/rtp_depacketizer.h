@@ -64,6 +64,7 @@ private:
     // Access Unit (AU) assembly buffer
     std::vector<uint8_t> au_buffer_;
     bool au_has_data_{false};
+    bool au_has_vcl_{false};
     bool au_is_keyframe_{false};
     uint32_t au_timestamp_{0};
     uint16_t au_seq_num_{0};

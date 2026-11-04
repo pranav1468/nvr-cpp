@@ -1114,7 +1114,7 @@ var init_wasm_worker = __esm({
             ...this.options.threads === void 0 ? {} : { threads: this.options.threads }
           }
         });
-        if (this.options.canvas && this.options.render) {
+        if (this.options.canvas && this.options.render && this.options.workerFrameOutput === "metadata") {
           const offscreen = this.#takeOffscreenCanvas(this.options.canvas);
           if (offscreen) {
             this.canvasTransferred = true;
@@ -1349,6 +1349,11 @@ var init_player = __esm({
       pressureLevel = "normal";
       pendingFrames = [];
       rendering = false;
+      renderTimer = null;
+      baseWallMs = null;
+      basePtsMs = null;
+      lastPtsMs = null;
+      pacedFrameCount = 0;
       renderPromise = Promise.resolve();
       decodedFrames = 0;
       renderedFrames = 0;
@@ -1524,6 +1529,16 @@ var init_player = __esm({
       reset() {
         this.parser.reset();
         this.decoder?.reset();
+        if (this.renderTimer !== null) {
+          clearTimeout(this.renderTimer);
+          this.renderTimer = null;
+        }
+        for (const frame of this.pendingFrames.splice(0))
+          frame.close();
+        this.baseWallMs = null;
+        this.basePtsMs = null;
+        this.lastPtsMs = null;
+        this.pacedFrameCount = 0;
         this.#clearInputQueue("waiting-key", false);
         this.waitingForKeyframe = false;
         this.nextTimestamp = 0;
@@ -1542,6 +1557,9 @@ var init_player = __esm({
         if (this.drainTimer !== null)
           clearTimeout(this.drainTimer);
         this.drainTimer = null;
+        if (this.renderTimer !== null)
+          clearTimeout(this.renderTimer);
+        this.renderTimer = null;
         this.#clearInputQueue("waiting-key", false);
         for (const frame of this.pendingFrames.splice(0))
           frame.close();
@@ -1727,25 +1745,78 @@ var init_player = __esm({
           frame.close();
           return;
         }
-        if (this.options.lowLatency.enabled && this.rendering && this.pendingFrames.length) {
-          const dropped = this.pendingFrames.pop();
-          this.droppedRenderFrames += 1;
-          this.events.emit("drop", {
-            stage: "render",
-            reason: "render-backpressure",
-            timestamp: dropped.timestamp
-          });
-          dropped.close();
+        const nowMs = now();
+        const ptsMs = Number.isFinite(frame.timestamp) && frame.timestamp > 0 ? frame.timestamp / 1000 : null;
+        if (ptsMs === null || this.baseWallMs === null || this.basePtsMs === null || (this.lastPtsMs !== null && Math.abs(ptsMs - this.lastPtsMs) > 5000)) {
+          this.baseWallMs = nowMs;
+          this.basePtsMs = ptsMs ?? 0;
+          this.pacedFrameCount = 0;
+          frame.targetRenderMs = nowMs;
+        } else {
+          this.pacedFrameCount += 1;
+          if (this.pacedFrameCount <= 6) {
+            this.baseWallMs += 12;
+          }
+          let targetMs = this.baseWallMs + (ptsMs - this.basePtsMs);
+          if (nowMs > targetMs) {
+            this.baseWallMs += (nowMs - targetMs) + 8;
+            targetMs = nowMs;
+          }
+          frame.targetRenderMs = targetMs;
         }
+        this.lastPtsMs = ptsMs;
+
+        if (this.pendingFrames.length >= 16) {
+          while (this.pendingFrames.length > 6) {
+            const dropped = this.pendingFrames.shift();
+            this.droppedRenderFrames += 1;
+            dropped.close();
+          }
+          if (this.pendingFrames.length > 0 && Number.isFinite(this.pendingFrames[0].timestamp)) {
+            const headPtsMs = this.pendingFrames[0].timestamp / 1000;
+            this.baseWallMs = nowMs - (headPtsMs - this.basePtsMs);
+            for (const f of this.pendingFrames) {
+              if (Number.isFinite(f.timestamp)) {
+                f.targetRenderMs = this.baseWallMs + ((f.timestamp / 1000) - this.basePtsMs);
+              }
+            }
+          }
+        } else if (this.pendingFrames.length > 8 && this.baseWallMs !== null) {
+          this.baseWallMs -= 2;
+        }
+
         this.pendingFrames.push(frame);
-        if (!this.rendering) {
+        this.#scheduleRender();
+      }
+      #scheduleRender() {
+        if (this.renderTimer !== null || this.rendering || !this.pendingFrames.length || this.state === "closed")
+          return;
+        const nextFrame = this.pendingFrames[0];
+        const delayMs = Math.max(0, (nextFrame.targetRenderMs ?? 0) - now());
+        if (delayMs <= 4) {
           this.renderPromise = this.#drainRender();
+        } else {
+          this.renderTimer = setTimeout(() => {
+            this.renderTimer = null;
+            this.renderPromise = this.#drainRender();
+          }, delayMs);
         }
       }
       async #drainRender() {
+        if (this.rendering || this.state === "closed")
+          return;
         this.rendering = true;
         try {
           while (this.pendingFrames.length) {
+            const nowMs = now();
+            if ((this.pendingFrames[0].targetRenderMs ?? 0) - nowMs > 4) {
+              break;
+            }
+            while (this.pendingFrames.length > 1 && (this.pendingFrames[1].targetRenderMs ?? 0) <= nowMs) {
+              const stale = this.pendingFrames.shift();
+              this.droppedRenderFrames += 1;
+              stale.close();
+            }
             const frame = this.pendingFrames.shift();
             try {
               await this.options.onFrame?.(frame);
@@ -1761,6 +1832,9 @@ var init_player = __esm({
           }
         } finally {
           this.rendering = false;
+          if (this.pendingFrames.length && this.state !== "closed") {
+            this.#scheduleRender();
+          }
         }
       }
       #handleError(error) {
