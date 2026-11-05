@@ -140,29 +140,13 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // Initialize Live View Pipeline with QmlVideoBridge display backend
-    nvr::LiveController::Instance().SetDisplayBackend(
-        std::shared_ptr<nvr::IDisplayBackend>(&nvr::QmlVideoBridge::Instance(), [](nvr::IDisplayBackend*){})
-    );
-    nvr::LiveController::Instance().Configure(config.live);
-    if (config.live.grid_layout == 1) {
-        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::SINGLE);
-    } else if (config.live.grid_layout == 6) {
-        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_6);
-    } else if (config.live.grid_layout == 8) {
-        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_8);
-    } else {
-        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_4);
-    }
-    nvr::LiveController::Instance().Start();
-
     // Start HTTP REST Control Plane
     if (config.api.enabled) {
         nvr::RestServer::Instance().Configure(config.api);
         nvr::RestServer::Instance().Start();
     }
 
-    LOG_INFO << "NVR Recording, Live View, and Control API initialized and operational.";
+    LOG_INFO << "NVR Recording, Camera Ingress, and Control API initialized and operational.";
 
     // Supervisor Telemetry Loop
     int loop_counter = 0;
@@ -194,10 +178,7 @@ int main(int argc, char* argv[]) {
     // 0. Stop HTTP REST Control Plane
     nvr::RestServer::Instance().Stop();
 
-    // 1. Stop Live View Pipeline
-    nvr::LiveController::Instance().Stop();
-
-    // 2. Stop Camera Ingress
+    // 1. Stop Camera Ingress
     nvr::CameraManager::Instance().StopAll();
 
     // 3. Flush and Finalize Recording Segments

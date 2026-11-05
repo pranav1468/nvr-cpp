@@ -389,20 +389,24 @@ public:
         if (width > 0) width_ = width;
         if (height > 0) height_ = height;
 
-        // Probe for Linux V4L2 M2M hardware decoder device (NXP i.MX 95 VPU)
+        // Probe for Linux V4L2 M2M hardware decoder device (NXP i.MX VPU)
         if (codec_ == CodecType::H264 || codec_ == CodecType::H265) {
             if (width_ > 0 && height_ > 0 && ProbeAndSetupVpu()) {
                 LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming active at " << v4l2_device_path_;
-            } else {
+            } else if (!prefer_vpu_) {
+                // Software fallback is strictly restricted to development environments without hardware VPU
                 sw_decoder_.Initialize(codec_);
                 if (width_ == 0 || height_ == 0) {
-                    LOG_INFO << "[VpuVideoDecoder] Deferring VPU queue allocation until camera SPS is parsed ("
+                    LOG_INFO << "[VpuVideoDecoder] Non-hardware development mode, deferring allocation until SPS ("
                              << CodecToString(codec_) << ")";
                 } else {
-                    LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 device not present, active engine: "
+                    LOG_INFO << "[VpuVideoDecoder] Non-hardware development mode, active engine: "
                              << (sw_decoder_.IsAvailable() ? "Software-FFmpeg" : "Aligned-Surface")
                              << " (" << CodecToString(codec_) << ")";
                 }
+            } else {
+                LOG_INFO << "[VpuVideoDecoder] Deferring VPU queue allocation until camera SPS is parsed ("
+                         << CodecToString(codec_) << ")";
             }
         }
 
@@ -463,10 +467,12 @@ public:
                 LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 VPU streaming dynamically activated at "
                          << v4l2_device_path_ << " (" << CodecToString(codec_) << ")";
             } else if (!is_hardware_) {
-                sw_decoder_.Close();
-                if (!sw_decoder_.Initialize(codec_)) {
-                    LOG_ERROR << "[PIPELINE][DECODER][SW_INIT_FAILED] Software decoder initialization "
-                              << "failed after codec change. codec=" << CodecToString(codec_);
+                if (!prefer_vpu_) {
+                    sw_decoder_.Close();
+                    if (!sw_decoder_.Initialize(codec_)) {
+                        LOG_ERROR << "[PIPELINE][DECODER][SW_INIT_FAILED] Software decoder initialization "
+                                  << "failed after codec change. codec=" << CodecToString(codec_);
+                    }
                 }
             }
         }
@@ -487,24 +493,21 @@ public:
             if (res == V4l2DecodeResult::FRAME_READY) {
                 return true;
             }
+            out_frame.reset();
             if (res == V4l2DecodeResult::FRAME_PENDING) {
-                out_frame.reset();
                 last_decode_error_ = false;
                 return false;
             }
             if (res == V4l2DecodeResult::HARDWARE_FATAL) {
-                out_frame.reset();
                 HandleHardwareFatal();
                 last_decode_error_ = true;
-                // Never software-decode this packet: hardware already accepted it
                 return false;
             }
-            // res == V4l2DecodeResult::INPUT_REJECTED:
-            // Hardware did not accept this packet. Fall through to software decoder.
+            return false;
         }
 
-        // 2. Dynamic software decoding path
-        if (sw_decoder_.IsAvailable()) {
+        // 2. Dynamic software decoding path (strictly disabled in hardware VPU mode)
+        if (!prefer_vpu_ && sw_decoder_.IsAvailable()) {
             if (software_awaiting_keyframe_) {
                 std::vector<uint8_t> recovery_data;
 
@@ -1211,7 +1214,7 @@ private:
     }
 
     void HandleHardwareFatal() {
-        LOG_ERROR << "[PIPELINE][DECODER][RECOVERY] Hardware V4L2 decoder fatal error; tearing down hardware and falling back to software"
+        LOG_ERROR << "[PIPELINE][DECODER][RECOVERY] Hardware V4L2 decoder error; resetting hardware session"
                   << " codec=" << CodecToString(codec_)
                   << " device=" << v4l2_device_path_;
         CleanupV4l2Buffers();
@@ -1223,7 +1226,7 @@ private:
         }
         is_hardware_ = false;
         software_awaiting_keyframe_ = true;
-        if (!sw_decoder_.IsAvailable() && codec_ != CodecType::UNKNOWN) {
+        if (!prefer_vpu_ && !sw_decoder_.IsAvailable() && codec_ != CodecType::UNKNOWN) {
             sw_decoder_.Initialize(codec_);
         }
     }
