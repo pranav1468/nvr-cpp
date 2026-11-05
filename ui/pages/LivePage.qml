@@ -27,7 +27,6 @@ Item {
             root.layoutMode = root.prevLayoutMode || "4";
             var cnt = (root.layoutMode === "7plus1" || root.layoutMode === "8") ? 8 : (root.layoutMode === "1" ? 1 : 4);
             ApiClient.setLayout(cnt);
-            ApiClient.exitFullscreen();
         } else {
             root.prevLayoutMode = root.layoutMode;
             root.fullscreenChannel = ch;
@@ -51,7 +50,6 @@ Item {
             root.layoutMode = mode;
             var cnt = (mode === "7plus1" || mode === "8") ? 8 : 4;
             ApiClient.setLayout(cnt);
-            ApiClient.exitFullscreen();
         }
     }
 

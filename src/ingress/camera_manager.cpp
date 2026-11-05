@@ -446,7 +446,10 @@ void CameraManager::StopAll() {
 bool CameraManager::IsCameraOnline(int channel_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = cameras_.find(channel_id);
-    return (it != cameras_.end() && it->second.main_session && it->second.main_session->IsConnected());
+    if (it == cameras_.end()) return false;
+    bool main_ok = (it->second.main_session && it->second.main_session->IsConnected());
+    bool sub_ok = (it->second.sub_session && it->second.sub_session->IsConnected());
+    return main_ok || sub_ok;
 }
 
 bool CameraManager::IsSubStreamOnline(int channel_id) const {

@@ -85,6 +85,20 @@ bool LiveController::SetLayout(LiveGridLayout layout) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (fullscreen_channel_id_ != -1) {
             old_fs = std::move(fullscreen_pipeline_);
+            if (old_fs) {
+                DecodedFramePtr fs_frame;
+                {
+                    std::lock_guard<std::mutex> f_lock(old_fs->frame_mutex);
+                    fs_frame = old_fs->last_rendered_frame;
+                }
+                if (fs_frame) {
+                    auto sub_it = pipelines_.find(fullscreen_channel_id_);
+                    if (sub_it != pipelines_.end() && sub_it->second) {
+                        std::lock_guard<std::mutex> f_lock(sub_it->second->frame_mutex);
+                        sub_it->second->last_rendered_frame = fs_frame;
+                    }
+                }
+            }
             fullscreen_channel_id_ = -1;
         }
 
@@ -142,6 +156,20 @@ bool LiveController::SetCustomGrid(int cols, int rows, const std::vector<int>& c
         std::lock_guard<std::mutex> lock(mutex_);
         if (fullscreen_channel_id_ != -1) {
             old_fs = std::move(fullscreen_pipeline_);
+            if (old_fs) {
+                DecodedFramePtr fs_frame;
+                {
+                    std::lock_guard<std::mutex> f_lock(old_fs->frame_mutex);
+                    fs_frame = old_fs->last_rendered_frame;
+                }
+                if (fs_frame) {
+                    auto sub_it = pipelines_.find(fullscreen_channel_id_);
+                    if (sub_it != pipelines_.end() && sub_it->second) {
+                        std::lock_guard<std::mutex> f_lock(sub_it->second->frame_mutex);
+                        sub_it->second->last_rendered_frame = fs_frame;
+                    }
+                }
+            }
             fullscreen_channel_id_ = -1;
         }
 
@@ -182,6 +210,20 @@ bool LiveController::SetTileLayout(const std::vector<TileConfig>& tiles) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (fullscreen_channel_id_ != -1) {
             old_fs = std::move(fullscreen_pipeline_);
+            if (old_fs) {
+                DecodedFramePtr fs_frame;
+                {
+                    std::lock_guard<std::mutex> f_lock(old_fs->frame_mutex);
+                    fs_frame = old_fs->last_rendered_frame;
+                }
+                if (fs_frame) {
+                    auto sub_it = pipelines_.find(fullscreen_channel_id_);
+                    if (sub_it != pipelines_.end() && sub_it->second) {
+                        std::lock_guard<std::mutex> f_lock(sub_it->second->frame_mutex);
+                        sub_it->second->last_rendered_frame = fs_frame;
+                    }
+                }
+            }
             fullscreen_channel_id_ = -1;
         }
 
@@ -399,13 +441,8 @@ bool LiveController::SetFullscreen(int channel_id) {
         TeardownPipeline(old_fs_pipe);
     }
 
-    bool already_online = CameraManager::Instance().IsCameraOnline(channel_id);
-    if (already_online) {
-        LOG_INFO << "[LiveController] Reusing existing active MAIN session for channel " << channel_id << " fullscreen";
-    } else {
-        LOG_INFO << "[LiveController] Activating on-demand MAIN session for channel " << channel_id << " fullscreen";
-        CameraManager::Instance().EnsureMainStream(channel_id);
-    }
+    LOG_INFO << "[LiveController] Ensuring MAIN session for channel " << channel_id << " fullscreen";
+    CameraManager::Instance().EnsureMainStream(channel_id);
 
     auto fs_pipe = std::make_shared<ChannelPipeline>();
     fs_pipe->channel_id = channel_id;
@@ -415,7 +452,7 @@ bool LiveController::SetFullscreen(int channel_id) {
     fs_pipe->active = true;
     fs_pipe->paused = false;
     fs_pipe->awaiting_keyframe = true;
-    fs_pipe->max_packet_depth = std::max<size_t>(4, config_.max_queue_depth * 3);
+    fs_pipe->max_packet_depth = std::max<size_t>(2, config_.max_queue_depth);
     {
         TileTarget tt;
         tt.tile_index = 0;
@@ -502,6 +539,20 @@ bool LiveController::ExitFullscreen() {
         }
 
         old_fs_pipe = std::move(fullscreen_pipeline_);
+        if (old_fs_pipe) {
+            DecodedFramePtr fs_frame;
+            {
+                std::lock_guard<std::mutex> f_lock(old_fs_pipe->frame_mutex);
+                fs_frame = old_fs_pipe->last_rendered_frame;
+            }
+            if (fs_frame) {
+                auto sub_it = pipelines_.find(fullscreen_channel_id_);
+                if (sub_it != pipelines_.end() && sub_it->second) {
+                    std::lock_guard<std::mutex> f_lock(sub_it->second->frame_mutex);
+                    sub_it->second->last_rendered_frame = fs_frame;
+                }
+            }
+        }
         fullscreen_channel_id_ = -1;
         current_layout_ = previous_layout_;
     }
@@ -759,27 +810,16 @@ void LiveController::ReconcilePipelines(const std::vector<TileConfig>& desired_t
         bool was_paused = pipe->paused.exchange(false);
         if (was_paused) {
             pipe->awaiting_keyframe.store(true);
-        }
-
-        std::vector<int> old_indices;
-        {
-            std::lock_guard<std::mutex> t_lock(pipe->targets_mutex);
-            for (const auto& t : pipe->targets) {
-                old_indices.push_back(t.tile_index);
-            }
+            pipe->packet_cv.notify_all();
         }
 
         std::vector<TileTarget> new_targets;
-        std::vector<int> newly_assigned_tiles;
         for (const auto& dt : d_tiles) {
             TileTarget tt;
             tt.tile_index = dt.tile_index;
             tt.target_w = dt.target_w;
             tt.target_h = dt.target_h;
             new_targets.push_back(std::move(tt));
-            if (std::find(old_indices.begin(), old_indices.end(), dt.tile_index) == old_indices.end()) {
-                newly_assigned_tiles.push_back(dt.tile_index);
-            }
         }
 
         {
@@ -787,7 +827,7 @@ void LiveController::ReconcilePipelines(const std::vector<TileConfig>& desired_t
             pipe->targets = std::move(new_targets);
         }
 
-        // Instant Continuity: seed newly assigned or unpaused tiles immediately with the channel's current frame
+        // Instant Continuity: seed all assigned tiles immediately with the channel's current frame
         if (backend) {
             DecodedFramePtr seed_frame;
             {
@@ -795,14 +835,8 @@ void LiveController::ReconcilePipelines(const std::vector<TileConfig>& desired_t
                 seed_frame = pipe->last_rendered_frame;
             }
             if (seed_frame) {
-                if (was_paused) {
-                    for (const auto& dt : d_tiles) {
-                        backend->RenderTile(dt.tile_index, pipe->channel_id, seed_frame);
-                    }
-                } else {
-                    for (int new_tidx : newly_assigned_tiles) {
-                        backend->RenderTile(new_tidx, pipe->channel_id, seed_frame);
-                    }
+                for (const auto& dt : d_tiles) {
+                    backend->RenderTile(dt.tile_index, pipe->channel_id, seed_frame);
                 }
             }
         }
@@ -853,7 +887,7 @@ void LiveController::StartChannelPipelineMulti(int channel_id, StreamType stream
     pipe->active = true;
     pipe->paused = false;
     pipe->awaiting_keyframe = true;
-    pipe->max_packet_depth = std::max<size_t>(4, config_.max_queue_depth * 3);
+    pipe->max_packet_depth = std::max<size_t>(2, config_.max_queue_depth);
 
     for (const auto& t : targets) {
         TileTarget tt;

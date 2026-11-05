@@ -874,6 +874,61 @@ private:
                 return V4l2DecodeResult::FRAME_PENDING;
             }
 
+            int64_t cap_pts = static_cast<int64_t>(dq_cap.timestamp.tv_sec) * 1000000LL + dq_cap.timestamp.tv_usec;
+
+            // Drain any additional ready capture buffers so we always render the freshest frame
+            // and eliminate VPU capture ring backlog latency.
+            if (v4l2_fd_ != 999) {
+                while (true) {
+                    struct v4l2_buffer next_cap{};
+                    next_cap.type = capture_buf_type_;
+                    next_cap.memory = V4L2_MEMORY_MMAP;
+                    struct v4l2_plane next_planes[1]{};
+                    if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                        next_cap.m.planes = next_planes;
+                        next_cap.length = 1;
+                    }
+                    int next_ret = Ioctl(v4l2_fd_, VIDIOC_DQBUF, &next_cap);
+                    if (next_ret != 0 || next_cap.index >= capture_buffers_.size()) {
+                        break;
+                    }
+                    uint32_t next_idx = next_cap.index;
+                    capture_buffers_[next_idx].queued = false;
+
+                    uint32_t next_bytes = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+                        ? next_cap.m.planes[0].bytesused : next_cap.bytesused;
+#ifdef V4L2_BUF_FLAG_LAST
+                    bool next_last = (next_cap.flags & V4L2_BUF_FLAG_LAST) != 0;
+#else
+                    bool next_last = false;
+#endif
+                    if (next_last || next_bytes == 0) {
+                        struct v4l2_event ev{};
+                        while (Ioctl(v4l2_fd_, VIDIOC_DQEVENT, &ev) == 0) {}
+                        ReconfigureV4l2CaptureQueue();
+                        reconfigured_out = true;
+                        return V4l2DecodeResult::FRAME_PENDING;
+                    }
+
+                    struct v4l2_buffer old_q{};
+                    old_q.type = capture_buf_type_;
+                    old_q.memory = V4L2_MEMORY_MMAP;
+                    old_q.index = cap_idx;
+                    struct v4l2_plane old_q_planes[1]{};
+                    if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                        old_q_planes[0].length = capture_buffers_[cap_idx].length;
+                        old_q.m.planes = old_q_planes;
+                        old_q.length = 1;
+                    }
+                    if (Ioctl(v4l2_fd_, VIDIOC_QBUF, &old_q) == 0) {
+                        capture_buffers_[cap_idx].queued = true;
+                    }
+
+                    cap_idx = next_idx;
+                    cap_pts = static_cast<int64_t>(next_cap.timestamp.tv_sec) * 1000000LL + next_cap.timestamp.tv_usec;
+                }
+            }
+
             uint32_t frame_w = (width_ > 0) ? width_ : negotiated_width_;
             uint32_t frame_h = (height_ > 0) ? height_ : negotiated_height_;
             frame_w = (frame_w & ~1U);
@@ -885,7 +940,6 @@ private:
             out_frame->stride = dst_stride;
             out_frame->dmabuf_fd = -1;
 
-            int64_t cap_pts = static_cast<int64_t>(dq_cap.timestamp.tv_sec) * 1000000LL + dq_cap.timestamp.tv_usec;
             if (cap_pts > 0) {
                 out_frame->pts_us = cap_pts;
             }
