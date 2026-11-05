@@ -813,7 +813,7 @@ bool StreamSession::SendRtspDescribe() {
         }
     );
 
-    if (has_audio_track_ && audio_codec_ != CodecType::UNKNOWN) {
+    if (stream_type_ == StreamType::MAIN && has_audio_track_ && audio_codec_ != CodecType::UNKNOWN) {
         audio_transcoder_ = std::make_unique<AudioTranscoder>(
             channel_id_, stream_type_,
             [](const MediaPacketPtr& pkt) {
@@ -843,7 +843,7 @@ bool StreamSession::SendRtspDescribe() {
         return false;
     }
 
-    if (has_audio_track_ && !audio_track_control_.empty() && audio_codec_ != CodecType::UNKNOWN) {
+    if (stream_type_ == StreamType::MAIN && has_audio_track_ && !audio_track_control_.empty() && audio_codec_ != CodecType::UNKNOWN) {
         if (!SendRtspSetup(audio_track_control_, 2, 3)) {
             LOG_WARN << "[Channel " << channel_id_ << "] Audio track SETUP failed, continuing video-only";
         }

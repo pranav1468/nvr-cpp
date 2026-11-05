@@ -102,7 +102,6 @@ public:
                     holder
                 );
             } else if (frame->format == nvr::PixelFormat::NV12) {
-                // Fast integer fixed-point YUV->RGB32 conversion for desktop fallback without G2D
                 int w = frame->width;
                 int h = frame->height;
                 int stride = frame->stride > 0 ? frame->stride : w;
@@ -110,34 +109,62 @@ public:
                 if (frame->data.size() < min_req) {
                     return get_fallback();
                 }
+
+                bool is_fs = nvr::LiveController::Instance().IsFullscreen() ||
+                             (nvr::LiveController::Instance().GetCurrentLayout() == nvr::LiveGridLayout::SINGLE);
+                int scale = (!is_fs && w >= 960) ? 2 : ((is_fs && w > 1280) ? 2 : 1);
+                int out_w = w / scale;
+                int out_h = h / scale;
+                if (size) *size = QSize(out_w, out_h);
+
                 const uint8_t* y_plane = frame->data.data();
                 const uint8_t* uv_plane = y_plane + (static_cast<size_t>(stride) * h);
-                QImage qimg(w, h, QImage::Format_RGB32);
+                QImage qimg(out_w, out_h, QImage::Format_RGB32);
 
-                for (int y = 0; y < h; ++y) {
-                    uint32_t* scanline = reinterpret_cast<uint32_t*>(qimg.scanLine(y));
-                    const uint8_t* y_row = y_plane + (static_cast<size_t>(y) * stride);
-                    const uint8_t* uv_row = uv_plane + (static_cast<size_t>(y >> 1) * stride);
-                    for (int x = 0; x < w; x += 2) {
-                        int u_val = uv_row[x] - 128;
-                        int v_val = uv_row[x + 1] - 128;
+                if (scale == 2) {
+                    for (int y = 0; y < out_h; ++y) {
+                        uint32_t* scanline = reinterpret_cast<uint32_t*>(qimg.scanLine(y));
+                        const uint8_t* y_row = y_plane + (static_cast<size_t>(y * 2) * stride);
+                        const uint8_t* uv_row = uv_plane + (static_cast<size_t>(y) * stride);
+                        for (int x = 0; x < out_w; ++x) {
+                            int src_x = x * 2;
+                            int y0 = y_row[src_x];
+                            int u_val = uv_row[src_x] - 128;
+                            int v_val = uv_row[src_x + 1] - 128;
 
-                        int ruv = (1436 * v_val) >> 10;
-                        int guv = (352 * u_val + 731 * v_val) >> 10;
-                        int buv = (1815 * u_val) >> 10;
+                            int r = std::clamp(y0 + ((1436 * v_val) >> 10), 0, 255);
+                            int g = std::clamp(y0 - ((352 * u_val + 731 * v_val) >> 10), 0, 255);
+                            int b = std::clamp(y0 + ((1815 * u_val) >> 10), 0, 255);
+                            scanline[x] = 0xff000000u | (static_cast<uint32_t>(r) << 16) |
+                                          (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
+                        }
+                    }
+                } else {
+                    for (int y = 0; y < h; ++y) {
+                        uint32_t* scanline = reinterpret_cast<uint32_t*>(qimg.scanLine(y));
+                        const uint8_t* y_row = y_plane + (static_cast<size_t>(y) * stride);
+                        const uint8_t* uv_row = uv_plane + (static_cast<size_t>(y >> 1) * stride);
+                        for (int x = 0; x < w; x += 2) {
+                            int u_val = uv_row[x] - 128;
+                            int v_val = uv_row[x + 1] - 128;
 
-                        int y0 = y_row[x];
-                        int r0 = std::clamp(y0 + ruv, 0, 255);
-                        int g0 = std::clamp(y0 - guv, 0, 255);
-                        int b0 = std::clamp(y0 + buv, 0, 255);
-                        scanline[x] = 0xff000000u | (static_cast<uint32_t>(r0) << 16) | (static_cast<uint32_t>(g0) << 8) | static_cast<uint32_t>(b0);
+                            int ruv = (1436 * v_val) >> 10;
+                            int guv = (352 * u_val + 731 * v_val) >> 10;
+                            int buv = (1815 * u_val) >> 10;
 
-                        if (x + 1 < w) {
-                            int y1 = y_row[x + 1];
-                            int r1 = std::clamp(y1 + ruv, 0, 255);
-                            int g1 = std::clamp(y1 - guv, 0, 255);
-                            int b1 = std::clamp(y1 + buv, 0, 255);
-                            scanline[x + 1] = 0xff000000u | (static_cast<uint32_t>(r1) << 16) | (static_cast<uint32_t>(g1) << 8) | static_cast<uint32_t>(b1);
+                            int y0 = y_row[x];
+                            int r0 = std::clamp(y0 + ruv, 0, 255);
+                            int g0 = std::clamp(y0 - guv, 0, 255);
+                            int b0 = std::clamp(y0 + buv, 0, 255);
+                            scanline[x] = 0xff000000u | (static_cast<uint32_t>(r0) << 16) | (static_cast<uint32_t>(g0) << 8) | static_cast<uint32_t>(b0);
+
+                            if (x + 1 < w) {
+                                int y1 = y_row[x + 1];
+                                int r1 = std::clamp(y1 + ruv, 0, 255);
+                                int g1 = std::clamp(y1 - guv, 0, 255);
+                                int b1 = std::clamp(y1 + buv, 0, 255);
+                                scanline[x + 1] = 0xff000000u | (static_cast<uint32_t>(r1) << 16) | (static_cast<uint32_t>(g1) << 8) | static_cast<uint32_t>(b1);
+                            }
                         }
                     }
                 }
@@ -262,7 +289,6 @@ int main(int argc, char *argv[]) {
         if (cam.enabled) {
             nvr::RecordingScheduler::Instance().StartChannelRecording(cam.id, cam.record_mode);
             nvr::CameraManager::Instance().StartCamera(cam.id);
-            nvr::CameraManager::Instance().StartSubStream(cam.id);
         }
     }
 
@@ -271,15 +297,7 @@ int main(int argc, char *argv[]) {
         std::shared_ptr<nvr::IDisplayBackend>(&nvr::QmlVideoBridge::Instance(), [](nvr::IDisplayBackend*){})
     );
     nvr::LiveController::Instance().Configure(config.live);
-    if (config.live.grid_layout == 1) {
-        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::SINGLE);
-    } else if (config.live.grid_layout == 6) {
-        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_6);
-    } else if (config.live.grid_layout == 8) {
-        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_8);
-    } else {
-        nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_4);
-    }
+    nvr::LiveController::Instance().SetLayout(nvr::LiveGridLayout::GRID_4);
     nvr::LiveController::Instance().Start();
 
     if (config.api.enabled) {
@@ -298,37 +316,43 @@ int main(int argc, char *argv[]) {
         liveBridge.insert(QString("online%1").arg(i), nvr::CameraManager::Instance().IsCameraOnline(i + 1));
     }
 
-    // 20ms UI batching pump (50 Hz) ensures worker threads never flood the Qt event queue
+    // 40ms UI batching pump (25 Hz) ensures worker threads never flood the Qt event queue
     QTimer uiPump;
     uiPump.setTimerType(Qt::CoarseTimer);
-    uiPump.setInterval(20);
-    QObject::connect(&uiPump, &QTimer::timeout, [&liveBridge]() {
+    uiPump.setInterval(40);
+    uint64_t pumpTick = 0;
+    QObject::connect(&uiPump, &QTimer::timeout, [&liveBridge, &pumpTick]() {
+        ++pumpTick;
+        bool checkOnline = (pumpTick % 12 == 0);
         for (int i = 0; i < 8; ++i) {
             uint64_t rev = nvr::QmlVideoBridge::Instance().GetTileRevision(i);
             QString revKey = QString("rev%1").arg(i);
-            if (liveBridge.value(revKey).toULongLong() != rev) {
+            bool revChanged = (liveBridge.value(revKey).toULongLong() != rev);
+            if (revChanged) {
                 liveBridge.insert(revKey, QVariant::fromValue<qulonglong>(rev));
+
+                auto frame = nvr::QmlVideoBridge::Instance().GetTileFrame(i);
+                if (frame && frame->height > 0) {
+                    QString prefix = (frame->stream_type == nvr::StreamType::MAIN) ? "MAIN" : "SUB";
+                    QString resStr;
+                    if (frame->height >= 2160) resStr = prefix + " 4K";
+                    else if (frame->height >= 1440) resStr = prefix + " 2K";
+                    else resStr = QString("%1 %2p").arg(prefix).arg(frame->height);
+
+                    QString resKey = QString("res%1").arg(i);
+                    if (liveBridge.value(resKey).toString() != resStr) {
+                        liveBridge.insert(resKey, resStr);
+                    }
+                }
             }
 
-            int ch = nvr::QmlVideoBridge::Instance().GetTileChannelId(i);
-            if (ch <= 0) ch = i + 1;
-            bool online = nvr::CameraManager::Instance().IsCameraOnline(ch);
-            QString onKey = QString("online%1").arg(i);
-            if (liveBridge.value(onKey).toBool() != online) {
-                liveBridge.insert(onKey, online);
-            }
-
-            auto frame = nvr::QmlVideoBridge::Instance().GetTileFrame(i);
-            if (frame && frame->height > 0) {
-                QString prefix = (frame->stream_type == nvr::StreamType::MAIN) ? "MAIN" : "SUB";
-                QString resStr;
-                if (frame->height >= 2160) resStr = prefix + " 4K";
-                else if (frame->height >= 1440) resStr = prefix + " 2K";
-                else resStr = QString("%1 %2p").arg(prefix).arg(frame->height);
-
-                QString resKey = QString("res%1").arg(i);
-                if (liveBridge.value(resKey).toString() != resStr) {
-                    liveBridge.insert(resKey, resStr);
+            if (checkOnline || revChanged) {
+                int ch = nvr::QmlVideoBridge::Instance().GetTileChannelId(i);
+                if (ch <= 0) ch = i + 1;
+                bool online = nvr::CameraManager::Instance().IsCameraOnline(ch);
+                QString onKey = QString("online%1").arg(i);
+                if (liveBridge.value(onKey).toBool() != online) {
+                    liveBridge.insert(onKey, online);
                 }
             }
         }

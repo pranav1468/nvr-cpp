@@ -48,10 +48,6 @@ private:
     uint32_t cached_width_{0};
     uint32_t cached_height_{0};
     bool has_audio_configured_{false};
-
-    // Dedicated keyframe decoder for background companion snapshots
-    VideoDecoderPtr thumbnail_decoder_;
-    DecodedFramePtr latest_segment_thumbnail_;
 };
 
 } // namespace nvr

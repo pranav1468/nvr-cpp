@@ -10,12 +10,12 @@ namespace nvr {
 
 namespace {
 
-inline void CaptureSegmentThumbnail(int channel_id, SegmentMetadata& meta, const DecodedFramePtr& keyframe = nullptr) {
+inline void CaptureSegmentThumbnail(int channel_id, SegmentMetadata& meta) {
     if (meta.file_path.size() <= 4) return;
-    auto frame = keyframe ? keyframe : LiveController::Instance().GetLatestFrame(channel_id);
+    auto frame = LiveController::Instance().GetLatestFrame(channel_id);
     if (frame && !frame->data.empty() && frame->width > 0 && frame->height > 0) {
         std::string thumb_path = meta.file_path.substr(0, meta.file_path.size() - 4) + ".jpg";
-        if (SaveFrameToJpeg(frame, thumb_path, 80)) {
+        if (SaveFrameToJpeg(frame, thumb_path, 75, 320)) {
             meta.thumbnail_path = thumb_path;
             LOG_DEBUG << "[Channel " << channel_id << "] Saved companion thumbnail: " << thumb_path;
         }
@@ -111,14 +111,6 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
             is_recording_ = true;
             waiting_for_first_keyframe_ = false;
             InjectCachedParameterSets();
-
-            // Decode initial keyframe for companion thumbnail
-            if (!thumbnail_decoder_ && cached_codec_ != CodecType::UNKNOWN) {
-                thumbnail_decoder_ = VideoDecoderFactory::Create(cached_codec_, cached_width_, cached_height_, false);
-            }
-            if (thumbnail_decoder_) {
-                thumbnail_decoder_->Decode(packet, latest_segment_thumbnail_);
-            }
         } else {
             return;
         }
@@ -163,10 +155,9 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
                  << (2 * segment_duration_ms_) << " ms ceiling). Force-finalizing segment.";
         SegmentMetadata meta;
         if (writer_.FinalizeSegment(meta)) {
-            CaptureSegmentThumbnail(channel_id_, meta, latest_segment_thumbnail_);
+            CaptureSegmentThumbnail(channel_id_, meta);
             IndexSegmentInDatabase(channel_id_, meta);
         }
-        latest_segment_thumbnail_.reset();
         waiting_for_first_keyframe_ = true;
         is_recording_ = false;
         return;
@@ -178,25 +169,15 @@ void Segmenter::PushPacket(const MediaPacketPtr& packet) {
 void Segmenter::RotateSegment(const MediaPacketPtr& next_keyframe_packet) {
     SegmentMetadata meta;
     if (writer_.FinalizeSegment(meta)) {
-        CaptureSegmentThumbnail(channel_id_, meta, latest_segment_thumbnail_);
+        CaptureSegmentThumbnail(channel_id_, meta);
         IndexSegmentInDatabase(channel_id_, meta);
     }
-    latest_segment_thumbnail_.reset();
 
     // Immediately start new segment with the incoming keyframe
     int64_t now_ms = (next_keyframe_packet->wall_time_ms > 0) ? 
                      next_keyframe_packet->wall_time_ms : time_utils::WallTimeMs();
     if (writer_.StartSegment(now_ms)) {
         InjectCachedParameterSets();
-
-        // Decode incoming keyframe for next companion thumbnail
-        if (!thumbnail_decoder_ && cached_codec_ != CodecType::UNKNOWN) {
-            thumbnail_decoder_ = VideoDecoderFactory::Create(cached_codec_, cached_width_, cached_height_, false);
-        }
-        if (thumbnail_decoder_ && next_keyframe_packet) {
-            thumbnail_decoder_->Decode(next_keyframe_packet, latest_segment_thumbnail_);
-        }
-
         writer_.WritePacket(next_keyframe_packet);
     } else {
         waiting_for_first_keyframe_ = true;
@@ -209,10 +190,9 @@ void Segmenter::FlushAndStop() {
     if (is_recording_) {
         SegmentMetadata meta;
         if (writer_.FinalizeSegment(meta)) {
-            CaptureSegmentThumbnail(channel_id_, meta, latest_segment_thumbnail_);
+            CaptureSegmentThumbnail(channel_id_, meta);
             IndexSegmentInDatabase(channel_id_, meta);
         }
-        latest_segment_thumbnail_.reset();
         is_recording_ = false;
         waiting_for_first_keyframe_ = true;
         LOG_INFO << "[Channel " << channel_id_ << "] Flushed and stopped segmenter";

@@ -87,7 +87,7 @@ Rectangle {
             anchors.fill: parent
             fillMode: Image.PreserveAspectFit
             cache: false
-            asynchronous: true
+            asynchronous: false
             source: (root.isOnline && root.frameRevision > 0 && !hwSurfaceLoader.active) ? "image://live/" + root.tileIndex + "/" + root.frameRevision : ""
             visible: root.isOnline && root.frameRevision > 0 && !hwSurfaceLoader.active
         }

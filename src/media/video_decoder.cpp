@@ -12,6 +12,7 @@
 #include <linux/videodev2.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <poll.h>
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -35,7 +36,8 @@ bool CopyNv12Frame(
     uint32_t src_stride,
     uint32_t dst_stride,
     uint8_t* dst,
-    size_t dst_size)
+    size_t dst_size,
+    uint32_t src_aligned_height = 0)
 {
     if (!src || !dst || width == 0 || height == 0 ||
         (width & 1) != 0 || (height & 1) != 0 ||
@@ -43,11 +45,17 @@ bool CopyNv12Frame(
         return false;
     }
 
-    uint64_t total_rows = static_cast<uint64_t>(height) + (height / 2);
-    if (src_size < static_cast<uint64_t>(src_stride) * total_rows) {
-        return false;
+    uint32_t uv_offset_rows = (src_aligned_height >= height) ? src_aligned_height : height;
+    uint64_t min_src_rows = static_cast<uint64_t>(uv_offset_rows) + (height / 2);
+    uint64_t total_dst_rows = static_cast<uint64_t>(height) + (height / 2);
+    if (src_size < static_cast<uint64_t>(src_stride) * min_src_rows) {
+        if (src_size >= static_cast<uint64_t>(src_stride) * total_dst_rows) {
+            uv_offset_rows = height;
+        } else {
+            return false;
+        }
     }
-    if (dst_size < static_cast<uint64_t>(dst_stride) * total_rows) {
+    if (dst_size < static_cast<uint64_t>(dst_stride) * total_dst_rows) {
         return false;
     }
 
@@ -59,7 +67,7 @@ bool CopyNv12Frame(
     }
 
     // Copy interleaved UV plane row-by-row
-    const uint8_t* src_uv = src + static_cast<size_t>(height) * src_stride;
+    const uint8_t* src_uv = src + static_cast<size_t>(uv_offset_rows) * src_stride;
     uint8_t* dst_uv = dst + static_cast<size_t>(height) * dst_stride;
     uint32_t uv_rows = height / 2;
     for (uint32_t r = 0; r < uv_rows; ++r) {
@@ -681,25 +689,8 @@ private:
         HARDWARE_FATAL
     };
 
-    V4l2DecodeResult DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
-        uint32_t frame_w = (width_ > 0) ? width_ : negotiated_width_;
-        uint32_t frame_h = (height_ > 0) ? height_ : negotiated_height_;
-        if (frame_w == 0 || frame_h == 0) {
-            return V4l2DecodeResult::INPUT_REJECTED;
-        }
-        frame_w = (frame_w & ~1U);
-        frame_h = (frame_h & ~1U);
-        uint32_t dst_stride = (frame_w + 63) & ~size_t(63);
-        uint32_t src_stride = (negotiated_stride_ > 0) ? negotiated_stride_ : dst_stride;
-
-        int out_idx = -1;
-        for (size_t i = 0; i < output_buffers_.size(); ++i) {
-            if (!output_buffers_[i].queued) {
-                out_idx = static_cast<int>(i);
-                break;
-            }
-        }
-        if (out_idx < 0) {
+    void DrainCompletedOutputBuffers() {
+        while (v4l2_fd_ >= 0 && output_streaming_) {
             struct v4l2_buffer dq{};
             dq.type = output_buf_type_;
             dq.memory = V4L2_MEMORY_MMAP;
@@ -710,53 +701,150 @@ private:
             }
             if (Ioctl(v4l2_fd_, VIDIOC_DQBUF, &dq) == 0 && dq.index < output_buffers_.size()) {
                 output_buffers_[dq.index].queued = false;
-                out_idx = dq.index;
+            } else {
+                break;
             }
         }
+    }
 
-        if (out_idx < 0 || !output_buffers_[out_idx].start) {
-            return V4l2DecodeResult::INPUT_REJECTED;
+    bool ReconfigureV4l2CaptureQueue() {
+        if (v4l2_fd_ < 0) return false;
+
+        if (capture_streaming_) {
+            Ioctl(v4l2_fd_, VIDIOC_STREAMOFF, &capture_buf_type_);
+            capture_streaming_ = false;
         }
 
-        std::vector<uint8_t> hw_combined;
-        const uint8_t* src_ptr = packet->data.data();
-        size_t copy_bytes = packet->data.size();
-        if (packet->is_keyframe && !packet->HasParameterSets() &&
-            PrepareSoftwareRecoveryPacket(packet, hw_combined)) {
-            src_ptr = hw_combined.data();
-            copy_bytes = hw_combined.size();
+        for (auto& b : capture_buffers_) {
+            if (b.dmabuf_fd >= 0) {
+                close(b.dmabuf_fd);
+                b.dmabuf_fd = -1;
+            }
+            if (b.start && b.start != MAP_FAILED) {
+                if (v4l2_fd_ != 999) {
+                    munmap(b.start, b.length);
+                }
+                b.start = nullptr;
+            }
+        }
+        capture_buffers_.clear();
+
+        struct v4l2_requestbuffers req_zero{};
+        req_zero.count = 0;
+        req_zero.memory = V4L2_MEMORY_MMAP;
+        req_zero.type = capture_buf_type_;
+        Ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_zero);
+
+        struct v4l2_format gfmt_cap{};
+        gfmt_cap.type = capture_buf_type_;
+        if (Ioctl(v4l2_fd_, VIDIOC_G_FMT, &gfmt_cap) == 0) {
+            uint32_t nw = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+                ? gfmt_cap.fmt.pix_mp.width : gfmt_cap.fmt.pix.width;
+            uint32_t nh = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+                ? gfmt_cap.fmt.pix_mp.height : gfmt_cap.fmt.pix.height;
+            uint32_t nstride = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+                ? gfmt_cap.fmt.pix_mp.plane_fmt[0].bytesperline : gfmt_cap.fmt.pix.bytesperline;
+            if (nw > 0 && nh > 0) {
+                negotiated_width_ = nw;
+                negotiated_height_ = nh;
+                if (width_ == 0) width_ = nw;
+                if (height_ == 0) height_ = nh;
+            }
+            if (nstride > 0) {
+                negotiated_stride_ = nstride;
+            }
+            Ioctl(v4l2_fd_, VIDIOC_S_FMT, &gfmt_cap);
         }
 
-        // Reject oversized compressed packets; never silently truncate encoded video
-        if (copy_bytes > output_buffers_[out_idx].length) {
-            LOG_WARN << "[VpuVideoDecoder] Rejecting oversized compressed packet (" 
-                     << copy_bytes << " bytes > buffer limit " 
-                     << output_buffers_[out_idx].length << " bytes)";
-            return V4l2DecodeResult::INPUT_REJECTED;
+        uint32_t req_count = 6;
+#ifdef V4L2_CID_MIN_BUFFERS_FOR_CAPTURE
+        struct v4l2_control ctrl{};
+        ctrl.id = V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
+        if (Ioctl(v4l2_fd_, VIDIOC_G_CTRL, &ctrl) == 0 && ctrl.value > 0) {
+            req_count = std::clamp<uint32_t>(static_cast<uint32_t>(ctrl.value) + 2, 6, 12);
         }
-        std::memcpy(output_buffers_[out_idx].start, src_ptr, copy_bytes);
+#endif
 
-        struct v4l2_buffer q{};
-        q.type = output_buf_type_;
-        q.memory = V4L2_MEMORY_MMAP;
-        q.index = out_idx;
-        q.bytesused = copy_bytes;
-        // Associate packet PTS with output buffer so driver preserves timestamp
-        q.timestamp.tv_sec = packet->pts_us / 1000000;
-        q.timestamp.tv_usec = packet->pts_us % 1000000;
-        struct v4l2_plane q_planes[1]{};
-        if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
-            q_planes[0].bytesused = copy_bytes;
-            q_planes[0].length = output_buffers_[out_idx].length;
-            q.m.planes = q_planes;
-            q.length = 1;
+        struct v4l2_requestbuffers req_cap{};
+        req_cap.count = req_count;
+        req_cap.type = capture_buf_type_;
+        req_cap.memory = V4L2_MEMORY_MMAP;
+        if (Ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_cap) < 0 || req_cap.count == 0) {
+            LOG_WARN << "[VpuVideoDecoder] Capture VIDIOC_REQBUFS failed during source-change reconfigure";
+            return false;
         }
-        if (Ioctl(v4l2_fd_, VIDIOC_QBUF, &q) < 0) {
-            LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_QBUF failed: " << strerror(errno);
-            return V4l2DecodeResult::INPUT_REJECTED;
-        }
-        output_buffers_[out_idx].queued = true;
 
+        capture_buffers_.resize(req_cap.count);
+        for (uint32_t i = 0; i < req_cap.count; ++i) {
+            struct v4l2_buffer buf{};
+            buf.type = capture_buf_type_;
+            buf.memory = V4L2_MEMORY_MMAP;
+            buf.index = i;
+            struct v4l2_plane planes[1]{};
+            if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                buf.m.planes = planes;
+                buf.length = 1;
+            }
+            if (Ioctl(v4l2_fd_, VIDIOC_QUERYBUF, &buf) < 0) {
+                return false;
+            }
+            size_t length = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) ? planes[0].length : buf.length;
+            off_t offset = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) ? planes[0].m.mem_offset : buf.m.offset;
+            void* ptr = (v4l2_fd_ == 999) ? nullptr : mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, v4l2_fd_, offset);
+            if (v4l2_fd_ != 999 && ptr == MAP_FAILED) {
+                return false;
+            }
+            capture_buffers_[i].start = ptr;
+            capture_buffers_[i].length = length;
+            capture_buffers_[i].queued = false;
+            capture_buffers_[i].dmabuf_fd = -1;
+
+            struct v4l2_buffer qbuf{};
+            qbuf.type = capture_buf_type_;
+            qbuf.memory = V4L2_MEMORY_MMAP;
+            qbuf.index = i;
+            struct v4l2_plane qplanes[1]{};
+            if (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE) {
+                qplanes[0].length = length;
+                qbuf.m.planes = qplanes;
+                qbuf.length = 1;
+            }
+            if (Ioctl(v4l2_fd_, VIDIOC_QBUF, &qbuf) < 0) {
+                return false;
+            }
+            capture_buffers_[i].queued = true;
+        }
+
+        if (Ioctl(v4l2_fd_, VIDIOC_STREAMON, &capture_buf_type_) == 0) {
+            capture_streaming_ = true;
+            LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 capture queue reconfigured ("
+                     << negotiated_width_ << "x" << negotiated_height_
+                     << ", stride=" << negotiated_stride_
+                     << ", buffers=" << capture_buffers_.size() << ")";
+            return true;
+        }
+        return false;
+    }
+
+    bool CheckAndHandleSourceChangeEvents() {
+        bool source_changed = false;
+        struct v4l2_event ev{};
+        while (Ioctl(v4l2_fd_, VIDIOC_DQEVENT, &ev) == 0) {
+#ifdef V4L2_EVENT_SOURCE_CHANGE
+            if (ev.type == V4L2_EVENT_SOURCE_CHANGE) {
+                source_changed = true;
+            }
+#endif
+        }
+        if (source_changed) {
+            ReconfigureV4l2CaptureQueue();
+            return true;
+        }
+        return false;
+    }
+
+    V4l2DecodeResult TryDequeueCaptureFrame(DecodedFramePtr& out_frame, bool& reconfigured_out) {
+        reconfigured_out = false;
         struct v4l2_buffer dq_cap{};
         dq_cap.type = capture_buf_type_;
         dq_cap.memory = V4L2_MEMORY_MMAP;
@@ -771,11 +859,32 @@ private:
             uint32_t cap_idx = dq_cap.index;
             capture_buffers_[cap_idx].queued = false;
 
+            uint32_t bytes_used = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+                ? dq_cap.m.planes[0].bytesused : dq_cap.bytesused;
+#ifdef V4L2_BUF_FLAG_LAST
+            bool is_last = (dq_cap.flags & V4L2_BUF_FLAG_LAST) != 0;
+#else
+            bool is_last = false;
+#endif
+            if (v4l2_fd_ != 999 && (is_last || bytes_used == 0)) {
+                struct v4l2_event ev{};
+                while (Ioctl(v4l2_fd_, VIDIOC_DQEVENT, &ev) == 0) {}
+                ReconfigureV4l2CaptureQueue();
+                reconfigured_out = true;
+                return V4l2DecodeResult::FRAME_PENDING;
+            }
+
+            uint32_t frame_w = (width_ > 0) ? width_ : negotiated_width_;
+            uint32_t frame_h = (height_ > 0) ? height_ : negotiated_height_;
+            frame_w = (frame_w & ~1U);
+            frame_h = (frame_h & ~1U);
+            uint32_t dst_stride = (frame_w + 63) & ~size_t(63);
+            uint32_t src_stride = (negotiated_stride_ > 0) ? negotiated_stride_ : dst_stride;
+
             out_frame = BufferAllocator::Instance().AllocateFrame(frame_w, frame_h, PixelFormat::NV12);
             out_frame->stride = dst_stride;
             out_frame->dmabuf_fd = -1;
 
-            // Associate driver-propagated PTS from capture buffer
             int64_t cap_pts = static_cast<int64_t>(dq_cap.timestamp.tv_sec) * 1000000LL + dq_cap.timestamp.tv_usec;
             if (cap_pts > 0) {
                 out_frame->pts_us = cap_pts;
@@ -789,10 +898,10 @@ private:
                 src_stride,
                 dst_stride,
                 out_frame->data.data(),
-                out_frame->data.size()
+                out_frame->data.size(),
+                negotiated_height_
             );
 
-            // Requeue capture buffer only AFTER copy has fully completed
             struct v4l2_buffer req_q{};
             req_q.type = capture_buf_type_;
             req_q.memory = V4L2_MEMORY_MMAP;
@@ -819,28 +928,10 @@ private:
                 return V4l2DecodeResult::FRAME_PENDING;
             }
             if (errno == EPIPE) {
-                // In Linux V4L2 stateful decoders (e.g. Hantro G1/G2 on i.MX 8M Plus),
-                // EPIPE is returned during initial SPS/PPS parameter detection or dynamic resolution change.
                 struct v4l2_event ev{};
-                while (Ioctl(v4l2_fd_, VIDIOC_DQEVENT, &ev) == 0) {
-                    // Consume pending source change events
-                }
-                struct v4l2_format gfmt_cap{};
-                gfmt_cap.type = capture_buf_type_;
-                if (Ioctl(v4l2_fd_, VIDIOC_G_FMT, &gfmt_cap) == 0) {
-                    uint32_t nw = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
-                        ? gfmt_cap.fmt.pix_mp.width : gfmt_cap.fmt.pix.width;
-                    uint32_t nh = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
-                        ? gfmt_cap.fmt.pix_mp.height : gfmt_cap.fmt.pix.height;
-                    if (nw > 0 && nh > 0 && (nw != negotiated_width_ || nh != negotiated_height_)) {
-                        LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 source change event acknowledged: "
-                                 << nw << "x" << nh << " (was " << negotiated_width_ << "x" << negotiated_height_
-                                 << "); reconfiguring capture queues";
-                        width_ = nw;
-                        height_ = nh;
-                        SetupV4l2Queues();
-                    }
-                }
+                while (Ioctl(v4l2_fd_, VIDIOC_DQEVENT, &ev) == 0) {}
+                ReconfigureV4l2CaptureQueue();
+                reconfigured_out = true;
                 return V4l2DecodeResult::FRAME_PENDING;
             }
 
@@ -851,6 +942,142 @@ private:
         }
 
         return V4l2DecodeResult::FRAME_PENDING;
+    }
+
+    V4l2DecodeResult DecodeHardware(const MediaPacketPtr& packet, DecodedFramePtr& out_frame) {
+        uint32_t frame_w = (width_ > 0) ? width_ : negotiated_width_;
+        uint32_t frame_h = (height_ > 0) ? height_ : negotiated_height_;
+        if (frame_w == 0 || frame_h == 0) {
+            return V4l2DecodeResult::INPUT_REJECTED;
+        }
+
+        CheckAndHandleSourceChangeEvents();
+        DrainCompletedOutputBuffers();
+
+        auto find_free_output_buffer = [this]() -> int {
+            for (size_t i = 0; i < output_buffers_.size(); ++i) {
+                if (!output_buffers_[i].queued) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+
+        int out_idx = find_free_output_buffer();
+        DecodedFramePtr early_frame;
+        bool early_frame_ready = false;
+
+        // If all output buffers are currently busy in the VPU, service the capture queue first
+        // so the VPU can unblock and release consumed output buffers (prevents output/capture deadlock).
+        if (out_idx < 0) {
+            bool reconf = false;
+            V4l2DecodeResult early_res = TryDequeueCaptureFrame(early_frame, reconf);
+            if (early_res == V4l2DecodeResult::FRAME_READY) {
+                early_frame_ready = true;
+            } else if (early_res == V4l2DecodeResult::HARDWARE_FATAL) {
+                return V4l2DecodeResult::HARDWARE_FATAL;
+            }
+            DrainCompletedOutputBuffers();
+            out_idx = find_free_output_buffer();
+
+            if (out_idx < 0 && v4l2_fd_ != 999) {
+                struct pollfd pfd{};
+                pfd.fd = v4l2_fd_;
+                pfd.events = POLLOUT | POLLWRNORM | POLLIN | POLLRDNORM | POLLPRI;
+                if (poll(&pfd, 1, 6) > 0) {
+                    CheckAndHandleSourceChangeEvents();
+                    if (!early_frame_ready) {
+                        bool r2 = false;
+                        if (TryDequeueCaptureFrame(early_frame, r2) == V4l2DecodeResult::FRAME_READY) {
+                            early_frame_ready = true;
+                        }
+                    }
+                    DrainCompletedOutputBuffers();
+                    out_idx = find_free_output_buffer();
+                }
+            }
+        }
+
+        if (out_idx < 0 || !output_buffers_[out_idx].start) {
+            if (early_frame_ready) {
+                out_frame = std::move(early_frame);
+                return V4l2DecodeResult::FRAME_READY;
+            }
+            return V4l2DecodeResult::FRAME_PENDING;
+        }
+
+        std::vector<uint8_t> hw_combined;
+        const uint8_t* src_ptr = packet->data.data();
+        size_t copy_bytes = packet->data.size();
+        if (packet->is_keyframe && !packet->HasParameterSets() &&
+            PrepareSoftwareRecoveryPacket(packet, hw_combined)) {
+            src_ptr = hw_combined.data();
+            copy_bytes = hw_combined.size();
+        }
+
+        // Reject oversized compressed packets; never silently truncate encoded video
+        if (copy_bytes > output_buffers_[out_idx].length) {
+            LOG_WARN << "[VpuVideoDecoder] Rejecting oversized compressed packet (" 
+                     << copy_bytes << " bytes > buffer limit " 
+                     << output_buffers_[out_idx].length << " bytes)";
+            return V4l2DecodeResult::INPUT_REJECTED;
+        }
+        std::memcpy(output_buffers_[out_idx].start, src_ptr, copy_bytes);
+
+        struct v4l2_buffer q{};
+        q.type = output_buf_type_;
+        q.memory = V4L2_MEMORY_MMAP;
+        q.index = out_idx;
+        q.bytesused = copy_bytes;
+        q.timestamp.tv_sec = packet->pts_us / 1000000;
+        q.timestamp.tv_usec = packet->pts_us % 1000000;
+        struct v4l2_plane q_planes[1]{};
+        if (output_buf_type_ == V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE) {
+            q_planes[0].bytesused = copy_bytes;
+            q_planes[0].length = output_buffers_[out_idx].length;
+            q.m.planes = q_planes;
+            q.length = 1;
+        }
+        if (Ioctl(v4l2_fd_, VIDIOC_QBUF, &q) < 0) {
+            LOG_WARN << "[VpuVideoDecoder] Output VIDIOC_QBUF failed: " << strerror(errno);
+            return V4l2DecodeResult::INPUT_REJECTED;
+        }
+        output_buffers_[out_idx].queued = true;
+
+        if (early_frame_ready) {
+            out_frame = std::move(early_frame);
+            DrainCompletedOutputBuffers();
+            return V4l2DecodeResult::FRAME_READY;
+        }
+
+        CheckAndHandleSourceChangeEvents();
+
+        bool reconfigured = false;
+        V4l2DecodeResult res = TryDequeueCaptureFrame(out_frame, reconfigured);
+        if (res == V4l2DecodeResult::FRAME_PENDING && v4l2_fd_ != 999) {
+            struct pollfd pfd{};
+            pfd.fd = v4l2_fd_;
+            pfd.events = POLLIN | POLLRDNORM | POLLPRI;
+            if (poll(&pfd, 1, 8) > 0) {
+                if (CheckAndHandleSourceChangeEvents()) {
+                    reconfigured = true;
+                }
+                bool r2 = false;
+                res = TryDequeueCaptureFrame(out_frame, r2);
+                if (r2) reconfigured = true;
+            }
+            if (reconfigured && res == V4l2DecodeResult::FRAME_PENDING) {
+                // Capture queue was just restarted after initial SPS source-change event;
+                // wait briefly for the VPU to emit the first decoded frame into the new capture queue.
+                if (poll(&pfd, 1, 8) > 0) {
+                    bool r3 = false;
+                    res = TryDequeueCaptureFrame(out_frame, r3);
+                }
+            }
+        }
+
+        DrainCompletedOutputBuffers();
+        return res;
     }
 
     bool SetupV4l2Queues() {
@@ -990,7 +1217,7 @@ private:
 
         // 3. Request buffers for output queue
         struct v4l2_requestbuffers req_out{};
-        req_out.count = 4;
+        req_out.count = 6;
         req_out.type = output_buf_type_;
         req_out.memory = V4L2_MEMORY_MMAP;
         if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_out) < 0 || req_out.count == 0) {
@@ -1030,7 +1257,7 @@ private:
 
         // 4. Request buffers for capture queue
         struct v4l2_requestbuffers req_cap{};
-        req_cap.count = 4;
+        req_cap.count = 6;
         req_cap.type = capture_buf_type_;
         req_cap.memory = V4L2_MEMORY_MMAP;
         if (ioctl(v4l2_fd_, VIDIOC_REQBUFS, &req_cap) < 0 || req_cap.count == 0) {
@@ -1161,7 +1388,7 @@ private:
                             }
                         }
                     }
-                    if (!is_hardware_ && !sw_decoder_.IsAvailable() && codec_ != CodecType::UNKNOWN) {
+                    if (!prefer_vpu_ && !is_hardware_ && !sw_decoder_.IsAvailable() && codec_ != CodecType::UNKNOWN) {
                         sw_decoder_.Initialize(codec_);
                     }
                 };

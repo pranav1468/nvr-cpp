@@ -56,6 +56,8 @@ Item {
     }
 
     Component.onCompleted: {
+        var cnt = (root.layoutMode === "7plus1" || root.layoutMode === "8") ? 8 : (root.layoutMode === "1" ? 1 : 4);
+        ApiClient.setLayout(cnt);
         loadCameras();
     }
 

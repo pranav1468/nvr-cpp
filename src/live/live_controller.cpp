@@ -936,7 +936,7 @@ void LiveController::ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline
             if (!pkt->is_keyframe) {
                 continue;
             }
-            if (pipeline->decoder) {
+            if (pipeline->decoder && pipeline->rendered_count.load(std::memory_order_relaxed) > 0) {
                 pipeline->decoder->Flush();
             }
             pipeline->awaiting_keyframe.store(false);
