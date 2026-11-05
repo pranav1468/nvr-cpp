@@ -702,7 +702,9 @@ void CommandDispatcher::RegisterDefaultHandlers() {
 
         bool ok = CameraManager::Instance().AddCamera(cfg);
         if (ok && enabled) {
-            CameraManager::Instance().StartCamera(channel_id);
+            if (rec_mode != RecordMode::DISABLED || cfg.sub_rtsp_url.empty()) {
+                CameraManager::Instance().StartCamera(channel_id);
+            }
             CameraManager::Instance().StartSubStream(channel_id);
             if (rec_mode != RecordMode::DISABLED) {
                 RecordingScheduler::Instance().StartChannelRecording(channel_id, rec_mode);

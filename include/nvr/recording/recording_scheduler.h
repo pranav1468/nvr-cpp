@@ -30,6 +30,7 @@ public:
 
     bool IsChannelRecording(int channel_id) const;
     bool IsChannelActive(int channel_id) const;
+    bool IsMotionGateNeeded(int channel_id) const;
 
     uint32_t GetChannelFrameCount(int channel_id) const;
     uint64_t GetChannelBytesWritten(int channel_id) const;

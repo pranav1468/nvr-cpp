@@ -1000,8 +1000,10 @@ void LiveController::ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline
         }
 
         if (frame) {
-            // Software motion gate evaluation fallback
-            MotionGateManager::Instance().ProcessFrame(pipeline->channel_id, frame);
+            // Software motion gate evaluation fallback (only when channel is in MOTION_ONLY mode)
+            if (RecordingScheduler::Instance().IsMotionGateNeeded(pipeline->channel_id)) {
+                MotionGateManager::Instance().ProcessFrame(pipeline->channel_id, frame);
+            }
 
             // Discard frame if pipeline is paused to avoid stale overwrites
             if (pipeline->paused.load(std::memory_order_relaxed)) {

@@ -54,7 +54,7 @@ Rectangle {
     property string liveClockText: ""
     Timer {
         interval: 1000
-        running: true
+        running: root.visible && root.isOnline
         repeat: true
         triggeredOnStart: true
         onTriggered: {

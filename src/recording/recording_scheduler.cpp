@@ -1,4 +1,5 @@
 #include "nvr/recording/recording_scheduler.h"
+#include "nvr/ingress/camera_manager.h"
 #include "nvr/common/logger.h"
 #include "nvr/common/time_utils.h"
 
@@ -90,6 +91,9 @@ bool RecordingScheduler::StartChannelRecording(int channel_id, RecordMode mode) 
     // Start dedicated recording worker thread (isolated from network ingress)
     state->worker_thread = std::thread(&RecordingScheduler::ChannelWorkerLoop, this, state);
 
+    // Ensure MAIN RTSP ingress session is active for recording
+    CameraManager::Instance().EnsureMainStream(channel_id);
+
     // Subscribe to compressed MAIN stream packets from the StreamBroker (outside mutex_ to avoid self-deadlock)
     state->subscription_id = StreamBroker::Instance().Subscribe(
         channel_id, 
@@ -133,6 +137,8 @@ void RecordingScheduler::StopChannelRecording(int channel_id) {
             state->preroll_buffer.clear();
             state->preroll_bytes = 0;
         }
+        // Stop unneeded 1080p MAIN RTSP stream when recording stops if no other subscriber needs it
+        CameraManager::Instance().StopCamera(channel_id, false);
         LOG_INFO << "[Channel " << channel_id << "] Stopped recording";
     }
 }
@@ -164,6 +170,7 @@ void RecordingScheduler::StopAll() {
             state->preroll_buffer.clear();
             state->preroll_bytes = 0;
         }
+        CameraManager::Instance().StopCamera(state->channel_id, false);
     }
     LOG_INFO << "Stopped all active recording channels";
 }
@@ -177,6 +184,12 @@ bool RecordingScheduler::IsChannelRecording(int channel_id) const {
 bool RecordingScheduler::IsChannelActive(int channel_id) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return channels_.find(channel_id) != channels_.end();
+}
+
+bool RecordingScheduler::IsMotionGateNeeded(int channel_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = channels_.find(channel_id);
+    return (it != channels_.end() && it->second->mode == RecordMode::MOTION_ONLY);
 }
 
 uint32_t RecordingScheduler::GetChannelFrameCount(int channel_id) const {

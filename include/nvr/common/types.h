@@ -229,6 +229,7 @@ enum class PixelFormat {
     RGB24,
     RGBA32,
     RGB16,
+    BGRX32,   // Little-endian 0xffRRGGBB (Qt Format_RGB32); native Qt Quick texture layout
     UNKNOWN
 };
 
@@ -239,6 +240,7 @@ inline const char* PixelFormatToString(PixelFormat fmt) {
         case PixelFormat::RGB24:   return "RGB24";
         case PixelFormat::RGBA32:  return "RGBA32";
         case PixelFormat::RGB16:   return "RGB16";
+        case PixelFormat::BGRX32:  return "BGRx";
         default:                   return "UNKNOWN";
     }
 }
@@ -398,8 +400,21 @@ struct DecodedFrame {
     AlignedByteBuffer data;
     int dmabuf_fd{-1};
 
+    // Optional zero-copy view into externally owned memory (e.g. a mapped G2D
+    // output buffer). When set it takes precedence over `data`; `external_owner`
+    // keeps the memory mapped and alive for the lifetime of this frame.
+    const uint8_t* external_data{nullptr};
+    size_t external_size{0};
+    std::shared_ptr<void> external_owner;
+
+    const uint8_t* GetDataPtr() const {
+        return external_data ? external_data : data.data();
+    }
+    bool HasData() const {
+        return external_data ? (external_size > 0) : !data.empty();
+    }
     size_t GetSizeBytes() const {
-        return data.size();
+        return external_data ? external_size : data.size();
     }
 };
 

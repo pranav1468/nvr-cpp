@@ -47,6 +47,7 @@ private:
 
     void AppendNalToAu(const uint8_t* nal_data, size_t nal_len, bool is_key, uint32_t rtp_timestamp, uint16_t seq_num);
     void FlushAu();
+    void EmitPacket(std::vector<uint8_t>&& data, bool is_keyframe, uint32_t rtp_timestamp, uint16_t seq_num);
     void EmitPacket(const std::vector<uint8_t>& data, bool is_keyframe, uint32_t rtp_timestamp, uint16_t seq_num);
 
     int channel_id_{0};

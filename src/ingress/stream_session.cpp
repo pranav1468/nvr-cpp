@@ -115,6 +115,7 @@ std::string StripRtspCredentials(const std::string& url) {
 
 StreamSession::StreamSession(int channel_id, StreamType stream_type, const std::string& rtsp_url, uint32_t reconnect_delay_sec)
     : channel_id_(channel_id), stream_type_(stream_type), rtsp_url_(rtsp_url), reconnect_delay_sec_(reconnect_delay_sec) {
+    rx_buf_.resize(65536);
     depacketizer_ = std::make_unique<RtpDepacketizer>(
         channel_id_, stream_type_, CodecType::UNKNOWN,
         [](const MediaPacketPtr& pkt) {
@@ -452,6 +453,8 @@ bool StreamSession::ConnectSocket() {
 
     cseq_ = 1;
     session_id_.clear();
+    rx_head_ = 0;
+    rx_tail_ = 0;
     state_ = SessionState::CONNECTING;
     return true;
 }
@@ -469,6 +472,8 @@ void StreamSession::DisconnectSocket() {
         close(fd);
     }
     session_id_.clear();
+    rx_head_ = 0;
+    rx_tail_ = 0;
     state_ = SessionState::DISCONNECTED;
     if (depacketizer_) {
         depacketizer_->Reset();
@@ -483,6 +488,20 @@ void StreamSession::DisconnectSocket() {
 
 bool StreamSession::ReadExact(uint8_t* buffer, size_t length, int timeout_ms) {
     size_t total = 0;
+
+    // 1. Drain user-space rx buffer first without any kernel syscall
+    if (rx_head_ < rx_tail_) {
+        size_t avail = rx_tail_ - rx_head_;
+        size_t to_copy = std::min(avail, length);
+        std::memcpy(buffer, rx_buf_.data() + rx_head_, to_copy);
+        rx_head_ += to_copy;
+        total += to_copy;
+        if (total == length) {
+            return true;
+        }
+    }
+
+    // 2. Fetch remaining bytes with bulk user-space buffered recv
     auto start = std::chrono::steady_clock::now();
     while (total < length && running_) {
         int fd = GetSocketFd();
@@ -509,11 +528,22 @@ bool StreamSession::ReadExact(uint8_t* buffer, size_t length, int timeout_ms) {
         if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
             return false;
         }
-        ssize_t n = recv(fd, buffer + total, length - total, 0);
+
+        if (rx_buf_.size() < 65536) {
+            rx_buf_.resize(65536);
+        }
+        ssize_t n = recv(fd, rx_buf_.data(), rx_buf_.size(), 0);
         if (n <= 0) {
             return false;
         }
-        total += static_cast<size_t>(n);
+        rx_head_ = 0;
+        rx_tail_ = static_cast<size_t>(n);
+
+        size_t needed = length - total;
+        size_t to_copy = std::min(rx_tail_, needed);
+        std::memcpy(buffer + total, rx_buf_.data(), to_copy);
+        rx_head_ = to_copy;
+        total += to_copy;
     }
     return (total == length);
 }

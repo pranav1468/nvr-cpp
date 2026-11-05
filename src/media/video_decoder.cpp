@@ -59,21 +59,30 @@ bool CopyNv12Frame(
         return false;
     }
 
-    // Copy Y plane row-by-row
-    for (uint32_t r = 0; r < height; ++r) {
-        std::memcpy(dst + static_cast<size_t>(r) * dst_stride,
-                    src + static_cast<size_t>(r) * src_stride,
-                    width);
-    }
-
-    // Copy interleaved UV plane row-by-row
     const uint8_t* src_uv = src + static_cast<size_t>(uv_offset_rows) * src_stride;
     uint8_t* dst_uv = dst + static_cast<size_t>(height) * dst_stride;
     uint32_t uv_rows = height / 2;
-    for (uint32_t r = 0; r < uv_rows; ++r) {
-        std::memcpy(dst_uv + static_cast<size_t>(r) * dst_stride,
-                    src_uv + static_cast<size_t>(r) * src_stride,
-                    width);
+
+    // Fast-path contiguous memory copies reduce 1,620 per-frame memcpy calls to 1 or 2
+    if (src_stride == dst_stride && uv_offset_rows == height) {
+        std::memcpy(dst, src, static_cast<size_t>(dst_stride) * height * 3 / 2);
+    } else if (src_stride == dst_stride) {
+        std::memcpy(dst, src, static_cast<size_t>(dst_stride) * height);
+        std::memcpy(dst_uv, src_uv, static_cast<size_t>(dst_stride) * uv_rows);
+    } else {
+        // Strides differ: copy Y plane row-by-row
+        for (uint32_t r = 0; r < height; ++r) {
+            std::memcpy(dst + static_cast<size_t>(r) * dst_stride,
+                        src + static_cast<size_t>(r) * src_stride,
+                        width);
+        }
+
+        // Copy interleaved UV plane row-by-row
+        for (uint32_t r = 0; r < uv_rows; ++r) {
+            std::memcpy(dst_uv + static_cast<size_t>(r) * dst_stride,
+                        src_uv + static_cast<size_t>(r) * src_stride,
+                        width);
+        }
     }
 
     return true;

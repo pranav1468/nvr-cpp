@@ -94,6 +94,11 @@ private:
     int audio_payload_type_{-1};
     uint32_t audio_clock_rate_{8000};
     uint8_t audio_channels_{1};
+
+    // 64 KB user-space receive buffer reduces 3 syscalls/packet to ~1 syscall per 40 packets
+    std::vector<uint8_t> rx_buf_;
+    size_t rx_head_{0};
+    size_t rx_tail_{0};
 };
 
 } // namespace nvr

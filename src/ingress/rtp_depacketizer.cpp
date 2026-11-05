@@ -234,8 +234,9 @@ void RtpDepacketizer::FlushAu() {
         // Do not emit bare parameter sets (VPS/SPS/PPS) without a VCL slice; retain until slice arrives
         return;
     }
-    EmitPacket(au_buffer_, au_is_keyframe_, au_timestamp_, au_seq_num_);
+    EmitPacket(std::move(au_buffer_), au_is_keyframe_, au_timestamp_, au_seq_num_);
     au_buffer_.clear();
+    au_buffer_.reserve(64 * 1024);
     au_has_data_ = false;
     au_has_vcl_ = false;
     au_is_keyframe_ = false;
@@ -405,7 +406,7 @@ void RtpDepacketizer::ProcessAac(const uint8_t* payload, size_t size, uint32_t r
     size_t au_headers_len_bytes = (au_headers_len_bits + 7) / 8;
     if (2 + au_headers_len_bytes > size) {
         std::vector<uint8_t> frame(payload, payload + size);
-        EmitPacket(frame, true, rtp_timestamp, seq_num);
+        EmitPacket(std::move(frame), true, rtp_timestamp, seq_num);
         return;
     }
 
@@ -417,10 +418,10 @@ void RtpDepacketizer::ProcessAac(const uint8_t* payload, size_t size, uint32_t r
 
         if (payload_offset + au_size <= size && au_size > 0) {
             std::vector<uint8_t> frame(payload + payload_offset, payload + payload_offset + au_size);
-            EmitPacket(frame, true, rtp_timestamp, seq_num);
+            EmitPacket(std::move(frame), true, rtp_timestamp, seq_num);
         } else {
             std::vector<uint8_t> frame(payload + payload_offset, payload + size);
-            EmitPacket(frame, true, rtp_timestamp, seq_num);
+            EmitPacket(std::move(frame), true, rtp_timestamp, seq_num);
         }
         return;
     }
@@ -437,7 +438,7 @@ void RtpDepacketizer::ProcessAac(const uint8_t* payload, size_t size, uint32_t r
 
         if (payload_offset + au_size <= size && au_size > 0) {
             std::vector<uint8_t> frame(payload + payload_offset, payload + payload_offset + au_size);
-            EmitPacket(frame, true, current_ts, seq_num);
+            EmitPacket(std::move(frame), true, current_ts, seq_num);
             payload_offset += au_size;
             current_ts += 1024; // Standard AAC frame step in clock ticks
         } else {
@@ -449,10 +450,10 @@ void RtpDepacketizer::ProcessAac(const uint8_t* payload, size_t size, uint32_t r
 void RtpDepacketizer::ProcessG711(const uint8_t* payload, size_t size, uint32_t rtp_timestamp, uint16_t seq_num) {
     if (size == 0) return;
     std::vector<uint8_t> frame(payload, payload + size);
-    EmitPacket(frame, true, rtp_timestamp, seq_num);
+    EmitPacket(std::move(frame), true, rtp_timestamp, seq_num);
 }
 
-void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyframe, uint32_t rtp_timestamp, uint16_t seq_num) {
+void RtpDepacketizer::EmitPacket(std::vector<uint8_t>&& data, bool is_keyframe, uint32_t rtp_timestamp, uint16_t seq_num) {
     if (!callback_ || data.empty()) return;
 
     auto packet = std::make_shared<MediaPacket>();
@@ -492,9 +493,14 @@ void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyfr
         packet->pts_us = base_pts_us_ + delta_us;
     }
     packet->dts_us = packet->pts_us;
-    packet->data = data;
+    packet->data = std::move(data);
 
     callback_(packet);
+}
+
+void RtpDepacketizer::EmitPacket(const std::vector<uint8_t>& data, bool is_keyframe, uint32_t rtp_timestamp, uint16_t seq_num) {
+    std::vector<uint8_t> copy = data;
+    EmitPacket(std::move(copy), is_keyframe, rtp_timestamp, seq_num);
 }
 
 } // namespace nvr

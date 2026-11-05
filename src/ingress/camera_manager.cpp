@@ -213,7 +213,9 @@ bool CameraManager::UpdateCamera(const CameraConfig& config) {
 
 
     if (config.enabled && !config.rtsp_url.empty()) {
-        StartCamera(config.id);
+        if (config.record_mode != RecordMode::DISABLED || config.sub_rtsp_url.empty()) {
+            StartCamera(config.id);
+        }
         if (!config.sub_rtsp_url.empty()) {
             StartSubStream(config.id);
         }

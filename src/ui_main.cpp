@@ -53,9 +53,9 @@ public:
 
         auto frame = nvr::QmlVideoBridge::Instance().GetTileFrame(tileIndex);
 
-        if (!frame || frame->data.empty() || frame->width == 0 || frame->height == 0) {
+        if (!frame || !frame->HasData() || frame->width == 0 || frame->height == 0) {
             auto latest = nvr::LiveController::Instance().GetLatestFrame(channel_id);
-            if (latest && !latest->data.empty() && latest->width > 0 && latest->height > 0) {
+            if (latest && latest->HasData() && latest->width > 0 && latest->height > 0) {
                 frame = latest;
             }
         }
@@ -67,14 +67,24 @@ public:
             return fallback;
         };
 
-        if (frame && !frame->data.empty() && frame->width > 0 && frame->height > 0) {
+        if (frame && frame->HasData() && frame->width > 0 && frame->height > 0) {
             if (size) *size = QSize(frame->width, frame->height);
 
-            // Zero-memcpy wrapping for standard RGB/RGBA/RGB16 formats
-            if (frame->format == nvr::PixelFormat::RGB24) {
+            // Zero-copy wrapping for G2D hardware converted BGRx (Qt native Format_RGB32)
+            if (frame->format == nvr::PixelFormat::BGRX32) {
                 auto* holder = new nvr::DecodedFramePtr(frame);
                 return QImage(
-                    const_cast<uint8_t*>(frame->data.data()),
+                    const_cast<uint8_t*>(frame->GetDataPtr()),
+                    frame->width, frame->height,
+                    frame->stride > 0 ? frame->stride : frame->width * 4,
+                    QImage::Format_RGB32,
+                    [](void* info) { delete static_cast<nvr::DecodedFramePtr*>(info); },
+                    holder
+                );
+            } else if (frame->format == nvr::PixelFormat::RGB24) {
+                auto* holder = new nvr::DecodedFramePtr(frame);
+                return QImage(
+                    const_cast<uint8_t*>(frame->GetDataPtr()),
                     frame->width, frame->height,
                     frame->stride > 0 ? frame->stride : frame->width * 3,
                     QImage::Format_RGB888,
@@ -84,7 +94,7 @@ public:
             } else if (frame->format == nvr::PixelFormat::RGBA32) {
                 auto* holder = new nvr::DecodedFramePtr(frame);
                 return QImage(
-                    const_cast<uint8_t*>(frame->data.data()),
+                    const_cast<uint8_t*>(frame->GetDataPtr()),
                     frame->width, frame->height,
                     frame->stride > 0 ? frame->stride : frame->width * 4,
                     QImage::Format_RGBA8888,
@@ -94,7 +104,7 @@ public:
             } else if (frame->format == nvr::PixelFormat::RGB16) {
                 auto* holder = new nvr::DecodedFramePtr(frame);
                 return QImage(
-                    const_cast<uint8_t*>(frame->data.data()),
+                    const_cast<uint8_t*>(frame->GetDataPtr()),
                     frame->width, frame->height,
                     frame->stride > 0 ? frame->stride : frame->width * 2,
                     QImage::Format_RGB16,
@@ -106,65 +116,43 @@ public:
                 int h = frame->height;
                 int stride = frame->stride > 0 ? frame->stride : w;
                 size_t min_req = (static_cast<size_t>(stride) * h * 3) / 2;
-                if (frame->data.size() < min_req) {
+                if (frame->GetSizeBytes() < min_req) {
                     return get_fallback();
                 }
 
-                bool is_fs = nvr::LiveController::Instance().IsFullscreen() ||
-                             (nvr::LiveController::Instance().GetCurrentLayout() == nvr::LiveGridLayout::SINGLE);
-                int scale = (!is_fs && w >= 960) ? 2 : ((is_fs && w > 1280) ? 2 : 1);
-                int out_w = w / scale;
-                int out_h = h / scale;
+                // 100% Native full resolution conversion without CPU downscaling
+                int out_w = w;
+                int out_h = h;
                 if (size) *size = QSize(out_w, out_h);
 
-                const uint8_t* y_plane = frame->data.data();
+                const uint8_t* y_plane = frame->GetDataPtr();
                 const uint8_t* uv_plane = y_plane + (static_cast<size_t>(stride) * h);
                 QImage qimg(out_w, out_h, QImage::Format_RGB32);
 
-                if (scale == 2) {
-                    for (int y = 0; y < out_h; ++y) {
-                        uint32_t* scanline = reinterpret_cast<uint32_t*>(qimg.scanLine(y));
-                        const uint8_t* y_row = y_plane + (static_cast<size_t>(y * 2) * stride);
-                        const uint8_t* uv_row = uv_plane + (static_cast<size_t>(y) * stride);
-                        for (int x = 0; x < out_w; ++x) {
-                            int src_x = x * 2;
-                            int y0 = y_row[src_x];
-                            int u_val = uv_row[src_x] - 128;
-                            int v_val = uv_row[src_x + 1] - 128;
+                for (int y = 0; y < h; ++y) {
+                    uint32_t* scanline = reinterpret_cast<uint32_t*>(qimg.scanLine(y));
+                    const uint8_t* y_row = y_plane + (static_cast<size_t>(y) * stride);
+                    const uint8_t* uv_row = uv_plane + (static_cast<size_t>(y >> 1) * stride);
+                    for (int x = 0; x < w; x += 2) {
+                        int u_val = uv_row[x] - 128;
+                        int v_val = uv_row[x + 1] - 128;
 
-                            int r = std::clamp(y0 + ((1436 * v_val) >> 10), 0, 255);
-                            int g = std::clamp(y0 - ((352 * u_val + 731 * v_val) >> 10), 0, 255);
-                            int b = std::clamp(y0 + ((1815 * u_val) >> 10), 0, 255);
-                            scanline[x] = 0xff000000u | (static_cast<uint32_t>(r) << 16) |
-                                          (static_cast<uint32_t>(g) << 8) | static_cast<uint32_t>(b);
-                        }
-                    }
-                } else {
-                    for (int y = 0; y < h; ++y) {
-                        uint32_t* scanline = reinterpret_cast<uint32_t*>(qimg.scanLine(y));
-                        const uint8_t* y_row = y_plane + (static_cast<size_t>(y) * stride);
-                        const uint8_t* uv_row = uv_plane + (static_cast<size_t>(y >> 1) * stride);
-                        for (int x = 0; x < w; x += 2) {
-                            int u_val = uv_row[x] - 128;
-                            int v_val = uv_row[x + 1] - 128;
+                        int ruv = (1436 * v_val) >> 10;
+                        int guv = (352 * u_val + 731 * v_val) >> 10;
+                        int buv = (1815 * u_val) >> 10;
 
-                            int ruv = (1436 * v_val) >> 10;
-                            int guv = (352 * u_val + 731 * v_val) >> 10;
-                            int buv = (1815 * u_val) >> 10;
+                        int y0 = y_row[x];
+                        int r0 = std::clamp(y0 + ruv, 0, 255);
+                        int g0 = std::clamp(y0 - guv, 0, 255);
+                        int b0 = std::clamp(y0 + buv, 0, 255);
+                        scanline[x] = 0xff000000u | (static_cast<uint32_t>(r0) << 16) | (static_cast<uint32_t>(g0) << 8) | static_cast<uint32_t>(b0);
 
-                            int y0 = y_row[x];
-                            int r0 = std::clamp(y0 + ruv, 0, 255);
-                            int g0 = std::clamp(y0 - guv, 0, 255);
-                            int b0 = std::clamp(y0 + buv, 0, 255);
-                            scanline[x] = 0xff000000u | (static_cast<uint32_t>(r0) << 16) | (static_cast<uint32_t>(g0) << 8) | static_cast<uint32_t>(b0);
-
-                            if (x + 1 < w) {
-                                int y1 = y_row[x + 1];
-                                int r1 = std::clamp(y1 + ruv, 0, 255);
-                                int g1 = std::clamp(y1 - guv, 0, 255);
-                                int b1 = std::clamp(y1 + buv, 0, 255);
-                                scanline[x + 1] = 0xff000000u | (static_cast<uint32_t>(r1) << 16) | (static_cast<uint32_t>(g1) << 8) | static_cast<uint32_t>(b1);
-                            }
+                        if (x + 1 < w) {
+                            int y1 = y_row[x + 1];
+                            int r1 = std::clamp(y1 + ruv, 0, 255);
+                            int g1 = std::clamp(y1 - guv, 0, 255);
+                            int b1 = std::clamp(y1 + buv, 0, 255);
+                            scanline[x + 1] = 0xff000000u | (static_cast<uint32_t>(r1) << 16) | (static_cast<uint32_t>(g1) << 8) | static_cast<uint32_t>(b1);
                         }
                     }
                 }
@@ -175,10 +163,10 @@ public:
                 int stride = frame->stride > 0 ? frame->stride : w;
                 int uv_stride = stride / 2;
                 size_t min_req = (static_cast<size_t>(stride) * h) + 2 * (static_cast<size_t>(uv_stride) * (h / 2));
-                if (frame->data.size() < min_req) {
+                if (frame->GetSizeBytes() < min_req) {
                     return get_fallback();
                 }
-                const uint8_t* y_plane = frame->data.data();
+                const uint8_t* y_plane = frame->GetDataPtr();
                 const uint8_t* u_plane = y_plane + (static_cast<size_t>(stride) * h);
                 const uint8_t* v_plane = u_plane + (static_cast<size_t>(uv_stride) * (h / 2));
                 QImage qimg(w, h, QImage::Format_RGB32);
@@ -287,8 +275,13 @@ int main(int argc, char *argv[]) {
 
     for (const auto& cam : nvr::CameraManager::Instance().GetCameras()) {
         if (cam.enabled) {
-            nvr::RecordingScheduler::Instance().StartChannelRecording(cam.id, cam.record_mode);
-            nvr::CameraManager::Instance().StartCamera(cam.id);
+            if (cam.record_mode != nvr::RecordMode::DISABLED) {
+                nvr::RecordingScheduler::Instance().StartChannelRecording(cam.id, cam.record_mode);
+            }
+            if (cam.record_mode != nvr::RecordMode::DISABLED || cam.sub_rtsp_url.empty()) {
+                nvr::CameraManager::Instance().StartCamera(cam.id);
+            }
+            nvr::CameraManager::Instance().StartSubStream(cam.id);
         }
     }
 

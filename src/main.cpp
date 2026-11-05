@@ -134,8 +134,12 @@ int main(int argc, char* argv[]) {
     // Start Recording and Ingress for configured cameras
     for (const auto& cam : nvr::CameraManager::Instance().GetCameras()) {
         if (cam.enabled) {
-            nvr::RecordingScheduler::Instance().StartChannelRecording(cam.id, cam.record_mode);
-            nvr::CameraManager::Instance().StartCamera(cam.id);
+            if (cam.record_mode != nvr::RecordMode::DISABLED) {
+                nvr::RecordingScheduler::Instance().StartChannelRecording(cam.id, cam.record_mode);
+            }
+            if (cam.record_mode != nvr::RecordMode::DISABLED || cam.sub_rtsp_url.empty()) {
+                nvr::CameraManager::Instance().StartCamera(cam.id);
+            }
             nvr::CameraManager::Instance().StartSubStream(cam.id);
         }
     }

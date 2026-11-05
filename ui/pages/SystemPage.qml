@@ -17,14 +17,18 @@ Item {
     property var usersList: []
 
     Component.onCompleted: {
-        loadAll();
+        if (root.visible) loadAll();
+    }
+
+    onVisibleChanged: {
+        if (root.visible) loadAll();
     }
 
     Timer {
         id: traceTimer
         interval: 2500
         repeat: true
-        running: root.autoTail
+        running: root.autoTail && root.visible
         onTriggered: root.fetchTrace()
     }
 

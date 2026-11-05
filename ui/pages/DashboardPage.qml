@@ -14,13 +14,17 @@ Item {
     signal navigateTo(string route)
 
     Component.onCompleted: {
-        loadData();
+        if (root.visible) loadData();
+    }
+
+    onVisibleChanged: {
+        if (root.visible) loadData();
     }
 
     Timer {
         interval: 4000
         repeat: true
-        running: true
+        running: root.visible
         onTriggered: root.loadData()
     }
 

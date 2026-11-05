@@ -16,6 +16,23 @@ namespace nvr {
 
 namespace {
 
+// Layout-compatible mirror of GstMapInfo (gst/gstmemory.h). GStreamer is loaded
+// dynamically, so its headers are not available at build time.
+struct GstMapInfoCompat {
+    void* memory;
+    int flags;
+    uint8_t* data;
+    size_t size;
+    size_t maxsize;
+    void* user_data[4];
+    void* gst_reserved[4];
+};
+
+constexpr int kGstMapRead = 1;               // GST_MAP_READ
+constexpr int kGstMemoryFlagReadonly = 2;    // GST_MEMORY_FLAG_READONLY
+constexpr int kGstStateNull = 1;             // GST_STATE_NULL
+constexpr int kGstStatePlaying = 4;          // GST_STATE_PLAYING
+
 // Dynamic GStreamer runtime loader for NXP i.MX hardware acceleration
 struct GstRuntimeShim {
     void* gst_lib{nullptr};
@@ -39,6 +56,14 @@ struct GstRuntimeShim {
     void (*gst_app_src_set_caps)(void*, const void*){nullptr};
     void* (*gst_buffer_new)(){nullptr};
     void (*gst_buffer_append_memory)(void*, void*){nullptr};
+
+    // appsink pull + buffer mapping (G2D appsink conversion mode)
+    void* (*gst_app_sink_try_pull_sample)(void*, uint64_t){nullptr};
+    void* (*gst_sample_get_buffer)(void*){nullptr};
+    void (*gst_mini_object_unref)(void*){nullptr};
+    int (*gst_buffer_map)(void*, GstMapInfoCompat*, int){nullptr};
+    void (*gst_buffer_unmap)(void*, GstMapInfoCompat*){nullptr};
+    bool appsink_pull_supported{false};
 
     void* (*gst_dmabuf_allocator_new)(){nullptr};
     void* (*gst_dmabuf_allocator_alloc)(void*, int, size_t){nullptr};
@@ -109,6 +134,14 @@ struct GstRuntimeShim {
         gst_buffer_append_memory = reinterpret_cast<void(*)(void*, void*)>(dlsym(gst_lib, "gst_buffer_append_memory"));
         gst_app_src_set_caps = reinterpret_cast<void(*)(void*, const void*)>(dlsym(app_lib, "gst_app_src_set_caps"));
 
+        gst_app_sink_try_pull_sample = reinterpret_cast<void*(*)(void*, uint64_t)>(dlsym(app_lib, "gst_app_sink_try_pull_sample"));
+        gst_sample_get_buffer = reinterpret_cast<void*(*)(void*)>(dlsym(gst_lib, "gst_sample_get_buffer"));
+        gst_mini_object_unref = reinterpret_cast<void(*)(void*)>(dlsym(gst_lib, "gst_mini_object_unref"));
+        gst_buffer_map = reinterpret_cast<int(*)(void*, GstMapInfoCompat*, int)>(dlsym(gst_lib, "gst_buffer_map"));
+        gst_buffer_unmap = reinterpret_cast<void(*)(void*, GstMapInfoCompat*)>(dlsym(gst_lib, "gst_buffer_unmap"));
+        appsink_pull_supported = gst_app_sink_try_pull_sample && gst_sample_get_buffer &&
+                                 gst_mini_object_unref && gst_buffer_map && gst_buffer_unmap;
+
         if (!gst_init_check || !gst_parse_launch || !gst_element_set_state ||
             !gst_bin_get_by_name || !gst_object_unref || !gst_buffer_new_wrapped_full ||
             !gst_app_src_push_buffer || !g_object_set) {
@@ -157,6 +190,204 @@ static GstRuntimeShim& GetGstShim() {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// G2D appsink converter: NV12 (VPU output) -> BGRx on the G2D 2D engine.
+//
+// The worker thread pushes the decoded NV12 frame (wrapped, no copy) into
+// appsrc and synchronously pulls the converted sample. The mapped output buffer
+// is handed to Qt as a Format_RGB32 QImage without copying; the GstSample is
+// released when the last DecodedFrame / QImage reference goes away.
+// BGRx is chosen over RGB16 because it is Qt Quick's native upload layout:
+// any other QImage format is converted again on the CPU before GPU upload.
+// ---------------------------------------------------------------------------
+struct QmlVideoBridge::G2dConverter {
+    static constexpr uint64_t kPullTimeoutNs = 40ULL * 1000000ULL;  // one frame period at 25 fps
+    static constexpr int kMaxConsecutiveFailures = 50;              // ~2 s of failed conversions
+
+    std::mutex mtx;
+    int tile_index{-1};
+    void* pipeline{nullptr};
+    void* appsrc{nullptr};
+    void* appsink{nullptr};
+    uint32_t width{0};
+    uint32_t height{0};
+    int consecutive_failures{0};
+    bool disabled{false};
+    bool first_success_logged{false};
+
+    ~G2dConverter() { Teardown(); }
+
+    void Teardown() {
+        if (!pipeline) return;
+        auto& shim = GetGstShim();
+        shim.gst_element_set_state(pipeline, kGstStateNull);
+        if (appsrc) shim.gst_object_unref(appsrc);
+        if (appsink) shim.gst_object_unref(appsink);
+        shim.gst_object_unref(pipeline);
+        pipeline = appsrc = appsink = nullptr;
+        width = height = 0;
+    }
+
+    bool Configure(uint32_t w, uint32_t h) {
+        if (pipeline && w == width && h == height) return true;
+        Teardown();
+
+        std::ostringstream oss;
+        oss << "appsrc name=src is-live=true format=time block=false "
+            << "caps=\"video/x-raw,format=NV12,width=" << w << ",height=" << h << ",framerate=0/1\" ! "
+            << "imxvideoconvert_g2d ! "
+            << "video/x-raw,format=BGRx,width=" << w << ",height=" << h << " ! "
+            << "appsink name=sink sync=false async=false max-buffers=1 drop=true "
+            << "emit-signals=false enable-last-sample=false";
+        const std::string desc = oss.str();
+
+        auto& shim = GetGstShim();
+        void* err = nullptr;
+        void* pipe = shim.gst_parse_launch(desc.c_str(), &err);
+        if (!pipe) {
+            LOG_WARN << "[QmlVideoBridge] Tile " << tile_index << ": failed to build G2D converter: " << desc;
+            return false;
+        }
+        void* src = shim.gst_bin_get_by_name(pipe, "src");
+        void* sink = shim.gst_bin_get_by_name(pipe, "sink");
+        if (!src || !sink) {
+            if (src) shim.gst_object_unref(src);
+            if (sink) shim.gst_object_unref(sink);
+            shim.gst_object_unref(pipe);
+            return false;
+        }
+        shim.gst_element_set_state(pipe, kGstStatePlaying);
+
+        pipeline = pipe;
+        appsrc = src;
+        appsink = sink;
+        width = w;
+        height = h;
+        LOG_INFO << "[QmlVideoBridge] Tile " << tile_index << ": G2D NV12->BGRx converter ready ("
+                 << w << "x" << h << ", native resolution)";
+        return true;
+    }
+
+    // Returns a BGRX32 frame backed by the mapped G2D output, or nullptr on failure.
+    DecodedFramePtr Convert(const DecodedFramePtr& in) {
+        auto& shim = GetGstShim();
+        const uint32_t w = in->width;
+        const uint32_t h = in->height;
+        const size_t in_bytes = static_cast<size_t>(w) * h * 3 / 2;
+        if (in->GetSizeBytes() < in_bytes) return nullptr;
+        if (!Configure(w, h)) return nullptr;
+
+        // Zero-copy input: GStreamer keeps the NV12 frame alive via the holder.
+        auto* holder = new DecodedFramePtr(in);
+        void* inbuf = shim.gst_buffer_new_wrapped_full(
+            kGstMemoryFlagReadonly,
+            const_cast<uint8_t*>(in->GetDataPtr()), in_bytes, 0, in_bytes,
+            holder, [](void* p) { delete static_cast<DecodedFramePtr*>(p); });
+        if (!inbuf) {
+            delete holder;
+            return nullptr;
+        }
+        if (shim.gst_app_src_push_buffer(appsrc, inbuf) != 0) {  // takes ownership
+            return nullptr;
+        }
+
+        void* sample = shim.gst_app_sink_try_pull_sample(appsink, kPullTimeoutNs);
+        if (!sample) return nullptr;
+
+        struct MappedSample {
+            void* sample{nullptr};
+            void* buffer{nullptr};
+            GstMapInfoCompat info{};
+        };
+        auto* mapped = new MappedSample();
+        mapped->sample = sample;
+        mapped->buffer = shim.gst_sample_get_buffer(sample);  // borrowed; the sample holds the ref
+        const size_t out_bytes = static_cast<size_t>(w) * h * 4;
+        if (!mapped->buffer || !shim.gst_buffer_map(mapped->buffer, &mapped->info, kGstMapRead)) {
+            shim.gst_mini_object_unref(sample);
+            delete mapped;
+            return nullptr;
+        }
+        if (mapped->info.size < out_bytes) {
+            shim.gst_buffer_unmap(mapped->buffer, &mapped->info);
+            shim.gst_mini_object_unref(sample);
+            delete mapped;
+            return nullptr;
+        }
+
+        auto out = std::make_shared<DecodedFrame>();
+        out->channel_id = in->channel_id;
+        out->stream_type = in->stream_type;
+        out->width = w;
+        out->height = h;
+        out->stride = w * 4;
+        out->format = PixelFormat::BGRX32;
+        out->pts_us = in->pts_us;
+        out->wall_time_ms = in->wall_time_ms;
+        out->frame_index = in->frame_index;
+        out->external_data = mapped->info.data;
+        out->external_size = mapped->info.size;
+        out->external_owner = std::shared_ptr<void>(mapped, [](void* p) {
+            auto* m = static_cast<MappedSample*>(p);
+            auto& s = GetGstShim();
+            s.gst_buffer_unmap(m->buffer, &m->info);
+            s.gst_mini_object_unref(m->sample);
+            delete m;
+        });
+        return out;
+    }
+};
+
+bool QmlVideoBridge::IsG2dAppsinkModeAvailable() const {
+    return hw_acceleration_enabled_ && g2d_gst_element_ && !qml6glsink_supported_ &&
+           GetGstShim().appsink_pull_supported;
+}
+
+DecodedFramePtr QmlVideoBridge::ConvertFrameWithG2d(int tile_index, const DecodedFramePtr& frame) {
+    // G2D input must be tightly packed NV12 (caps carry no stride information).
+    if (frame->format != PixelFormat::NV12 || frame->width == 0 || frame->height == 0 ||
+        (frame->width & 1) || (frame->height & 1) ||
+        (frame->stride != 0 && frame->stride != frame->width)) {
+        return nullptr;
+    }
+
+    std::shared_ptr<G2dConverter> conv;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!IsG2dAppsinkModeAvailable()) return nullptr;
+        auto& slot = g2d_converters_[tile_index];
+        if (!slot) {
+            slot = std::make_shared<G2dConverter>();
+            slot->tile_index = tile_index;
+        }
+        conv = slot;
+    }
+
+    // Conversion runs outside mutex_ so the GUI thread and other tiles never wait on G2D.
+    std::lock_guard<std::mutex> conv_lock(conv->mtx);
+    if (conv->disabled) return nullptr;
+
+    DecodedFramePtr out = conv->Convert(frame);
+    if (out) {
+        conv->consecutive_failures = 0;
+        if (!conv->first_success_logged) {
+            conv->first_success_logged = true;
+            LOG_INFO << "[QmlVideoBridge] Tile " << tile_index
+                     << ": live frames now colour-converted on G2D (zero CPU copy into Qt)";
+        }
+        return out;
+    }
+
+    if (++conv->consecutive_failures >= G2dConverter::kMaxConsecutiveFailures) {
+        conv->disabled = true;
+        conv->Teardown();
+        LOG_WARN << "[QmlVideoBridge] Tile " << tile_index << ": G2D conversion failed "
+                 << conv->consecutive_failures
+                 << " times in a row; falling back to CPU colour conversion for this tile";
+    }
+    return nullptr;
+}
+
 QmlVideoBridge::QmlVideoBridge() {
     InitGstRuntime();
 }
@@ -188,6 +419,7 @@ void QmlVideoBridge::InitGstRuntime() {
     void* g2d_fact = shim.gst_element_factory_find("imxvideoconvert_g2d");
     if (g2d_fact) {
         g2d_supported_ = true;
+        g2d_gst_element_ = true;
         shim.gst_object_unref(g2d_fact);
     } else {
         // Also check if NXP G2D kernel device node exists
@@ -465,6 +697,16 @@ void QmlVideoBridge::RenderTile(int tile_index, int channel_id, const DecodedFra
         }
     }
 
+    // Hardware G2D offload: when qml6glsink is not attached but G2D is present on NXP i.MX,
+    // convert NV12 to BGRx (Format_RGB32) on the hardware G2D engine outside Qt GUI thread.
+    DecodedFramePtr effective_frame = frame;
+    if (frame->format == PixelFormat::NV12 && IsG2dAppsinkModeAvailable()) {
+        auto g2d_frame = ConvertFrameWithG2d(tile_index, frame);
+        if (g2d_frame) {
+            effective_frame = std::move(g2d_frame);
+        }
+    }
+
     // Always update software bridge and frame revision so decoupled viewers,
     // thumbnail generators, and QML view state bindings remain fully responsive.
     FrameRenderCallback cb;
@@ -474,7 +716,7 @@ void QmlVideoBridge::RenderTile(int tile_index, int channel_id, const DecodedFra
         auto& t = tiles_[tile_index];
         t.channel_id = channel_id;
         t.revision++;
-        t.frame = frame;
+        t.frame = effective_frame;
         rev = t.revision;
         cb = render_callback_;
     }
@@ -487,6 +729,7 @@ void QmlVideoBridge::RenderTile(int tile_index, int channel_id, const DecodedFra
 void QmlVideoBridge::ClearTile(int tile_index) {
     std::lock_guard<std::mutex> lock(mutex_);
     tiles_.erase(tile_index);
+    g2d_converters_.erase(tile_index);
     auto it = hw_pipelines_.find(tile_index);
     if (it != hw_pipelines_.end()) {
         CleanupTilePipeline(it->second);
@@ -500,6 +743,7 @@ void QmlVideoBridge::Shutdown() {
         CleanupTilePipeline(pair.second);
     }
     hw_pipelines_.clear();
+    g2d_converters_.clear();
     tiles_.clear();
 }
 

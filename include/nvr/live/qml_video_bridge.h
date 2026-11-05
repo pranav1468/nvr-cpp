@@ -117,9 +117,17 @@ private:
     bool StartTilePipeline(ImxG2dTilePipeline& p, int src_w, int src_h, int dst_w, int dst_h);
     bool PushFrameToTilePipeline(int tile_index, const DecodedFramePtr& frame);
 
+    // Per-tile NV12 -> BGRx hardware converter (appsrc ! imxvideoconvert_g2d ! appsink).
+    // Used when G2D is present but qml6glsink is not: colour conversion runs on the G2D
+    // engine at native resolution and the result is handed to Qt without any CPU copy.
+    struct G2dConverter;
+    DecodedFramePtr ConvertFrameWithG2d(int tile_index, const DecodedFramePtr& frame);
+    bool IsG2dAppsinkModeAvailable() const;
+
     mutable std::mutex mutex_;
     std::unordered_map<int, TileData> tiles_;
     std::unordered_map<int, ImxG2dTilePipeline> hw_pipelines_;
+    std::unordered_map<int, std::shared_ptr<G2dConverter>> g2d_converters_;
     FrameRenderCallback render_callback_;
     int width_{1920};
     int height_{1080};
@@ -127,6 +135,7 @@ private:
     bool hw_acceleration_enabled_{true};
     bool gst_initialized_{false};
     bool g2d_supported_{false};
+    bool g2d_gst_element_{false};
     bool qml6glsink_supported_{false};
     bool dmabuf_supported_{false};
     mutable std::string session_token_;
