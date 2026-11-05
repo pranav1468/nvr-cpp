@@ -29,9 +29,13 @@ Rectangle {
         else if (data.core_status) root.coreStatus = data.core_status;
 
         // CPU load calculation matching web/app.js
-        if (typeof data.cpu_load_1m === "number") {
-            var cpuPct = Math.min(100, (data.cpu_load_1m / 6.0) * 100);
+        var cores = (typeof data.cpu_cores === "number" && data.cpu_cores > 0) ? data.cpu_cores : 6;
+        if (typeof data.cpu_percent === "number") {
+            var cpuPct = Math.min(100, Math.max(0, data.cpu_percent));
             root.cpuLoad = cpuPct.toFixed(1) + "%";
+        } else if (typeof data.cpu_load_1m === "number") {
+            var loadPct = Math.min(100, (data.cpu_load_1m / cores) * 100);
+            root.cpuLoad = loadPct.toFixed(1) + "%";
         } else if (data.cpu_usage_pct !== undefined) {
             root.cpuLoad = Number(data.cpu_usage_pct).toFixed(1) + "%";
         } else if (data.cpu_load !== undefined) {

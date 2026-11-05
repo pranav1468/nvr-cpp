@@ -354,10 +354,94 @@ class NvrStreamEngine {
     this.webcodecsMode = "annexb";
     this.awaitingKeyChunk = true;
     this.isDestroyed = false;
+    this.isPaused = false;
+    this.prevCanvas = null;
     this.detectedWidth = 0;
     this.detectedHeight = 0;
 
     this.initDOM();
+  }
+
+  setPaused(paused) {
+    if (this.isPaused === paused) return;
+    this.isPaused = paused;
+    this.awaitingKeyChunk = true;
+    if (paused) {
+      if (this.wasmPlayer) {
+        try { this.wasmPlayer.reset(); } catch {}
+      }
+      if (this.decoder && this.decoder.state === "configured") {
+        try { this.decoder.reset(); } catch {}
+      }
+    }
+  }
+
+  clearPrevSurface() {
+    if (this.prevCanvas) {
+      try { this.prevCanvas.remove(); } catch {}
+      this.prevCanvas = null;
+    }
+    if (this.canvas) {
+      this.canvas.style.opacity = "1";
+    }
+    if (this.video) {
+      this.video.style.opacity = "1";
+    }
+  }
+
+  switchStreamType(newStreamType) {
+    if (this.streamType === newStreamType) return;
+    this.streamType = newStreamType;
+    this.detectedWidth = 0;
+    this.detectedHeight = 0;
+    this.clearPrevSurface();
+
+    const stage = this.container?.querySelector(".nvr-media-stage-inner");
+    if (stage) {
+      if (this.canvas && this.canvas.style.display !== "none" && this.canvas.width > 0) {
+        this.prevCanvas = this.canvas;
+        Object.assign(this.prevCanvas.style, {
+          position: "absolute",
+          inset: "0",
+          zIndex: "1",
+          pointerEvents: "none"
+        });
+        const freshCanvas = document.createElement("canvas");
+        Object.assign(freshCanvas.style, {
+          width: "100%",
+          height: "100%",
+          objectFit: "cover",
+          display: "none",
+          opacity: "0",
+          position: "relative",
+          zIndex: "2"
+        });
+        stage.appendChild(freshCanvas);
+        this.canvas = freshCanvas;
+        this.ctx = null;
+      } else if (this.video && this.video.style.display !== "none" && this.video.videoWidth > 0) {
+        try {
+          const snapCanvas = document.createElement("canvas");
+          snapCanvas.width = this.video.videoWidth;
+          snapCanvas.height = this.video.videoHeight;
+          Object.assign(snapCanvas.style, {
+            width: "100%",
+            height: "100%",
+            objectFit: "cover",
+            position: "absolute",
+            inset: "0",
+            zIndex: "1",
+            pointerEvents: "none"
+          });
+          const snapCtx = snapCanvas.getContext("2d", { alpha: false });
+          snapCtx?.drawImage(this.video, 0, 0, snapCanvas.width, snapCanvas.height);
+          stage.insertBefore(snapCanvas, stage.firstChild);
+          this.prevCanvas = snapCanvas;
+        } catch {}
+      }
+    }
+
+    this.start();
   }
 
   updateDynamicResolutionBadge(w, h) {
@@ -499,7 +583,15 @@ class NvrStreamEngine {
               if (!this.isDestroyed && this.pendingInitFrames?.length) {
                 const queued = this.pendingInitFrames;
                 this.pendingInitFrames = [];
-                for (const f of queued) {
+                let startIdx = 0;
+                for (let i = queued.length - 1; i >= 0; i--) {
+                  if (queued[i].isKey) {
+                    startIdx = i;
+                    break;
+                  }
+                }
+                for (let i = startIdx; i < queued.length; i++) {
+                  const f = queued[i];
                   this.dispatchFrame(f.nalData, f.ptsUs, f.isKey, f.isH265);
                 }
               }
@@ -664,6 +756,7 @@ class NvrStreamEngine {
           this.updateDynamicResolutionBadge(frame.displayWidth, frame.displayHeight);
         }
         this.ctx?.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+        this.clearPrevSurface();
         frame.close();
       },
       error: () => { this.awaitingKeyChunk = true; },
@@ -675,6 +768,12 @@ class NvrStreamEngine {
     this.onStatus({ state: "PLAYING", tier: `fMP4 / ${codecLabel}`, codec: codecLabel, text: `MSE pass-through (${codecLabel})` });
     const ms = new MediaSource();
     this.mseSource = ms;
+    this.video.onloadeddata = () => {
+      if (this.video.videoHeight > 0) {
+        this.updateDynamicResolutionBadge(this.video.videoWidth, this.video.videoHeight);
+      }
+      this.clearPrevSurface();
+    };
     this.video.src = URL.createObjectURL(ms);
     ms.addEventListener("sourceopen", () => {
       if (this.isDestroyed || this.activeTier !== "MSE") return;
@@ -760,7 +859,12 @@ class NvrStreamEngine {
         typeof SharedArrayBuffer !== "undefined";
 
       const hardwareThreads = navigator.hardwareConcurrency || 4;
-      const targetThreads = canUseThreads ? Math.min(2, Math.max(1, Math.floor(hardwareThreads / 4))) : 1;
+      const isMainStream = this.streamType === "main";
+      const targetThreads = canUseThreads
+        ? (isMainStream
+            ? Math.min(6, Math.max(2, Math.floor(hardwareThreads / 2)))
+            : Math.min(2, Math.max(1, Math.floor(hardwareThreads / 4))))
+        : 1;
       const chosenVariant = canUseThreads ? "threads-simd" : "auto";
 
       this.awaitingKeyChunk = true;
@@ -789,6 +893,15 @@ class NvrStreamEngine {
         this.awaitingKeyChunk = true;
       });
 
+      this.wasmPlayer.on("frame", (frame) => {
+        const fw = frame?.displayWidth || frame?.codedWidth || 0;
+        const fh = frame?.displayHeight || frame?.codedHeight || 0;
+        if (fh > 0 && this.detectedHeight !== fh) {
+          this.updateDynamicResolutionBadge(fw, fh);
+        }
+        this.clearPrevSurface();
+      });
+
       await this.wasmPlayer.init();
       return true;
     } catch (e) {
@@ -799,11 +912,16 @@ class NvrStreamEngine {
 
   setOfflineStatus(statusText) {
     this.activeTier = "NONE";
+    this.clearPrevSurface();
     this.activateSurface("none");
     this.onStatus({ state: "FALLBACK", tier: "No signal", text: statusText });
   }
 
   dispatchFrame(nalData, ptsUs, isKeyframe, isH265) {
+    if (this.isPaused) {
+      this.awaitingKeyChunk = true;
+      return;
+    }
     if (this.activeTier === "WEBCODECS" && this.decoder?.state === "configured") {
       if (this.awaitingKeyChunk) {
         if (!isKeyframe) return;
@@ -848,6 +966,7 @@ class NvrStreamEngine {
 
   destroy() {
     this.isDestroyed = true;
+    this.clearPrevSurface();
     this.cleanupTransport();
   }
 }
@@ -970,6 +1089,10 @@ function renderLiveMatrix() {
     if (!isVisible) {
       tile.classList.add("hidden");
       tile.classList.remove("tile-master");
+      const hiddenEngine = liveStreamEngines.get(ch);
+      if (hiddenEngine) {
+        hiddenEngine.setPaused(true);
+      }
       continue;
     }
 
@@ -988,11 +1111,8 @@ function renderLiveMatrix() {
 
     const cam = cameras.find((c) => c.id === ch);
     const online = cam ? isCamOnline(cam) : false;
-    // To preserve zero-latency switching and avoid Wasm 1080p decode bottlenecks,
-    // live grid and fullscreen operate on the high-definition SUB stream (720p).
-    // The MAIN stream remains dedicated to zero-transcode high-bitrate recording.
-    const isMain = false;
-    const targetStream = "sub";
+    const isMain = (fullscreenCh === ch || liveLayout === 1);
+    const targetStream = isMain ? "main" : "sub";
     const isEnabled = cam && (cam.enabled !== false);
 
     // Update HUD elements
@@ -1006,7 +1126,7 @@ function renderLiveMatrix() {
     if (resBadgeEl) {
       const existing = liveStreamEngines.get(ch);
       const prefix = isMain ? "MAIN" : "SUB";
-      if (existing && existing.detectedHeight > 0) {
+      if (existing && existing.streamType === targetStream && existing.detectedHeight > 0) {
         let resText = `${existing.detectedHeight}p`;
         if (existing.detectedHeight >= 2160) resText = "4K";
         else if (existing.detectedHeight >= 1440) resText = "2K";
@@ -1051,34 +1171,12 @@ function renderLiveMatrix() {
         liveStreamEngines.set(ch, engine);
         engine.start();
       } else if (existing.streamType !== targetStream) {
-        // Stream type changed (e.g. sub to main for fullscreen, or main to sub on exit)
-        try { existing.destroy(); } catch {}
-        const engine = new NvrStreamEngine({
-          channelId: ch,
-          container: stageEl,
-          streamType: targetStream,
-          onStatus: (st) => {
-            const badgeEl = document.getElementById(`stream-tier-${ch}`);
-            if (badgeEl) {
-              badgeEl.textContent = st.tier || st.text;
-              badgeEl.className = `px-2 py-0.5 font-mono text-[10px] text-white/90 ${
-                st.state === "PLAYING" ? "bg-success/80" : st.state === "FALLBACK" ? "bg-warning/80" : "bg-black/55"
-              }`;
-            }
-          },
-          onError: () => {
-            const badgeEl = document.getElementById(`stream-tier-${ch}`);
-            if (badgeEl) {
-              badgeEl.textContent = "Error";
-              badgeEl.className = "px-2 py-0.5 font-mono text-[10px] text-white/90 bg-destructive/80";
-            }
-          },
-        });
-        liveStreamEngines.set(ch, engine);
-        engine.start();
+        // Stream type changed (e.g. sub to main for fullscreen/1-cam, or main to sub on exit)
+        existing.setPaused(false);
+        existing.switchStreamType(targetStream);
+      } else {
+        existing.setPaused(false);
       }
-      // If existing engine already matches targetStream: DO NOTHING.
-      // Stream continues playing without a single dropped frame!
     } else {
       // Only tear down engine if camera was explicitly disabled or removed
       const existing = liveStreamEngines.get(ch);

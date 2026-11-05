@@ -515,10 +515,16 @@ bool StreamBroker::GetCachedParameterSets(int channel_id, StreamType stream_type
 
 MediaPacketPtr StreamBroker::GetLatestKeyframe(int channel_id, StreamType stream_type) const {
     uint32_t topic_key = MakeTopicKey(channel_id, stream_type);
-    std::shared_lock<std::shared_mutex> r_lock(rw_mutex_);
-    auto it = topic_param_cache_.find(topic_key);
-    if (it != topic_param_cache_.end()) {
-        return it->second.last_keyframe;
+    {
+        std::lock_guard<std::mutex> r_lock(ring_buffer_mutex_);
+        auto rb_it = topic_ring_buffers_.find(topic_key);
+        if (rb_it != topic_ring_buffers_.end() && !rb_it->second.packets.empty()) {
+            for (auto it = rb_it->second.packets.rbegin(); it != rb_it->second.packets.rend(); ++it) {
+                if (*it && (*it)->IsVideo()) {
+                    return (*it)->is_keyframe ? *it : nullptr;
+                }
+            }
+        }
     }
     return nullptr;
 }

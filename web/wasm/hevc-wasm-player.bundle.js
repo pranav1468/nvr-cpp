@@ -1353,6 +1353,9 @@ var init_player = __esm({
       baseWallMs = null;
       basePtsMs = null;
       lastPtsMs = null;
+      lastDecodeWallMs = null;
+      frameIntervalMs = null;
+      keyframeStallMs = null;
       pacedFrameCount = 0;
       renderPromise = Promise.resolve();
       decodedFrames = 0;
@@ -1538,6 +1541,9 @@ var init_player = __esm({
         this.baseWallMs = null;
         this.basePtsMs = null;
         this.lastPtsMs = null;
+        this.lastDecodeWallMs = null;
+        this.frameIntervalMs = null;
+        this.keyframeStallMs = null;
         this.pacedFrameCount = 0;
         this.#clearInputQueue("waiting-key", false);
         this.waitingForKeyframe = false;
@@ -1754,36 +1760,64 @@ var init_player = __esm({
           frame.targetRenderMs = nowMs;
         } else {
           this.pacedFrameCount += 1;
-          if (this.pacedFrameCount <= 6) {
-            this.baseWallMs += 12;
+          const ptsDelta = ptsMs - this.lastPtsMs;
+          if (ptsDelta > 0 && ptsDelta < 1000) {
+            this.frameIntervalMs = this.frameIntervalMs === null
+              ? ptsDelta
+              : this.frameIntervalMs * 0.85 + ptsDelta * 0.15;
           }
+          const intervalMs = this.frameIntervalMs ?? (this.options.frameDuration / 1000);
+          if (this.lastDecodeWallMs !== null && ptsDelta > 0) {
+            const wallDelta = nowMs - this.lastDecodeWallMs;
+            const stallMs = wallDelta - ptsDelta;
+            if (stallMs > intervalMs * 0.5) {
+              this.keyframeStallMs = this.keyframeStallMs === null
+                ? stallMs
+                : Math.max(stallMs, this.keyframeStallMs * 0.85 + stallMs * 0.15);
+            }
+          }
+
+          const targetCushionMs = (this.keyframeStallMs ?? (intervalMs * 2.5)) + intervalMs;
+          const targetFrames = Math.max(2, Math.ceil(targetCushionMs / intervalMs));
+          const maxFrames = targetFrames + 3;
+
           let targetMs = this.baseWallMs + (ptsMs - this.basePtsMs);
           if (nowMs > targetMs) {
-            this.baseWallMs += (nowMs - targetMs) + 8;
+            this.baseWallMs += (nowMs - targetMs) + intervalMs * 0.15;
             targetMs = nowMs;
           }
           frame.targetRenderMs = targetMs;
+
+          if (this.pendingFrames.length >= maxFrames) {
+            while (this.pendingFrames.length > targetFrames) {
+              const dropped = this.pendingFrames.shift();
+              this.droppedRenderFrames += 1;
+              dropped.close();
+            }
+            if (this.pendingFrames.length > 0 && Number.isFinite(this.pendingFrames[0].timestamp)) {
+              const headPtsMs = this.pendingFrames[0].timestamp / 1000;
+              this.baseWallMs = nowMs - (headPtsMs - this.basePtsMs);
+              for (const f of this.pendingFrames) {
+                if (Number.isFinite(f.timestamp)) {
+                  f.targetRenderMs = this.baseWallMs + ((f.timestamp / 1000) - this.basePtsMs);
+                }
+              }
+              frame.targetRenderMs = this.baseWallMs + (ptsMs - this.basePtsMs);
+            }
+          } else if (
+            (this.pendingFrames.length > targetFrames || (targetMs - nowMs) > targetCushionMs) &&
+            this.inputQueue.length === 0 &&
+            (this.decoder?.decodeQueueSize ?? 0) <= 1 &&
+            this.baseWallMs !== null
+          ) {
+            const excessMs = Math.max(intervalMs * 0.5, (targetMs - nowMs) - targetCushionMs);
+            const pullMs = Math.min(intervalMs * 0.15, Math.max(intervalMs * 0.04, excessMs * 0.2));
+            this.baseWallMs -= pullMs;
+            frame.targetRenderMs = this.baseWallMs + (ptsMs - this.basePtsMs);
+          }
         }
         this.lastPtsMs = ptsMs;
-
-        if (this.pendingFrames.length >= 16) {
-          while (this.pendingFrames.length > 6) {
-            const dropped = this.pendingFrames.shift();
-            this.droppedRenderFrames += 1;
-            dropped.close();
-          }
-          if (this.pendingFrames.length > 0 && Number.isFinite(this.pendingFrames[0].timestamp)) {
-            const headPtsMs = this.pendingFrames[0].timestamp / 1000;
-            this.baseWallMs = nowMs - (headPtsMs - this.basePtsMs);
-            for (const f of this.pendingFrames) {
-              if (Number.isFinite(f.timestamp)) {
-                f.targetRenderMs = this.baseWallMs + ((f.timestamp / 1000) - this.basePtsMs);
-              }
-            }
-          }
-        } else if (this.pendingFrames.length > 8 && this.baseWallMs !== null) {
-          this.baseWallMs -= 2;
-        }
+        this.lastDecodeWallMs = nowMs;
 
         this.pendingFrames.push(frame);
         this.#scheduleRender();

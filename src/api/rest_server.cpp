@@ -2228,10 +2228,9 @@ void RestServer::HandleWebSocketStream(int client_fd, int channel_id, StreamType
         ctx->closed.store(true);
     }
 
-    // Only dispatch cached IDR if it was captured within the last 45ms (so no intermediate P-frames were missed)
+    // Dispatch cached IDR only if it is still the latest video packet on this stream (no intermediate P-frames missed)
     auto initial_kf = StreamBroker::Instance().GetLatestKeyframe(channel_id, stream_type);
-    if (initial_kf && initial_kf->wall_time_ms > 0 &&
-        (time_utils::WallTimeMs() - initial_kf->wall_time_ms) <= 45) {
+    if (initial_kf) {
         std::lock_guard<std::mutex> lock(ctx->mtx);
         if (ctx->queue.empty()) {
             ctx->queue.push_back(initial_kf);

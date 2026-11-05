@@ -186,8 +186,15 @@ void RtpDepacketizer::AppendNalToAu(const uint8_t* nal_data, size_t nal_len, boo
     if (au_has_data_ && rtp_timestamp != au_timestamp_) {
         if (au_has_vcl_) {
             FlushAu();
+        } else if (is_vcl && !is_key) {
+            // An earlier IDR slice was dropped due to RTP packet loss, leaving orphaned parameter sets;
+            // discard them so they do not get attached to a non-keyframe P-slice.
+            au_buffer_.clear();
+            au_has_data_ = false;
+            au_has_vcl_ = false;
+            au_is_keyframe_ = false;
         } else {
-            // Parameter sets / SEI preceded the slice with an earlier RTP timestamp; keep them attached to the slice
+            // Parameter sets / SEI preceded the keyframe slice with an earlier RTP timestamp; keep them attached
             au_timestamp_ = rtp_timestamp;
         }
     }

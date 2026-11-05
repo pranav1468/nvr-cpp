@@ -15,6 +15,7 @@
 #include "nvr/database/database_manager.h"
 
 #include <sys/sysinfo.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <thread>
 #include <chrono>
@@ -172,12 +173,10 @@ void CommandDispatcher::RegisterDefaultHandlers() {
         resp["total_recording_size_bytes"] = total_rec_size;
         resp["stream_broker_buffer_bytes"] = StreamBroker::Instance().GetClientBufferMemoryBytes();
 
+        static std::mutex telemetry_mtx;
         static auto last_bitrate_time = std::chrono::steady_clock::now();
         static uint64_t last_total_bytes = 0;
         static double smoothed_bitrate_mbps = 0.0;
-
-        auto now = std::chrono::steady_clock::now();
-        double elapsed_sec = std::chrono::duration<double>(now - last_bitrate_time).count();
 
         uint64_t current_total_bytes = 0;
         auto cameras = CameraManager::Instance().GetCameras();
@@ -189,27 +188,96 @@ void CommandDispatcher::RegisterDefaultHandlers() {
             current_total_bytes += RecordingScheduler::Instance().GetChannelBytesWritten(cam.id);
         }
 
-        if (elapsed_sec >= 1.0) {
-            if (last_total_bytes > 0 && current_total_bytes >= last_total_bytes) {
-                double bytes_diff = static_cast<double>(current_total_bytes - last_total_bytes);
-                smoothed_bitrate_mbps = (bytes_diff * 8.0) / (elapsed_sec * 1000000.0);
-            } else if (online_count == 0) {
-                smoothed_bitrate_mbps = 0.0;
+        double current_bitrate_mbps = 0.0;
+        double current_cpu_pct = 0.0;
+        {
+            std::lock_guard<std::mutex> t_lock(telemetry_mtx);
+            auto now = std::chrono::steady_clock::now();
+            double elapsed_sec = std::chrono::duration<double>(now - last_bitrate_time).count();
+
+            if (elapsed_sec >= 1.0) {
+                if (last_total_bytes > 0 && current_total_bytes >= last_total_bytes) {
+                    double bytes_diff = static_cast<double>(current_total_bytes - last_total_bytes);
+                    smoothed_bitrate_mbps = (bytes_diff * 8.0) / (elapsed_sec * 1000000.0);
+                } else if (online_count == 0) {
+                    smoothed_bitrate_mbps = 0.0;
+                }
+                last_total_bytes = current_total_bytes;
+                last_bitrate_time = now;
             }
-            last_total_bytes = current_total_bytes;
-            last_bitrate_time = now;
+            current_bitrate_mbps = smoothed_bitrate_mbps;
+
+            static unsigned long long prev_user = 0, prev_nice = 0, prev_system = 0, prev_idle = 0;
+            static unsigned long long prev_iowait = 0, prev_irq = 0, prev_softirq = 0, prev_steal = 0;
+            static double cached_cpu_pct = 0.0;
+            static std::chrono::steady_clock::time_point last_stat_read{};
+
+            auto now_stat = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now_stat - last_stat_read).count() >= 500) {
+                std::ifstream stat_file("/proc/stat");
+                if (stat_file.is_open()) {
+                    std::string line;
+                    if (std::getline(stat_file, line) && line.rfind("cpu ", 0) == 0) {
+                        unsigned long long u = 0, n = 0, s = 0, id = 0, io = 0, ir = 0, sir = 0, st = 0;
+                        if (sscanf(line.c_str(), "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
+                                   &u, &n, &s, &id, &io, &ir, &sir, &st) >= 4) {
+                            unsigned long long prev_idle_all = prev_idle + prev_iowait;
+                            unsigned long long idle_all = id + io;
+                            unsigned long long prev_non_idle = prev_user + prev_nice + prev_system + prev_irq + prev_softirq + prev_steal;
+                            unsigned long long non_idle = u + n + s + ir + sir + st;
+                            unsigned long long prev_total = prev_idle_all + prev_non_idle;
+                            unsigned long long total = idle_all + non_idle;
+
+                            if (prev_total > 0 && total > prev_total) {
+                                unsigned long long total_d = total - prev_total;
+                                unsigned long long idle_d = idle_all - prev_idle_all;
+                                cached_cpu_pct = 100.0 * static_cast<double>(total_d - idle_d) / static_cast<double>(total_d);
+                                if (cached_cpu_pct < 0.0) cached_cpu_pct = 0.0;
+                                if (cached_cpu_pct > 100.0) cached_cpu_pct = 100.0;
+                            }
+
+                            prev_user = u; prev_nice = n; prev_system = s; prev_idle = id;
+                            prev_iowait = io; prev_irq = ir; prev_softirq = sir; prev_steal = st;
+                            last_stat_read = now_stat;
+                        }
+                    }
+                }
+            }
+            current_cpu_pct = cached_cpu_pct;
         }
 
-        resp["bitrate_mbps"] = smoothed_bitrate_mbps;
+        resp["bitrate_mbps"] = current_bitrate_mbps;
         resp["online_cameras"] = online_count;
 
         struct sysinfo si;
+        uint64_t ram_total_bytes = 0;
+        uint64_t ram_free_bytes = 0;
         if (sysinfo(&si) == 0) {
             uint64_t unit = si.mem_unit ? si.mem_unit : 1;
-            resp["ram_total_bytes"] = static_cast<uint64_t>(si.totalram) * unit;
-            resp["ram_free_bytes"] = static_cast<uint64_t>(si.freeram) * unit;
+            ram_total_bytes = static_cast<uint64_t>(si.totalram) * unit;
+            ram_free_bytes = static_cast<uint64_t>(si.freeram + si.bufferram) * unit;
             resp["uptime_seconds"] = si.uptime;
         }
+        {
+            std::ifstream meminfo("/proc/meminfo");
+            if (meminfo.is_open()) {
+                std::string mline;
+                uint64_t mem_total_kb = 0;
+                uint64_t mem_avail_kb = 0;
+                while (std::getline(meminfo, mline)) {
+                    if (mline.rfind("MemTotal:", 0) == 0) {
+                        sscanf(mline.c_str(), "MemTotal: %lu", &mem_total_kb);
+                    } else if (mline.rfind("MemAvailable:", 0) == 0) {
+                        sscanf(mline.c_str(), "MemAvailable: %lu", &mem_avail_kb);
+                    }
+                    if (mem_total_kb > 0 && mem_avail_kb > 0) break;
+                }
+                if (mem_total_kb > 0) ram_total_bytes = mem_total_kb * 1024ULL;
+                if (mem_avail_kb > 0) ram_free_bytes = mem_avail_kb * 1024ULL;
+            }
+        }
+        resp["ram_total_bytes"] = ram_total_bytes;
+        resp["ram_free_bytes"] = ram_free_bytes;
 
         double loadavg[3];
         if (getloadavg(loadavg, 3) != -1) {
@@ -217,45 +285,13 @@ void CommandDispatcher::RegisterDefaultHandlers() {
             resp["cpu_load_5m"] = loadavg[1];
         }
 
-        resp["cpu_cores"] = static_cast<int>(std::thread::hardware_concurrency());
-
-        static unsigned long long prev_user = 0, prev_nice = 0, prev_system = 0, prev_idle = 0;
-        static unsigned long long prev_iowait = 0, prev_irq = 0, prev_softirq = 0, prev_steal = 0;
-        static double cached_cpu_pct = 0.0;
-        static std::chrono::steady_clock::time_point last_stat_read{};
-
-        auto now_stat = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::milliseconds>(now_stat - last_stat_read).count() >= 500) {
-            std::ifstream stat_file("/proc/stat");
-            if (stat_file.is_open()) {
-                std::string line;
-                if (std::getline(stat_file, line) && line.rfind("cpu ", 0) == 0) {
-                    unsigned long long u = 0, n = 0, s = 0, id = 0, io = 0, ir = 0, sir = 0, st = 0;
-                    if (sscanf(line.c_str(), "cpu %llu %llu %llu %llu %llu %llu %llu %llu",
-                               &u, &n, &s, &id, &io, &ir, &sir, &st) >= 4) {
-                        unsigned long long prev_idle_all = prev_idle + prev_iowait;
-                        unsigned long long idle_all = id + io;
-                        unsigned long long prev_non_idle = prev_user + prev_nice + prev_system + prev_irq + prev_softirq + prev_steal;
-                        unsigned long long non_idle = u + n + s + ir + sir + st;
-                        unsigned long long prev_total = prev_idle_all + prev_non_idle;
-                        unsigned long long total = idle_all + non_idle;
-
-                        if (total > prev_total) {
-                            unsigned long long total_d = total - prev_total;
-                            unsigned long long idle_d = idle_all - prev_idle_all;
-                            cached_cpu_pct = 100.0 * static_cast<double>(total_d - idle_d) / static_cast<double>(total_d);
-                            if (cached_cpu_pct < 0.0) cached_cpu_pct = 0.0;
-                            if (cached_cpu_pct > 100.0) cached_cpu_pct = 100.0;
-                        }
-
-                        prev_user = u; prev_nice = n; prev_system = s; prev_idle = id;
-                        prev_iowait = io; prev_irq = ir; prev_softirq = sir; prev_steal = st;
-                        last_stat_read = now_stat;
-                    }
-                }
-            }
+        int cpu_cores = static_cast<int>(std::thread::hardware_concurrency());
+        if (cpu_cores <= 0) {
+            long nprocs = sysconf(_SC_NPROCESSORS_ONLN);
+            cpu_cores = (nprocs > 0) ? static_cast<int>(nprocs) : 1;
         }
-        resp["cpu_percent"] = cached_cpu_pct;
+        resp["cpu_cores"] = cpu_cores;
+        resp["cpu_percent"] = current_cpu_pct;
 
         return CommandResult::Success(resp);
     }, "Query system hardware and storage telemetry");

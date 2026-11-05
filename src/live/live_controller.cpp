@@ -461,9 +461,15 @@ bool LiveController::SetFullscreen(int channel_id) {
                     p->packet_queue.clear();
                     p->awaiting_keyframe.store(false, std::memory_order_release);
                 } else {
-                    while (p->packet_queue.size() >= p->max_packet_depth) {
+                    while (!p->packet_queue.empty() && !p->packet_queue.front()->is_keyframe) {
                         p->packet_queue.pop_front();
                         p->dropped_frames.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (p->packet_queue.size() >= p->max_packet_depth) {
+                        p->dropped_frames.fetch_add(p->packet_queue.size(), std::memory_order_relaxed);
+                        p->packet_queue.clear();
+                        p->awaiting_keyframe.store(true, std::memory_order_release);
+                        return;
                     }
                 }
             }
@@ -671,7 +677,7 @@ void LiveController::SetupGridPipelines() {
             TileConfig dt;
             dt.tile_index = tile_idx++;
             dt.channel_id = ch;
-            dt.stream_type = StreamType::SUB;
+            dt.stream_type = (layout == LiveGridLayout::SINGLE) ? StreamType::MAIN : StreamType::SUB;
             dt.target_w = tw;
             dt.target_h = th;
             desired_tiles.push_back(dt);
@@ -878,9 +884,15 @@ void LiveController::StartChannelPipelineMulti(int channel_id, StreamType stream
                     p->packet_queue.clear();
                     p->awaiting_keyframe.store(false, std::memory_order_release);
                 } else {
-                    while (p->packet_queue.size() >= p->max_packet_depth) {
+                    while (!p->packet_queue.empty() && !p->packet_queue.front()->is_keyframe) {
                         p->packet_queue.pop_front();
                         p->dropped_frames.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (p->packet_queue.size() >= p->max_packet_depth) {
+                        p->dropped_frames.fetch_add(p->packet_queue.size(), std::memory_order_relaxed);
+                        p->packet_queue.clear();
+                        p->awaiting_keyframe.store(true, std::memory_order_release);
+                        return;
                     }
                 }
             }
@@ -919,14 +931,9 @@ void LiveController::ChannelWorkerLoop(std::shared_ptr<ChannelPipeline> pipeline
 
         if (!pkt) continue;
 
-        // L7 Resynchronization: discard non-keyframes when dependency chain is broken,
-        // while allowing parameter sets (SPS/PPS/VPS) to be cached by the decoder.
+        // L7 Resynchronization: discard non-keyframes when dependency chain is broken.
         if (pipeline->awaiting_keyframe.load()) {
             if (!pkt->is_keyframe) {
-                if (pkt->HasParameterSets() && pipeline->decoder) {
-                    DecodedFramePtr unused_frame;
-                    pipeline->decoder->Decode(pkt, unused_frame);
-                }
                 continue;
             }
             if (pipeline->decoder) {

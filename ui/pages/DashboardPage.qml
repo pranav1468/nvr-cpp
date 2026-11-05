@@ -30,7 +30,10 @@ Item {
             var totalMb = data.total_storage_bytes ? Math.round(data.total_storage_bytes / (1024 * 1024)) : 0;
             var freeMb = data.free_storage_bytes ? Math.round(data.free_storage_bytes / (1024 * 1024)) : 0;
             var ramFreeMb = data.ram_free_bytes ? Math.round(data.ram_free_bytes / (1024 * 1024)) : 0;
-            var cpuPct = (typeof data.cpu_load_1m === "number") ? Math.min(100, (data.cpu_load_1m / 6.0) * 100) : 0.0;
+            var cores = (typeof data.cpu_cores === "number" && data.cpu_cores > 0) ? data.cpu_cores : 6;
+            var cpuPct = (typeof data.cpu_percent === "number")
+                ? Math.min(100, Math.max(0, data.cpu_percent))
+                : ((typeof data.cpu_load_1m === "number") ? Math.min(100, (data.cpu_load_1m / cores) * 100) : 0.0);
             root.telemetry = {
                 status: data.status || "OFFLINE",
                 uptime_seconds: Number(data.uptime_seconds || 0),
