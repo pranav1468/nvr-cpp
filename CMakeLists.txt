@@ -36,6 +36,8 @@ set(CORE_SOURCES
     src/common/time_utils.cpp
     src/common/thread_pool.cpp
     src/common/config_loader.cpp
+    src/common/crypto_utils.cpp
+    src/database/database_manager.cpp
     src/storage/retention_manager.cpp
     src/media/stream_broker.cpp
     src/media/buffer_allocator.cpp
@@ -66,14 +68,19 @@ target_include_directories(nvr_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include/3rdparty
 )
-target_link_libraries(nvr_core PUBLIC pthread dl)
+target_link_libraries(nvr_core PUBLIC pthread dl sqlite3 crypto)
 
 add_executable(nvr_server src/main.cpp)
 target_link_libraries(nvr_server PRIVATE nvr_core)
 
 find_package(Qt6 COMPONENTS Core Gui Qml Quick QuickControls2 QUIET)
 if(Qt6_FOUND)
-    add_executable(nvr_gui src/ui_main.cpp src/ui/nvr_bridge.cpp)
+    add_executable(nvr_gui
+        src/ui_main.cpp
+        src/ui/nvr_bridge.cpp
+        include/nvr/ui/nvr_bridge.h
+        include/nvr/live/live_bridge_controller.h
+    )
     target_link_libraries(nvr_gui PRIVATE nvr_core Qt6::Core Qt6::Gui Qt6::Qml Qt6::Quick Qt6::QuickControls2)
     install(TARGETS nvr_gui DESTINATION bin OPTIONAL)
 endif()
