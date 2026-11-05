@@ -811,14 +811,43 @@ private:
             return copy_ok ? V4l2DecodeResult::FRAME_READY : V4l2DecodeResult::HARDWARE_FATAL;
         }
 
-        if (dq_ret < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return V4l2DecodeResult::FRAME_PENDING;
+        if (dq_ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return V4l2DecodeResult::FRAME_PENDING;
+            }
+            if (errno == EPIPE) {
+                // In Linux V4L2 stateful decoders (e.g. Hantro G1/G2 on i.MX 8M Plus),
+                // EPIPE is returned during initial SPS/PPS parameter detection or dynamic resolution change.
+                struct v4l2_event ev{};
+                while (Ioctl(v4l2_fd_, VIDIOC_DQEVENT, &ev) == 0) {
+                    // Consume pending source change events
+                }
+                struct v4l2_format gfmt_cap{};
+                gfmt_cap.type = capture_buf_type_;
+                if (Ioctl(v4l2_fd_, VIDIOC_G_FMT, &gfmt_cap) == 0) {
+                    uint32_t nw = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+                        ? gfmt_cap.fmt.pix_mp.width : gfmt_cap.fmt.pix.width;
+                    uint32_t nh = (capture_buf_type_ == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE)
+                        ? gfmt_cap.fmt.pix_mp.height : gfmt_cap.fmt.pix.height;
+                    if (nw > 0 && nh > 0 && (nw != negotiated_width_ || nh != negotiated_height_)) {
+                        LOG_INFO << "[VpuVideoDecoder] Hardware V4L2 source change event acknowledged: "
+                                 << nw << "x" << nh << " (was " << negotiated_width_ << "x" << negotiated_height_
+                                 << "); reconfiguring capture queues";
+                        width_ = nw;
+                        height_ = nh;
+                        SetupV4l2Queues();
+                    }
+                }
+                return V4l2DecodeResult::FRAME_PENDING;
+            }
+
+            LOG_ERROR << "[PIPELINE][DECODER][HARDWARE_FATAL] Capture VIDIOC_DQBUF unrecoverable error"
+                      << " device=" << v4l2_device_path_
+                      << " errno=" << errno << " reason=" << std::strerror(errno);
+            return V4l2DecodeResult::HARDWARE_FATAL;
         }
 
-        LOG_ERROR << "[PIPELINE][DECODER][HARDWARE_FATAL] Capture VIDIOC_DQBUF unrecoverable error"
-                  << " device=" << v4l2_device_path_
-                  << " errno=" << errno << " reason=" << std::strerror(errno);
-        return V4l2DecodeResult::HARDWARE_FATAL;
+        return V4l2DecodeResult::FRAME_PENDING;
     }
 
     bool SetupV4l2Queues() {
@@ -855,7 +884,7 @@ private:
             fdesc.index++;
         }
         if (!has_codec_fmt) {
-            LOG_WARN << "[VpuVideoDecoder] Hardware V4L2 device does not support format " << CodecToString(codec_);
+            LOG_DEBUG << "[VpuVideoDecoder] Device " << v4l2_device_path_ << " does not support " << CodecToString(codec_);
             CleanupV4l2Buffers();
             return false;
         }
@@ -1071,6 +1100,12 @@ private:
             CleanupV4l2Buffers();
             return false;
         }
+
+#ifdef V4L2_EVENT_SOURCE_CHANGE
+        struct v4l2_event_subscription sub{};
+        sub.type = V4L2_EVENT_SOURCE_CHANGE;
+        ioctl(v4l2_fd_, VIDIOC_SUBSCRIBE_EVENT, &sub);
+#endif
 
         return true;
     }
